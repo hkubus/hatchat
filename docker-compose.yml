@@ -1,0 +1,30 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+    ports:
+      - "${HAT_PORT:-8787}:8787"
+    environment:
+      HAT_HOST: 0.0.0.0
+      HAT_PORT: "8787"
+      HAT_AUTH_TOKEN: ${HAT_AUTH_TOKEN:-}
+      HAT_ENROLL_TOKEN: ${HAT_ENROLL_TOKEN:-dev-enroll-token}
+
+  runner:
+    build:
+      context: .
+      dockerfile: docker/runner.Dockerfile
+    depends_on:
+      - server
+    environment:
+      HAT_SERVER_URL: ws://server:8787/link
+      HAT_ENROLL_TOKEN: ${HAT_ENROLL_TOKEN:-dev-enroll-token}
+      HAT_RUNNER_TAGS: docker
+      HAT_WORKSPACE_ROOT: /srv/hat/workspaces
+    volumes:
+      - runner-workspaces:/srv/hat/workspaces
+    # Intentionally no ports: the runner dials out to the server.
+
+volumes:
+  runner-workspaces:

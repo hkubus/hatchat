@@ -1,0 +1,34 @@
+{
+  "name": "hat",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,runner,web -c blue,magenta,green \"pnpm run dev:server\" \"pnpm run dev:runner\" \"pnpm run dev:web\"",
+    "dev:server": "tsx watch packages/server/src/index.ts",
+    "dev:runner": "tsx watch packages/runner/src/index.ts",
+    "dev:web": "pnpm --filter @hat/web dev",
+    "start:server": "tsx packages/server/src/index.ts",
+    "start:runner": "tsx packages/runner/src/index.ts",
+    "typecheck": "turbo run typecheck",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@hat/plugin-sdk": "workspace:*",
+    "zod": "^3.24.1"
+  }
+}
