@@ -469,17 +469,19 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- sessions -----------------------------------------------------------
 
-  app.get("/api/sessions", (c) =>
-    c.json({
+  app.get("/api/sessions", (c) => {
+    const usage = store.usageBySession();
+    return c.json({
       sessions: store.listSessions().map((s) => ({
         id: s.id,
         title: s.title,
         model: s.model,
         messageCount: store.countMessages(s.id),
+        usage: usage.get(s.id) ?? null,
         updatedAt: s.updatedAt,
       })),
-    }),
-  );
+    });
+  });
 
   app.post("/api/sessions", async (c) => {
     let body: { model?: string; title?: string } = {};

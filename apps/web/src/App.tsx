@@ -1,5 +1,5 @@
-import type { KernelEvent, ModelInfo, Part, ReasoningEffort } from "@hat/core";
-import { REASONING_EFFORTS } from "@hat/core";
+import type { KernelEvent, ModelInfo, Part, ReasoningEffort, Usage } from "@hat/core";
+import { REASONING_EFFORTS, addUsage, sumUsage, usageTotal } from "@hat/core";
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import Connect from "./Connect";
 import MessageImage from "./MessageImage";
@@ -9,6 +9,7 @@ import Sidebar from "./Sidebar";
 import * as api from "./api";
 import type { PathNode, PluginDescriptor, ProviderStatus, RunnerSummary, SessionSummary } from "./api";
 import { capSummary, capTags } from "./capTags";
+import { formatTokens, usageDetail } from "./tokens";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
 
@@ -38,6 +39,7 @@ interface UiMessage {
   tools: UiTool[];
   branch?: UiBranch;
   images: { src: string; attachmentId?: string }[];
+  usage?: Usage;
 }
 
 interface PendingAttachment {
@@ -120,6 +122,7 @@ function buildMessages(path: PathNode[]): UiMessage[] {
         tools: toolsOf(message.parts),
         images: imagesOf(message.parts),
         branch,
+        usage: message.meta?.usage,
       });
     } else if (message.role === "tool") {
       for (const part of message.parts) {
@@ -181,6 +184,9 @@ export default function App() {
   const [editing, setEditing] = useState<{ messageId: string; text: string } | null>(null);
   const [pending, setPending] = useState<PendingAttachment[]>([]);
   const [restoring, setRestoring] = useState(false);
+  // Usage for the turn currently in flight. The server persists it onto the
+  // assistant message, so this only exists to keep the readout moving live.
+  const [liveUsage, setLiveUsage] = useState<Usage | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -355,8 +361,22 @@ export default function App() {
   const selectedModel = models.find((m) => m.id === model);
   const effortSupported = Boolean(selectedModel?.capabilities.reasoningEffort);
 
+  // Everything the visible branch has cost so far, plus the turn in flight.
+  const sessionUsage = useMemo(
+    () => sumUsage([...messages.map((m) => m.usage), liveUsage]),
+    [messages, liveUsage],
+  );
+  const sessionTokens = usageTotal(sessionUsage);
+  const sessionTokensLabel = formatTokens(sessionTokens);
+
   function handleEvent(event: KernelEvent): void {
     switch (event.type) {
+      case "turn.start":
+        setLiveUsage(undefined);
+        break;
+      case "usage":
+        setLiveUsage((prev) => addUsage(prev, event.usage));
+        break;
       case "message.start":
         setStreaming({
           id: event.messageId,
@@ -516,6 +536,9 @@ export default function App() {
       abortRef.current = null;
       await refresh(id).catch(() => undefined);
       await refreshSessions();
+      // Drop the live figure only once the persisted usage is in `messages`,
+      // otherwise the two would be added together and double-count.
+      setLiveUsage(undefined);
       setStreaming(null);
       setBusy(false);
     }
@@ -1090,6 +1113,15 @@ export default function App() {
                         {tag.label}
                       </span>
                     ))}
+                  </span>
+                )}
+
+                {sessionTokensLabel && (
+                  <span
+                    className="token-count"
+                    title={`${usageDetail(sessionUsage)} tokens in this conversation`}
+                  >
+                    {sessionTokensLabel} tokens
                   </span>
                 )}
               </div>

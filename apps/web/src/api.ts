@@ -1,4 +1,10 @@
-import type { ChatMessage, KernelEvent, ModelInfo, ReasoningEffort } from "@hat/core";
+import type {
+  ChatMessage,
+  KernelEvent,
+  ModelInfo,
+  ReasoningEffort,
+  Usage,
+} from "@hat/core";
 import { apiUrl, bearerHeaders } from "./runtime";
 import { SseFrameParser, decodeFrame } from "./sse";
 
@@ -59,6 +65,8 @@ export interface SessionSummary {
   title: string;
   model: string;
   messageCount: number;
+  /** Tokens spent on the active branch; null when nothing has been recorded. */
+  usage: Usage | null;
   updatedAt: number;
 }
 

@@ -10,8 +10,9 @@ import type {
   Provider,
   Tool,
   ToolPolicy,
+  Usage,
 } from "@hat/core";
-import { DEFAULT_CAPABILITIES, DEFAULT_TOOL_POLICY, newId } from "@hat/core";
+import { DEFAULT_CAPABILITIES, DEFAULT_TOOL_POLICY, newId, usageTotal } from "@hat/core";
 import { z } from "zod";
 import { Agent } from "./agent.js";
 import { ProviderRegistry, ToolRegistry } from "./registries.js";
@@ -66,10 +67,29 @@ function onceProvider(): Provider {
   };
 }
 
+/** Emits plain text, then reports what it cost, split without a total. */
+function spendingProvider(reports: Usage[]): Provider {
+  let call = 0;
+  return {
+    id: "spend",
+    label: "spend",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES }),
+    listModels: async () => [],
+    async *chat() {
+      const usage = reports[Math.min(call, reports.length - 1)];
+      call += 1;
+      yield { type: "text.delta", text: "answer" };
+      if (usage) yield { type: "usage", usage };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+}
+
 async function runAgent(
   provider: Provider,
   policy: Partial<ToolPolicy>,
   onApproval?: (req: ApprovalRequest) => void,
+  onMessage?: (sessionId: string, message: ChatMessage) => void,
 ): Promise<KernelEvent[]> {
   const providers = new ProviderRegistry();
   providers.register(provider);
@@ -89,6 +109,7 @@ async function runAgent(
     secrets: { async get() { return undefined; } },
     audit: { record() {} },
     logger,
+    onMessage,
   });
 
   const events: KernelEvent[] = [];
@@ -255,4 +276,52 @@ test("resolves attachment images to data for vision models", async () => {
   const image = sink.messages?.at(-1)?.parts.find((p) => p.type === "image");
   assert.ok(image && image.type === "image");
   assert.deepEqual(image.source, { kind: "data", data: "BBBB", mime: "image/png" });
+});
+
+test("records provider usage on the assistant message it persists", async () => {
+  const persisted: ChatMessage[] = [];
+  await runAgent(
+    spendingProvider([{ inputTokens: 120, outputTokens: 30, totalTokens: 150 }]),
+    {},
+    undefined,
+    (_sessionId, message) => {
+      persisted.push(message);
+    },
+  );
+
+  const assistant = persisted.find((m) => m.role === "assistant");
+  assert.ok(assistant);
+  assert.deepEqual(assistant.meta?.usage, {
+    inputTokens: 120,
+    outputTokens: 30,
+    totalTokens: 150,
+  });
+  // The provider/model stamp must survive alongside the new usage field.
+  assert.equal(assistant.meta?.provider, "spend");
+});
+
+test("a provider that reports no split total still yields a usable figure", async () => {
+  const persisted: ChatMessage[] = [];
+  await runAgent(
+    spendingProvider([{ inputTokens: 40, outputTokens: 8 }]),
+    {},
+    undefined,
+    (_sessionId, message) => {
+      persisted.push(message);
+    },
+  );
+
+  const assistant = persisted.find((m) => m.role === "assistant");
+  assert.ok(assistant?.meta?.usage);
+  assert.equal(usageTotal(assistant.meta.usage), 48);
+});
+
+test("usage is still relayed as a stream event", async () => {
+  const events = await runAgent(spendingProvider([{ inputTokens: 5, outputTokens: 1 }]), {});
+  const usageEvents = events.filter((e) => e.type === "usage");
+  assert.equal(usageEvents.length, 1);
+  assert.deepEqual(usageEvents[0], {
+    type: "usage",
+    usage: { inputTokens: 5, outputTokens: 1 },
+  });
 });

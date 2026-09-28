@@ -6,7 +6,12 @@ export interface CapTag {
   title: string;
 }
 
-/** Compact context-window label: 1048576 -> "1M", 200000 -> "200k", 8192 -> "8k". */
+/**
+ * Compact context-window label: 1048576 -> "1M", 200000 -> "200k", 8192 -> "8k".
+ * Deliberately rounds to whole thousands, unlike the measured counts in
+ * `tokens.ts`: a window is an advertised round number, so "8k" reads truer than
+ * "8.2k".
+ */
 export function formatContext(tokens: number): string {
   if (!Number.isFinite(tokens) || tokens <= 0) return "";
   if (tokens >= 1_000_000) {

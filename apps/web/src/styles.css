@@ -930,6 +930,14 @@ select {
   color: var(--fg-dim);
 }
 
+.token-count {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  cursor: default;
+}
+
 .allowlist-input {
   flex: 1;
   min-width: 130px;

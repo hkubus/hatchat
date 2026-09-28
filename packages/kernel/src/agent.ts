@@ -14,8 +14,9 @@ import type {
   SecretStore,
   ToolContext,
   ToolPolicy,
+  Usage,
 } from "@hat/core";
-import { DEFAULT_TOOL_POLICY, decideTool, newId, normalizeError } from "@hat/core";
+import { DEFAULT_TOOL_POLICY, addUsage, decideTool, newId, normalizeError } from "@hat/core";
 import type { ProviderRegistry, ToolRegistry } from "./registries.js";
 
 export interface AgentTurnInput {
@@ -111,6 +112,7 @@ export class Agent {
       const calls: ToolCallRecord[] = [];
       let text = "";
       let reasoning = "";
+      let usage: Usage | undefined;
       let finish: FinishReason = "stop";
 
       const request: ChatRequest = {
@@ -140,6 +142,7 @@ export class Agent {
               calls.push(event.call);
               break;
             case "usage":
+              usage = addUsage(usage, event.usage);
               yield { type: "usage", usage: event.usage };
               break;
             case "done":
@@ -166,6 +169,9 @@ export class Agent {
       }
       for (const call of calls) {
         assistant.parts.push({ type: "tool_call", id: call.id, name: call.name, args: call.args });
+      }
+      if (usage) {
+        assistant.meta = { ...assistant.meta, usage };
       }
       messages.push(assistant);
       this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
