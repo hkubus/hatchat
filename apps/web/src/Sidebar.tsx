@@ -36,6 +36,7 @@ export default function Sidebar({
 }: SidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
 
   function commit(): void {
     const title = draft.trim();
@@ -64,6 +65,7 @@ export default function Sidebar({
                 className="session-rename"
                 autoFocus
                 value={draft}
+                aria-label="Session title"
                 onChange={(e) => setDraft(e.target.value)}
                 onBlur={commit}
                 onKeyDown={(e) => {
@@ -71,6 +73,24 @@ export default function Sidebar({
                   if (e.key === "Escape") setEditingId(null);
                 }}
               />
+            ) : confirmingId === session.id ? (
+              /* Delete is destructive and irreversible, so it is confirmed in
+                 place rather than through a blocking native dialog. */
+              <div className="session-confirm" role="group" aria-label="Confirm delete">
+                <span className="session-confirm-text">Delete?</span>
+                <button
+                  className="danger tiny"
+                  onClick={() => {
+                    setConfirmingId(null);
+                    onDelete(session.id);
+                  }}
+                >
+                  Delete
+                </button>
+                <button className="ghost tiny" onClick={() => setConfirmingId(null)}>
+                  Cancel
+                </button>
+              </div>
             ) : (
               <>
                 <button
@@ -87,6 +107,7 @@ export default function Sidebar({
                   <button
                     className="icon-btn"
                     title="Rename"
+                    aria-label={`Rename ${session.title}`}
                     onClick={() => {
                       setEditingId(session.id);
                       setDraft(session.title);
@@ -99,9 +120,8 @@ export default function Sidebar({
                   <button
                     className="icon-btn"
                     title="Delete"
-                    onClick={() => {
-                      if (confirm(`Delete "${session.title}"?`)) onDelete(session.id);
-                    }}
+                    aria-label={`Delete ${session.title}`}
+                    onClick={() => setConfirmingId(session.id)}
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
@@ -118,6 +138,7 @@ export default function Sidebar({
         <button
           className={`side-btn ${view === "settings" ? "active" : ""}`}
           onClick={() => onView(view === "settings" ? "chat" : "settings")}
+          aria-label="Settings"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M4 6h16M4 12h16M4 18h16" />
@@ -128,7 +149,7 @@ export default function Sidebar({
           Settings
         </button>
         {onLogout && (
-          <button className="side-btn" onClick={onLogout}>
+          <button className="side-btn" onClick={onLogout} aria-label="Sign out">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
             </svg>
