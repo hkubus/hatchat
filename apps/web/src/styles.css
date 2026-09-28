@@ -279,6 +279,22 @@ select {
   font-size: 13px;
 }
 
+/* Delete confirms in place: the row swaps its actions for the question, so the
+   decision stays where the eye already is. */
+.session-confirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  padding: 4px 6px 4px 10px;
+}
+
+.session-confirm-text {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
 .sidebar-foot {
   border-top: 1px solid var(--border);
   padding: 8px;
@@ -436,6 +452,14 @@ select {
   letter-spacing: -0.02em;
   margin: 0 0 10px;
   color: var(--fg);
+}
+
+.restoring {
+  margin: auto;
+  text-align: center;
+  color: var(--fg-dim);
+  font-size: 13px;
+  padding-top: 12vh;
 }
 
 .empty p {
@@ -820,6 +844,20 @@ select {
 .send-btn svg {
   width: 16px;
   height: 16px;
+}
+
+/* The send button's twin while a turn streams: same footprint, but it stops
+   the turn instead of queueing another one. */
+.send-btn.stop {
+  background: var(--surface-3);
+  color: var(--fg);
+  border: 1px solid var(--border-2);
+}
+
+.send-btn.stop:hover {
+  background: var(--danger);
+  color: #0a0a0a;
+  border-color: transparent;
 }
 
 /* The bottom bar: model, reasoning effort and tool policy sit directly under
@@ -1379,6 +1417,54 @@ select {
   border: 1px solid #454545;
   border-radius: var(--radius);
   padding: 11px 13px;
+}
+
+/* ---- error boundary ------------------------------------------------------ */
+
+.fatal {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+}
+
+.fatal-card {
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 28px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+
+.fatal-card h1 {
+  margin: 0;
+  font-size: 19px;
+  letter-spacing: -0.01em;
+}
+
+.fatal-detail {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fatal-actions {
+  display: flex;
+  gap: 8px;
 }
 
 /* ---- settings ----------------------------------------------------------- */

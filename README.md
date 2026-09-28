@@ -219,6 +219,14 @@ Messages form a **tree**; the active path is root→leaf, so:
 Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
 
+The browser keeps the open session in `localStorage` (`hat.session`) and
+reloads it on boot, so a refresh mid-conversation lands you back in it. While a
+turn streams, the send button becomes **Stop** (or `Esc`): it aborts the
+request, which the server turns into a real `AbortController.abort()` for the
+turn, so a runaway generation or a hung tool stops instead of only being hidden.
+The view only follows the stream while you are already at the bottom — scroll
+up to read back without being yanked down on every delta.
+
 ## Desktop app (M7)
 
 `apps/desktop` is a **Tauri v2 shell around the same web UI** — there is no
@@ -269,7 +277,7 @@ default `HAT_ENROLL_TOKEN=dev-enroll-token`, so dev works with no config.
 
 ```sh
 pnpm typecheck    # tsc across all packages
-pnpm test         # node:test unit tests (providers, crypto, store)
+pnpm test         # node:test unit tests (providers, crypto, store, web SSE parser)
 pnpm smoke        # boots server + runner, exercises turn/approval/branching
 ```
 

@@ -49,6 +49,9 @@ interface PendingAttachment {
 
 const DEFAULT_MODEL = "fake/fake-agent";
 
+/** How close to the bottom the scroller has to be to keep following the stream. */
+const NEAR_BOTTOM_PX = 72;
+
 function textOf(parts: Part[]): string {
   return parts
     .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
@@ -153,7 +156,9 @@ export default function App() {
   const [model, setModel] = useState(
     () => localStorage.getItem("hat.model") ?? DEFAULT_MODEL,
   );
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(
+    () => localStorage.getItem("hat.session"),
+  );
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [streaming, setStreaming] = useState<UiMessage | null>(null);
   const [input, setInput] = useState("");
@@ -178,12 +183,32 @@ export default function App() {
   });
   const [editing, setEditing] = useState<{ messageId: string; text: string } | null>(null);
   const [pending, setPending] = useState<PendingAttachment[]>([]);
+  const [restoring, setRestoring] = useState(false);
   // Usage for the turn currently in flight. The server persists it onto the
   // assistant message, so this only exists to keep the readout moving live.
   const [liveUsage, setLiveUsage] = useState<Usage | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  /** Set while a turn is streaming so the composer can stop it. */
+  const abortRef = useRef<AbortController | null>(null);
+  /** False once the user scrolls up, so streaming stops yanking the view down. */
+  const stickToBottom = useRef(true);
+  /** Mirrors `sessionId` for callbacks that must not re-subscribe on change. */
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const measure = (): void => {
+      stickToBottom.current =
+        el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+    };
+    el.addEventListener("scroll", measure, { passive: true });
+    measure();
+    return () => el.removeEventListener("scroll", measure);
+  }, []);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -266,6 +291,54 @@ export default function App() {
     localStorage.setItem("hat.favorites", JSON.stringify(favorites));
   }, [favorites]);
 
+  useEffect(() => {
+    if (sessionId) localStorage.setItem("hat.session", sessionId);
+    else localStorage.removeItem("hat.session");
+  }, [sessionId]);
+
+  /**
+   * Reopen the conversation that was on screen before the reload. Everything
+   * needed is already on the server, so a refresh mid-answer should not cost
+   * the user their session.
+   */
+  useEffect(() => {
+    if (!authenticated) return;
+    const stored = localStorage.getItem("hat.session");
+    if (!stored) return;
+    let cancelled = false;
+    setRestoring(true);
+    void api
+      .getSession(stored)
+      .then((payload) => {
+        // The user may have picked another session while this was in flight.
+        if (cancelled || sessionIdRef.current !== stored) return;
+        setSessionId(payload.session.id);
+        setMessages(buildMessages(payload.path));
+        applySession(payload.session);
+        stickToBottom.current = true;
+      })
+      .catch((e: unknown) => {
+        if (cancelled || sessionIdRef.current !== stored) return;
+        // Gone is permanent, so the stale pointer is dropped. Everything else
+        // — 401, a server that is still starting, no network at all — is not,
+        // and the stored pointer survives to be retried on the next load.
+        if (e instanceof api.HttpError && e.status === 404) {
+          setSessionId(null);
+          return;
+        }
+        // 401 is not this effect's problem: the unauthorized handler is already
+        // showing the login screen, and the restore retries once past it.
+        if (!(e instanceof api.HttpError && e.status === 401)) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticated]);
+
   function toggleFavorite(id: string): void {
     setFavorites((prev) => (prev.includes(id) ? prev.filter((f) => f !== id) : [...prev, id]));
   }
@@ -278,7 +351,11 @@ export default function App() {
   }, [models]);
 
   useEffect(() => {
-    scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
+    const el = scroller.current;
+    if (!el || !stickToBottom.current) return;
+    // Smooth for a new message, instant while tokens stream in: animating every
+    // delta makes the view lag behind the text.
+    el.scrollTo({ top: el.scrollHeight, behavior: streaming ? "auto" : "smooth" });
   }, [messages, streaming]);
 
   const selectedModel = models.find((m) => m.id === model);
@@ -440,17 +517,23 @@ export default function App() {
 
   async function runStream(
     id: string,
-    fn: (onEvent: (event: KernelEvent) => void) => Promise<void>,
+    fn: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    // Starting a turn is an explicit request to watch it, even from scrollback.
+    stickToBottom.current = true;
     setBusy(true);
     setError(null);
     setStreaming(null);
     setWarnings([]);
     try {
-      await fn(handleEvent);
+      await fn(handleEvent, controller.signal);
     } catch (e) {
-      setError(String(e));
+      // A turn the user stopped is not a failure; the server already unwound it.
+      if (!api.isAbortError(e)) setError(String(e));
     } finally {
+      abortRef.current = null;
       await refresh(id).catch(() => undefined);
       await refreshSessions();
       // Drop the live figure only once the persisted usage is in `messages`,
@@ -459,6 +542,10 @@ export default function App() {
       setStreaming(null);
       setBusy(false);
     }
+  }
+
+  function stop(): void {
+    abortRef.current?.abort();
   }
 
   async function ensureSession(): Promise<string> {
@@ -511,9 +598,11 @@ export default function App() {
 
     try {
       const id = await ensureSession();
-      await runStream(id, (onEvent) => api.sendTurn(id, text, model, attachmentIds, onEvent));
+      await runStream(id, (onEvent, signal) =>
+        api.sendTurn(id, text, model, attachmentIds, onEvent, signal),
+      );
     } catch (e) {
-      setError(String(e));
+      if (!api.isAbortError(e)) setError(String(e));
       setBusy(false);
     } finally {
       attachments.forEach((a) => URL.revokeObjectURL(a.previewUrl));
@@ -521,12 +610,14 @@ export default function App() {
   }
 
   async function newChat(): Promise<void> {
+    stop();
     setMessages([]);
     setStreaming(null);
     setError(null);
     setWarnings([]);
     setEditing(null);
     setView("chat");
+    stickToBottom.current = true;
     const payload = await api.createSession(model);
     setSessionId(payload.session.id);
     applySession(payload.session);
@@ -534,12 +625,14 @@ export default function App() {
   }
 
   async function openSession(id: string): Promise<void> {
+    stop();
     setBusy(false);
     setError(null);
     setWarnings([]);
     setStreaming(null);
     setEditing(null);
     setView("chat");
+    stickToBottom.current = true;
     const payload = await api.getSession(id);
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
@@ -574,6 +667,7 @@ export default function App() {
   }
 
   async function doLogout(): Promise<void> {
+    stop();
     await api.logout();
     setAuth({ required: true, authenticated: false });
     setSessionId(null);
@@ -583,7 +677,9 @@ export default function App() {
 
   async function regenerate(messageId: string): Promise<void> {
     if (!sessionId || busy) return;
-    await runStream(sessionId, (onEvent) => api.regenerate(sessionId, messageId, onEvent));
+    await runStream(sessionId, (onEvent, signal) =>
+      api.regenerate(sessionId, messageId, onEvent, signal),
+    );
   }
 
   async function submitEdit(): Promise<void> {
@@ -591,7 +687,9 @@ export default function App() {
     const { messageId, text } = editing;
     if (!text.trim()) return;
     setEditing(null);
-    await runStream(sessionId, (onEvent) => api.editMessage(sessionId, messageId, text, onEvent));
+    await runStream(sessionId, (onEvent, signal) =>
+      api.editMessage(sessionId, messageId, text, onEvent, signal),
+    );
   }
 
   async function switchBranch(messageId: string): Promise<void> {
@@ -676,6 +774,8 @@ export default function App() {
                 className="ghost tiny"
                 disabled={m.branch.index <= 0 || busy}
                 onClick={() => void switchBranch(m.branch!.ids[m.branch!.index - 1])}
+                aria-label="Previous version"
+                title="Previous version"
               >
                 ‹
               </button>
@@ -686,6 +786,8 @@ export default function App() {
                 className="ghost tiny"
                 disabled={m.branch.index >= m.branch.count - 1 || busy}
                 onClick={() => void switchBranch(m.branch!.ids[m.branch!.index + 1])}
+                aria-label="Next version"
+                title="Next version"
               >
                 ›
               </button>
@@ -838,7 +940,11 @@ export default function App() {
           )}
 
           <div className="scroller" ref={scroller}>
-            {messages.length === 0 && !streaming && (
+            {restoring && messages.length === 0 && !streaming && (
+              <div className="restoring">Restoring conversation…</div>
+            )}
+
+            {messages.length === 0 && !streaming && !restoring && (
               <div className="empty">
                 <h2>hat</h2>
                 <p>
@@ -867,7 +973,12 @@ export default function App() {
                   {pending.map((attachment, index) => (
                     <span key={attachment.previewUrl} className="chip">
                       <img src={attachment.previewUrl} alt="pending" />
-                      <button className="chip-remove" onClick={() => removePending(index)}>
+                      <button
+                        className="chip-remove"
+                        onClick={() => removePending(index)}
+                        aria-label="Remove attachment"
+                        title="Remove attachment"
+                      >
                         ×
                       </button>
                     </span>
@@ -889,6 +1000,11 @@ export default function App() {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     void send();
+                    return;
+                  }
+                  if (e.key === "Escape" && busy) {
+                    e.preventDefault();
+                    stop();
                   }
                 }}
                 rows={1}
@@ -898,21 +1014,36 @@ export default function App() {
                   className="icon-btn"
                   onClick={() => fileInput.current?.click()}
                   title="Attach images"
+                  aria-label="Attach images"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M21.4 11.05 12.5 20a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />
                   </svg>
                 </button>
-                <button
-                  className="send-btn"
-                  onClick={() => void send()}
-                  disabled={busy || (!input.trim() && pending.length === 0)}
-                  title="Send"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                    <path d="M12 19V5M5 12l7-7 7 7" />
-                  </svg>
-                </button>
+                {busy ? (
+                  <button
+                    className="send-btn stop"
+                    onClick={stop}
+                    title="Stop generating"
+                    aria-label="Stop generating"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                      <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    className="send-btn"
+                    onClick={() => void send()}
+                    disabled={!input.trim() && pending.length === 0}
+                    title="Send"
+                    aria-label="Send message"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                      <path d="M12 19V5M5 12l7-7 7 7" />
+                    </svg>
+                  </button>
+                )}
               </div>
 
               <div className="composer-footer">

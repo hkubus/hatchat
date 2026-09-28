@@ -6,6 +6,29 @@ import type {
   Usage,
 } from "@hat/core";
 import { apiUrl, bearerHeaders } from "./runtime";
+import { SseFrameParser, decodeFrame } from "./sse";
+
+/** Carries the HTTP status so callers can tell "gone" from "unreachable". */
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly url: string,
+  ) {
+    super(`${url}: ${status}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
+ * True for the rejection `fetch` raises when an `AbortSignal` fires. Matched on
+ * `name` rather than `instanceof`: the rejection is a `DOMException`, and older
+ * WebKit builds do not have it inheriting from `Error`.
+ */
+export function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError"
+  );
+}
 
 export interface RunnerSummary {
   id: string;
@@ -171,7 +194,7 @@ export async function logout(): Promise<void> {
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await authFetch(url);
-  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  if (!res.ok) throw new HttpError(res.status, url);
   return (await res.json()) as T;
 }
 
@@ -304,53 +327,52 @@ export async function resolveApproval(
   });
 }
 
+/**
+ * Consume a kernel SSE endpoint. Aborting `signal` tears the request down from
+ * the client side; the server turns that into a real `AbortController.abort()`
+ * for the turn, so a runaway generation or a hung tool stops promptly instead
+ * of only being hidden.
+ */
 async function postSSE(
   url: string,
   body: unknown,
   onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const res = await authFetch(url, {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(body),
+    signal,
   });
-  if (!res.ok || !res.body) throw new Error(`${url}: ${res.status}`);
+  if (!res.ok || !res.body) throw new HttpError(res.status, url);
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
+  const parser = new SseFrameParser();
 
-  function drain(): void {
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = chunk
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim())
-        .join("");
-      if (data) {
-        try {
-          onEvent(JSON.parse(data) as KernelEvent);
-        } catch {
-          /* ignore malformed frame */
-        }
-      }
-      boundary = buffer.indexOf("\n\n");
+  function emit(payloads: string[]): void {
+    for (const payload of payloads) {
+      // A frame can be truncated or non-JSON; that must not end the turn.
+      const event = decodeFrame<KernelEvent>(payload);
+      if (event) onEvent(event);
     }
   }
 
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    drain();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      emit(parser.push(decoder.decode(value, { stream: true })));
+    }
+    // Flush the decoder and whatever is left, so a final frame is not lost when
+    // the stream ends mid-frame.
+    emit(parser.push(decoder.decode()));
+    emit(parser.flush());
+  } finally {
+    // Also runs on abort, which errors the pending read and releases the socket.
+    await reader.cancel().catch(() => undefined);
   }
-  // Flush the decoder and whatever is left, so a final frame is not lost when
-  // the stream ends mid-frame.
-  buffer += decoder.decode();
-  drain();
 }
 
 export function sendTurn(
@@ -359,11 +381,13 @@ export function sendTurn(
   model: string,
   attachmentIds: string[],
   onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   return postSSE(
     `/api/sessions/${encodeURIComponent(sessionId)}/turn`,
     { text, model, attachmentIds },
     onEvent,
+    signal,
   );
 }
 
@@ -382,11 +406,13 @@ export function regenerate(
   sessionId: string,
   messageId: string,
   onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   return postSSE(
     `/api/sessions/${encodeURIComponent(sessionId)}/regenerate`,
     { messageId },
     onEvent,
+    signal,
   );
 }
 
@@ -395,11 +421,13 @@ export function editMessage(
   messageId: string,
   text: string,
   onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   return postSSE(
     `/api/sessions/${encodeURIComponent(sessionId)}/edit`,
     { messageId, text },
     onEvent,
+    signal,
   );
 }
 
