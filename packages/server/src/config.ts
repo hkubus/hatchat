@@ -3,9 +3,17 @@ import { hashPassword } from "@hat/auth";
 /**
  * Native shells (Tauri desktop, mobile webviews) serve the UI from their own
  * asset origin, so the API has to opt those origins in. Desktop uses
- * `tauri://localhost` on macOS/Linux and `http://tauri.localhost` on Windows.
+ * `tauri://localhost` on macOS/Linux and `http://tauri.localhost` on Windows;
+ * in `tauri dev` the window loads the vite dev server instead, which is a
+ * plain `http://localhost` origin.
  */
-const DEFAULT_CORS_ORIGINS = ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
+const DEFAULT_CORS_ORIGINS = [
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+];
 
 export interface S3Config {
   bucket: string;

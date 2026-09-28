@@ -23,7 +23,6 @@ export interface SessionRecord {
   activeLeafId: string | null;
   approvalMode: ApprovalMode;
   allowedTools: string[];
-  autoRoute: boolean;
   reasoningEffort: ReasoningEffort;
   createdAt: number;
   updatedAt: number;
@@ -64,7 +63,6 @@ interface SessionRow {
   active_leaf_id: string | null;
   approval_mode: string;
   allowed_tools: string;
-  auto_route: number;
   reasoning_effort: string;
   created_at: number;
   updated_at: number;
@@ -105,7 +103,6 @@ export class Store implements SecretStore {
     const columns = [
       "approval_mode TEXT NOT NULL DEFAULT 'ask'",
       "allowed_tools TEXT NOT NULL DEFAULT '[]'",
-      "auto_route INTEGER NOT NULL DEFAULT 0",
       "reasoning_effort TEXT NOT NULL DEFAULT 'off'",
     ];
     for (const column of columns) {
@@ -114,6 +111,14 @@ export class Store implements SecretStore {
       } catch {
         /* column already exists */
       }
+    }
+    // Auto-route was removed; drop the legacy column where SQLite supports it.
+    // Wrapped because older SQLite builds lack DROP COLUMN, and an untouched
+    // column is harmless either way.
+    try {
+      this.db.exec("ALTER TABLE sessions DROP COLUMN auto_route");
+    } catch {
+      /* already dropped, or unsupported */
     }
   }
 
@@ -139,7 +144,6 @@ export class Store implements SecretStore {
       activeLeafId: null,
       approvalMode: "ask",
       allowedTools: [],
-      autoRoute: false,
       reasoningEffort: "off",
       createdAt: now,
       updatedAt: now,
@@ -180,18 +184,17 @@ export class Store implements SecretStore {
 
   setSessionPolicy(
     sessionId: string,
-    patch: { approvalMode?: ApprovalMode; allowedTools?: string[]; autoRoute?: boolean },
+    patch: { approvalMode?: ApprovalMode; allowedTools?: string[] },
   ): void {
     const session = this.getSession(sessionId);
     if (!session) return;
     this.db
       .prepare(
-        `UPDATE sessions SET approval_mode = ?, allowed_tools = ?, auto_route = ?, updated_at = ? WHERE id = ?`,
+        `UPDATE sessions SET approval_mode = ?, allowed_tools = ?, updated_at = ? WHERE id = ?`,
       )
       .run(
         patch.approvalMode ?? session.approvalMode,
         JSON.stringify(patch.allowedTools ?? session.allowedTools),
-        (patch.autoRoute ?? session.autoRoute) ? 1 : 0,
         Date.now(),
         sessionId,
       );
@@ -457,7 +460,6 @@ function toSession(row: SessionRow): SessionRecord {
     activeLeafId: row.active_leaf_id,
     approvalMode: (row.approval_mode as ApprovalMode) ?? "ask",
     allowedTools: row.allowed_tools ? (JSON.parse(row.allowed_tools) as string[]) : [],
-    autoRoute: row.auto_route === 1,
     reasoningEffort: (row.reasoning_effort as ReasoningEffort) ?? "off",
     createdAt: row.created_at,
     updatedAt: row.updated_at,

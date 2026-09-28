@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "hat",
-  "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "version": "0.0.0",
+  "identifier": "dev.hat.desktop",
   "build": {
     "frontendDist": "../web/dist",
     "devUrl": "http://localhost:5173",
@@ -10,17 +10,22 @@
     "beforeBuildCommand": "pnpm --filter @hat/web build"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "hat",
-        "width": 800,
-        "height": 600,
+        "width": 1100,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 520,
+        "center": true,
         "resizable": true,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http: https: ws: wss:; object-src 'none'; base-uri 'self'; frame-src 'none'"
     }
   },
   "bundle": {

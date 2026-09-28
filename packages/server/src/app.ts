@@ -39,7 +39,6 @@ import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { ApprovalManager } from "./approvals.js";
-import { ModelCatalog } from "./catalog.js";
 import type { ServerConfig } from "./config.js";
 import { createFakePlugin } from "./fake-provider.js";
 import { RunnerRegistry } from "./link.js";
@@ -257,8 +256,6 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return next();
   });
 
-  const catalog = new ModelCatalog(providers);
-
   function capabilitiesFor(modelId: string): ProviderCapabilities | undefined {
     try {
       const { provider, model } = providers.resolve(modelId);
@@ -288,35 +285,19 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         activeTurns.delete(options.sessionId);
       });
 
-      // Capability routing: warn or re-route when the model can't do what the
-      // conversation needs (e.g. vision on an image-only turn).
-      let model = session?.model ?? "fake/fake-agent";
+      // Capability check: warn when the model can't do what the conversation
+      // needs (e.g. vision on an image-only turn). The model is never swapped
+      // out from under the user; picking a different one is their decision.
+      const model = session?.model ?? "fake/fake-agent";
       if (session) {
         const needs = inferNeeds(options.history);
         const caps = capabilitiesFor(model);
         const unmet = caps ? unmetNeeds(caps, needs) : [];
         if (unmet.length > 0) {
-          if (session.autoRoute) {
-            const alternative = await catalog.findForNeeds(needs, model);
-            if (alternative) {
-              model = alternative.id;
-              store.setSessionModel(session.id, model);
-              queue.push({
-                type: "warning",
-                message: `Auto-routed to ${alternative.label} (needs: ${unmet.join(", ")}).`,
-              });
-            } else {
-              queue.push({
-                type: "warning",
-                message: `This model lacks ${unmet.join(", ")} and no alternative is available.`,
-              });
-            }
-          } else {
-            queue.push({
-              type: "warning",
-              message: `The selected model does not support ${unmet.join(", ")}. Enable auto-route or choose another model.`,
-            });
-          }
+          queue.push({
+            type: "warning",
+            message: `The selected model does not support ${unmet.join(", ")}. Choose another model.`,
+          });
         }
       }
 
@@ -342,11 +323,15 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         }
       })();
 
+      const keepalive = setInterval(() => {
+        void stream.write(": keepalive\n\n");
+      }, 2000);
       try {
         for await (const event of queue) {
           await stream.writeSSE({ event: "kernel", data: JSON.stringify(event) });
         }
       } finally {
+        clearInterval(keepalive);
         await producer;
       }
     });
@@ -520,7 +505,6 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       title?: string;
       approvalMode?: "ask" | "auto" | "allowlist" | "deny";
       allowedTools?: string[];
-      autoRoute?: boolean;
       reasoningEffort?: unknown;
     } = {};
     try {
@@ -538,7 +522,6 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     store.setSessionPolicy(session.id, {
       approvalMode: body.approvalMode,
       allowedTools: body.allowedTools,
-      autoRoute: body.autoRoute,
     });
     return c.json({ session: store.getSession(session.id) });
   });

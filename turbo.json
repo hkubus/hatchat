@@ -16,6 +16,11 @@
     "dev": {
       "cache": false,
       "persistent": true
+    },
+    "@hat/desktop#bundle": {
+      "dependsOn": ["@hat/web#build"],
+      "outputs": ["src-tauri/target/release/bundle/**"],
+      "cache": false
     }
   }
 }

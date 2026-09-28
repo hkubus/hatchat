@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build",
-    "bundle": "tauri build --bundles appimage,deb,dmg,nsis,msi",
+    "bundle": "tauri build",
     "tauri": "tauri"
   },
   "devDependencies": {

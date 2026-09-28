@@ -3,10 +3,12 @@ import { REASONING_EFFORTS } from "@hat/core";
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import Connect from "./Connect";
 import MessageImage from "./MessageImage";
+import ModelPicker from "./ModelPicker";
 import Settings from "./Settings";
 import Sidebar from "./Sidebar";
 import * as api from "./api";
 import type { PathNode, PluginDescriptor, ProviderStatus, RunnerSummary, SessionSummary } from "./api";
+import { capSummary, capTags } from "./capTags";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
 
@@ -157,7 +159,14 @@ export default function App() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [policyMode, setPolicyMode] = useState<"ask" | "auto" | "allowlist" | "deny">("ask");
   const [allowedToolsText, setAllowedToolsText] = useState("");
-  const [autoRoute, setAutoRoute] = useState(false);
+  const [favorites, setFavorites] = useState<string[]>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem("hat.favorites") ?? "[]");
+      return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  });
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(() => {
     const stored = localStorage.getItem("hat.effort");
     return (REASONING_EFFORTS as readonly string[]).includes(stored ?? "")
@@ -248,6 +257,14 @@ export default function App() {
   }, [reasoningEffort]);
 
   useEffect(() => {
+    localStorage.setItem("hat.favorites", JSON.stringify(favorites));
+  }, [favorites]);
+
+  function toggleFavorite(id: string): void {
+    setFavorites((prev) => (prev.includes(id) ? prev.filter((f) => f !== id) : [...prev, id]));
+  }
+
+  useEffect(() => {
     if (models.length > 0 && !models.some((m) => m.id === model)) {
       setModel(models[0].id);
     }
@@ -257,16 +274,6 @@ export default function App() {
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
   }, [messages, streaming]);
-
-  const groups = useMemo(() => {
-    const map = new Map<string, ModelInfo[]>();
-    for (const m of models) {
-      const list = map.get(m.provider) ?? [];
-      list.push(m);
-      map.set(m.provider, list);
-    }
-    return [...map.entries()];
-  }, [models]);
 
   const selectedModel = models.find((m) => m.id === model);
   const effortSupported = Boolean(selectedModel?.capabilities.reasoningEffort);
@@ -354,7 +361,6 @@ export default function App() {
     setModel(session.model);
     setPolicyMode(session.approvalMode);
     setAllowedToolsText(session.allowedTools.join(", "));
-    setAutoRoute(session.autoRoute);
     setReasoningEffort(session.reasoningEffort);
   }
 
@@ -383,7 +389,6 @@ export default function App() {
       const updated = await api.updateSession(sessionId, {
         approvalMode: policyMode,
         allowedTools: parseAllowlist(allowedToolsText),
-        autoRoute,
       });
       applySession(updated);
     } catch (e) {
@@ -405,11 +410,6 @@ export default function App() {
   function changePolicyMode(mode: typeof policyMode): void {
     setPolicyMode(mode);
     persist({ approvalMode: mode });
-  }
-
-  function changeAutoRoute(enabled: boolean): void {
-    setAutoRoute(enabled);
-    persist({ autoRoute: enabled });
   }
 
   async function refresh(id: string): Promise<void> {
@@ -444,11 +444,10 @@ export default function App() {
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     await refreshSessions();
-    if (policyMode !== "ask" || autoRoute || reasoningEffort !== "off") {
+    if (policyMode !== "ask" || reasoningEffort !== "off") {
       const updated = await api.updateSession(payload.session.id, {
         approvalMode: policyMode,
         allowedTools: parseAllowlist(allowedToolsText),
-        autoRoute,
         reasoningEffort,
       });
       applySession(updated);
@@ -894,24 +893,13 @@ export default function App() {
               </div>
 
               <div className="composer-footer">
-                <select
-                  className="composer-select model-select"
+                <ModelPicker
+                  models={models}
                   value={model}
-                  onChange={(e) => changeModel(e.target.value)}
-                  aria-label="Model"
-                  title={model}
-                >
-                  {groups.length === 0 && <option value={DEFAULT_MODEL}>{DEFAULT_MODEL}</option>}
-                  {groups.map(([provider, list]) => (
-                    <optgroup key={provider} label={provider}>
-                      {list.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select>
+                  favorites={favorites}
+                  onChange={changeModel}
+                  onToggleFavorite={toggleFavorite}
+                />
 
                 <select
                   className={`composer-select ${reasoningEffort !== "off" ? "on" : ""}`}
@@ -959,30 +947,18 @@ export default function App() {
                   />
                 )}
 
-                <label
-                  className={`composer-toggle ${autoRoute ? "on" : ""}`}
-                  title="Switch models automatically when the current one cannot handle the message"
-                >
-                  <input
-                    type="checkbox"
-                    checked={autoRoute}
-                    onChange={(e) => changeAutoRoute(e.target.checked)}
-                  />
-                  auto-route
-                </label>
-
                 <span className="composer-spacer" />
 
                 {selectedModel && (
-                  <span className="composer-caps" title={`${selectedModel.label} capabilities`}>
-                    {selectedModel.capabilities.toolCalls && <span className="cap">tools</span>}
-                    {selectedModel.capabilities.vision && <span className="cap">vision</span>}
-                    {selectedModel.capabilities.reasoning && <span className="cap">reasoning</span>}
-                    {selectedModel.contextWindow && (
-                      <span className="cap muted">
-                        {Math.round(selectedModel.contextWindow / 1000)}k ctx
+                  <span className="composer-caps" title={capSummary(selectedModel)}>
+                    {capTags(selectedModel.capabilities, selectedModel.contextWindow).map((tag) => (
+                      <span
+                        className={`cap ${tag.key === "ctx" ? "muted" : ""}`}
+                        key={tag.key}
+                      >
+                        {tag.label}
                       </span>
-                    )}
+                    ))}
                   </span>
                 )}
               </div>

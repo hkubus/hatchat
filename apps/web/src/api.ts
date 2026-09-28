@@ -13,7 +13,6 @@ export interface SessionRecord {
   activeLeafId: string | null;
   approvalMode: "ask" | "auto" | "allowlist" | "deny";
   allowedTools: string[];
-  autoRoute: boolean;
   reasoningEffort: ReasoningEffort;
   createdAt: number;
   updatedAt: number;
@@ -258,7 +257,6 @@ export async function updateSession(
     title?: string;
     approvalMode?: SessionRecord["approvalMode"];
     allowedTools?: string[];
-    autoRoute?: boolean;
     reasoningEffort?: ReasoningEffort;
   },
 ): Promise<SessionRecord> {
@@ -314,8 +312,11 @@ async function postSSE(
   const decoder = new TextDecoder();
   let buffer = "";
 
+  let reads = 0;
   for (;;) {
     const { value, done } = await reader.read();
+    reads += 1;
+    void fetch(`http://127.0.0.1:8899/js/read?${reads}:${done ? "done" : value?.byteLength}`, { mode: "no-cors" }).catch(() => undefined);
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let boundary = buffer.indexOf("\n\n");
@@ -329,6 +330,7 @@ async function postSSE(
         .join("");
       if (data) {
         try {
+          void fetch(`http://127.0.0.1:8899/js/frame?${encodeURIComponent(JSON.parse(data).type as string)}`, { mode: "no-cors" }).catch(() => undefined);
           onEvent(JSON.parse(data) as KernelEvent);
         } catch {
           /* ignore malformed frame */

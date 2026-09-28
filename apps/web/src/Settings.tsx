@@ -9,6 +9,7 @@ import {
   setPluginEnabled,
   setSecret,
 } from "./api";
+import { capTags } from "./capTags";
 
 interface SettingsProps {
   models: ModelInfo[];
@@ -430,12 +431,11 @@ export default function Settings({
           <div key={m.id} className="settings-row compact">
             <span className="settings-name mono">{m.id}</span>
             <span className="caps">
-              {m.capabilities.toolCalls && <span className="cap">tools</span>}
-              {m.capabilities.vision && <span className="cap">vision</span>}
-              {m.capabilities.reasoning && <span className="cap">reasoning</span>}
-              {m.contextWindow && (
-                <span className="cap muted">{Math.round(m.contextWindow / 1000)}k</span>
-              )}
+              {capTags(m.capabilities, m.contextWindow).map((tag) => (
+                <span className={`cap ${tag.key === "ctx" ? "muted" : ""}`} key={tag.key} title={tag.title}>
+                  {tag.label}
+                </span>
+              ))}
             </span>
           </div>
         ))}

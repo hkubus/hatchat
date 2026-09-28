@@ -12,12 +12,14 @@
     "dev:server": "tsx watch packages/server/src/index.ts",
     "dev:runner": "tsx watch packages/runner/src/index.ts",
     "dev:web": "pnpm --filter @hat/web dev",
+    "dev:desktop": "pnpm --filter @hat/desktop dev",
     "start:server": "tsx packages/server/src/index.ts",
     "start:runner": "tsx packages/runner/src/index.ts",
     "typecheck": "turbo run typecheck",
     "build": "turbo run build",
     "test": "turbo run test",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "bundle": "turbo run bundle"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

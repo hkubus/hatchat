@@ -135,10 +135,10 @@ PNG/GIF/JPEG headers with no native image dependency.
 
 Messages reference attachments by id. The kernel resolves them to base64 data
 URLs **only for vision-capable models**; for others the image is replaced with an
-omitted-note and the capability router warns (or auto-routes). This keeps large
+omitted-note and the capability check warns in the chat. This keeps large
 blobs out of stored messages and off the wire unless needed.
 
-## Tool policies + capability routing (M3)
+## Tool policies + capability checks (M3)
 
 Each conversation has a **tool policy** (editable in the chat toolbar):
 
@@ -151,10 +151,10 @@ Policies are persisted per session. The agent also has **loop guards**: it stops
 after N identical (name+args) calls and after N consecutive failures, so a model
 can't spin forever.
 
-**Capability routing** compares the conversation's needs (vision from image
-parts, tool calls once tools are used) against the selected model. If there's a
-mismatch you get a warning in the chat; enable **auto-route** and the server
-picks a capable model (preferring the same provider) and switches the session.
+**Capability checks** compare the conversation's needs (vision from image
+parts, tool calls once tools are used) against the selected model. On a mismatch
+you get a warning in the chat and the model is left alone — switching models is
+always your decision, made from the model picker in the composer.
 
 ## Plugins (M2)
 
@@ -276,7 +276,7 @@ This is a single-user app. Before exposing it:
   zod-backed config forms, declared permissions/secrets, external plugin loading
   from `./plugins`, settings UI. Providers + shell tool converted to plugins.
 - **M3 (done)** Tool-loop policies (ask/auto/allowlist/deny) + loop guards, and
-  capability routing with auto-route and in-chat warnings.
+  capability checks with in-chat warnings.
 - **M4 (done)** Vision input: content-addressed attachments, upload/serve API,
   attach/paste/drop UI, resolve-to-data only for vision models.
 - **M5 (done)** MCP plugin: stdio servers on the runner (duplex process link) +

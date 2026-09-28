@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   active_leaf_id TEXT,
   approval_mode TEXT NOT NULL DEFAULT 'ask',
   allowed_tools TEXT NOT NULL DEFAULT '[]',
-  auto_route INTEGER NOT NULL DEFAULT 0,
   reasoning_effort TEXT NOT NULL DEFAULT 'off',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
