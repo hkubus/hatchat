@@ -92,10 +92,48 @@ header.
 - **Single window, single server.** No support for switching servers without a
   reload (Settings → Connection → Disconnect returns to the connect screen).
 
-## Verified so far
+## The WebKit streaming problem (and the fix)
 
-- `cargo check --all-targets` clean; app launches under Xvfb and renders the
-  chat against a live server.
-- CORS verified by hand against a running server: allowed origin gets
+The first end-to-end attempt streamed the assistant text and then **froze**: the
+tool card and its Approve/Deny buttons never appeared, even though the server
+had written every frame.
+
+Diagnosis, in order:
+
+1. `curl` against the same endpoint received all ten frames — so not the server.
+2. A logging proxy in front of the server showed every frame reaching the
+   webview's socket as its own chunk, so not the network.
+3. Instrumenting the page's SSE reader showed it had consumed five chunks and
+   then simply stopped awaiting more, while the page kept polling other
+   endpoints normally.
+
+That is [WebKit bug 322545](https://bugs.webkit.org/show_bug.cgi?id=322545): a
+streaming `fetch()` body is **withheld until the next network chunk arrives**
+when the reader is busy. Whenever a turn pauses — waiting for a tool approval, or
+on a slow provider — the events the server already sent sit in WebKit's buffer
+until something else arrives on the socket.
+
+The fix is the standard SSE keepalive: the turn stream writes a `: keepalive`
+comment every `HAT_SSE_KEEPALIVE_MS` (default 1s) while the turn is idle
+(`packages/server/src/sse.ts`, unit-tested). The withheld frames are delivered
+on the next tick, and idle streams no longer risk being dropped by proxies.
+
+This affects any WebKitGTK client (the Linux desktop app). Chromium/WebKit-on-macOS
+do not need it, but the keepalive is harmless for them.
+
+## Verified
+
+Driven end to end under Xvfb against a live server + runner:
+
+- `cargo check --all-targets` clean; the window launches and renders.
+- Connect screen → bearer token → sessions, models, plugins, runner load.
+- `run: echo …` → text streams → tool card appears (after the keepalive fix)
+  → **Approve** → the runner executes → result and final message stream back.
+- Settings → Connection shows the persisted server URL and masked token.
+- CORS by hand against a running server: the allowed origin gets
   `access-control-allow-origin`, a foreign origin does not, preflight returns
   204 with the right methods/headers, and unauthenticated requests still 401.
+- `pnpm typecheck`, `pnpm test`, and the SSE keepalive unit tests pass.
+
+Not verified here: a release bundle (`tauri build` needs the bundling toolchain
+for each platform) and the macOS/Windows shells.

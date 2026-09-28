@@ -30,6 +30,7 @@ web (React) ──SSE──▶ server ──WS /link──▶ runner ──▶ s
 | `@hat/server` | Hono API, SSE turn stream, approval broker, runner registry, providers |
 | `@hat/runner` | Dial-out execution host: workspaces, process execution, fs, fetch |
 | `apps/web` | Streaming UI: grouped model picker, tool cards, approvals, branch navigation |
+| `apps/desktop` | Tauri v2 shell around `apps/web` for the same UI in a native window |
 
 ## Providers (M1)
 
@@ -67,6 +68,9 @@ the API is open (dev only).
   scripts) and bypasses CSRF.
 - `HAT_COOKIE_SECURE=true` when serving over HTTPS. The web UI shows a login
   screen and a sign-out button automatically.
+- Native shells (desktop/mobile) skip cookies entirely and send
+  `Authorization: Bearer $HAT_AUTH_TOKEN`; they need the origin in
+  `HAT_CORS_ORIGINS`.
 
 Multi-user is intentionally out of scope (single account).
 
@@ -215,6 +219,40 @@ Messages form a **tree**; the active path is root→leaf, so:
 Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
 
+## Desktop app (M7)
+
+`apps/desktop` is a **Tauri v2 shell around the same web UI** — there is no
+duplicated frontend. It is a thin client: it stores the address of a hat server
+and the token used to reach it, and nothing else. Run a server (and runner)
+separately, then:
+
+```sh
+pnpm dev:desktop            # native window against the vite dev server
+pnpm bundle                 # release bundles in apps/desktop/src-tauri/target/release/bundle
+```
+
+The window opens on a connect screen (server URL + `HAT_AUTH_TOKEN`), also
+editable later in **Settings → Connection**. Because the UI is served from the
+shell's own origin, two small pieces make the API reachable from it:
+
+- **CORS allowlist** (`HAT_CORS_ORIGINS`, defaulting to the Tauri origins plus
+  the vite dev server). Credentials are *not* allowed cross-origin: the desktop
+  app authenticates with the **bearer token** (CSRF-exempt), while the browser
+  app stays same-origin with its session cookie.
+- **Runtime connection config** (`apps/web/src/runtime.ts`) so requests resolve
+  against the configured server instead of a relative path. Empty config in a
+  browser tab = today's behaviour, unchanged.
+
+One server-side change was needed to make streaming work in the WebKitGTK
+webview: the turn stream now sends an SSE `: keepalive` comment every
+`HAT_SSE_KEEPALIVE_MS` (1s). WebKit withholds a streamed `fetch()` body until
+the next network chunk arrives (WebKit bug 322545), so a turn that pauses —
+waiting on a tool approval, say — appeared to freeze even though the server had
+already sent the events. Keepalives also stop proxies closing idle streams.
+
+See [docs/desktop-app.md](docs/desktop-app.md) for the architecture, the
+Tauri↔web bridge, and what's deliberately out of scope.
+
 ## Run (dev)
 
 ```sh
@@ -286,4 +324,7 @@ This is a single-user app. Before exposing it:
   scheduling (tags + least-busy), container sandbox tier, single-user password
   auth (scrypt + signed session cookie + CSRF + rate limiting). Multi-user is
   intentionally out of scope.
-- **M7** Tauri desktop + React Native mobile over the same kernel/UI.
+- **M7 (started)** Tauri desktop: the shell, connection config, CORS and SSE
+  keepalives are in place and a full turn (stream → approval → runner → result)
+  works in the app. Still open: packaging/signing, OS keychain for the token,
+  and React Native mobile over the same kernel/UI.
