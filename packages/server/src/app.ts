@@ -43,6 +43,7 @@ import type { ServerConfig } from "./config.js";
 import { createFakePlugin } from "./fake-provider.js";
 import { RunnerRegistry } from "./link.js";
 import { createAuditLog, createLogger } from "./logger.js";
+import { KEEPALIVE, kernelStream } from "./sse.js";
 import { loadExternalPlugins } from "./plugin-loader.js";
 
 export interface ServerRuntime {
@@ -323,15 +324,15 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         }
       })();
 
-      const keepalive = setInterval(() => {
-        void stream.write(": keepalive\n\n");
-      }, 2000);
       try {
-        for await (const event of queue) {
-          await stream.writeSSE({ event: "kernel", data: JSON.stringify(event) });
+        for await (const item of kernelStream(queue, config.sseKeepaliveMs)) {
+          if (item === KEEPALIVE) {
+            await stream.write(": keepalive\n\n");
+            continue;
+          }
+          await stream.writeSSE({ event: "kernel", data: JSON.stringify(item) });
         }
       } finally {
-        clearInterval(keepalive);
         await producer;
       }
     });

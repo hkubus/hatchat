@@ -312,13 +312,7 @@ async function postSSE(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  let reads = 0;
-  for (;;) {
-    const { value, done } = await reader.read();
-    reads += 1;
-    void fetch(`http://127.0.0.1:8899/js/read?${reads}:${done ? "done" : value?.byteLength}`, { mode: "no-cors" }).catch(() => undefined);
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  function drain(): void {
     let boundary = buffer.indexOf("\n\n");
     while (boundary !== -1) {
       const chunk = buffer.slice(0, boundary);
@@ -330,7 +324,6 @@ async function postSSE(
         .join("");
       if (data) {
         try {
-          void fetch(`http://127.0.0.1:8899/js/frame?${encodeURIComponent(JSON.parse(data).type as string)}`, { mode: "no-cors" }).catch(() => undefined);
           onEvent(JSON.parse(data) as KernelEvent);
         } catch {
           /* ignore malformed frame */
@@ -339,6 +332,17 @@ async function postSSE(
       boundary = buffer.indexOf("\n\n");
     }
   }
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    drain();
+  }
+  // Flush the decoder and whatever is left, so a final frame is not lost when
+  // the stream ends mid-frame.
+  buffer += decoder.decode();
+  drain();
 }
 
 export function sendTurn(
