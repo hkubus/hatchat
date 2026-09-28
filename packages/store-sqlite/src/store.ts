@@ -1,12 +1,14 @@
 import type {
   ApprovalMode,
   ChatMessage,
+  MessageMeta,
   Part,
   ReasoningEffort,
   Role,
   SecretStore,
+  Usage,
 } from "@hat/core";
-import { newId } from "@hat/core";
+import { addUsage, newId } from "@hat/core";
 import type { ArtifactStore } from "@hat/artifacts";
 import { decryptSecret, encryptSecret } from "@hat/crypto";
 import { createHash } from "node:crypto";
@@ -309,6 +311,39 @@ export class Store implements SecretStore {
     return row?.n ?? 0;
   }
 
+  /**
+   * Token totals for every session's active branch, summed from the usage
+   * recorded on each message's metadata. A single recursive query walks each
+   * session's leaf back to its root, so this stays cheap for the session list.
+   * Messages on inactive branches are excluded, matching what the chat shows.
+   */
+  usageBySession(): Map<string, Usage> {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE chain(id, session_id, depth) AS (
+           SELECT active_leaf_id, id, 0 FROM sessions WHERE active_leaf_id IS NOT NULL
+           UNION ALL
+           SELECT m.parent_id, c.session_id, c.depth + 1
+           FROM chain c
+           JOIN messages m ON m.id = c.id
+           WHERE m.parent_id IS NOT NULL AND c.depth < 1000
+         )
+         SELECT c.session_id AS session_id, m.meta AS meta
+         FROM chain c
+         JOIN messages m ON m.id = c.id
+         WHERE m.meta IS NOT NULL`,
+      )
+      .all() as unknown as Array<{ session_id: string; meta: string }>;
+
+    const totals = new Map<string, Usage>();
+    for (const row of rows) {
+      const usage = parseMeta(row.meta)?.usage;
+      if (!usage) continue;
+      totals.set(row.session_id, addUsage(totals.get(row.session_id), usage));
+    }
+    return totals;
+  }
+
   children(sessionId: string, parentId: string | null): ChatMessage[] {
     const rows =
       parentId === null
@@ -484,8 +519,18 @@ function toMessage(row: MessageRow): ChatMessage {
     role: row.role as Role,
     parts: JSON.parse(row.parts) as Part[],
     createdAt: row.created_at,
-    meta: row.meta ? JSON.parse(row.meta) : undefined,
+    meta: parseMeta(row.meta),
   };
+}
+
+/** Message metadata is optional and was written by older versions; never throw. */
+function parseMeta(raw: string | null): MessageMeta | undefined {
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as MessageMeta;
+  } catch {
+    return undefined;
+  }
 }
 
 function deriveTitle(session: SessionRecord, message: ChatMessage): string {
