@@ -44,6 +44,7 @@ import { createFakePlugin } from "./fake-provider.js";
 import { RunnerRegistry } from "./link.js";
 import { createAuditLog, createLogger } from "./logger.js";
 import { KEEPALIVE, kernelStream } from "./sse.js";
+import { generateTitle } from "./title.js";
 import { loadExternalPlugins } from "./plugin-loader.js";
 
 export interface ServerRuntime {
@@ -74,7 +75,48 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   const providers = new ProviderRegistry();
   const tools = new ToolRegistry();
-  const registry = new RunnerRegistry(logger, config.enrollToken);
+
+  /**
+   * stdio MCP servers live on the runner, so the plugin is wired when a runner
+   * is present. A runner joining (re)spawns them; one leaving does *not*
+   * unregister the tools, because that would pull them out of the model's tool
+   * list mid-turn — the plugin reports the outage per call instead.
+   *
+   * Runners flap (reconnecting on every command), and PluginHost activation is
+   * not reentrant, so the work is chained rather than fired concurrently.
+   */
+  const runnerAwarePlugins = ["mcp"];
+  let runnerSync: Promise<void> = Promise.resolve();
+  const syncRunnerPlugins = (): void => {
+    runnerSync = runnerSync
+      .then(async () => {
+        const available = registry.list().length > 0;
+        for (const id of runnerAwarePlugins) {
+          const descriptor = pluginHost.get(id);
+          if (!descriptor?.enabled) continue;
+          if (available) {
+            // Always cycle: an already-active plugin is holding stdio
+            // processes that died with the previous runner.
+            logger.info(`runner available; (re)connecting plugin ${id}`);
+            await pluginHost.deactivate(id);
+            await pluginHost.activate(id);
+          } else {
+            continue;
+          }
+          const after = pluginHost.get(id);
+          logger.info(
+            `plugin ${id}: ${after?.status}${after?.error ? ` (${after.error})` : ""}`,
+          );
+        }
+      })
+      .catch((error) => {
+        logger.error("runner plugin sync failed", normalizeError(error, "runner_sync_failed"));
+      });
+  };
+
+  const registry = new RunnerRegistry(logger, config.enrollToken, () => {
+    syncRunnerPlugins();
+  });
 
   const processHost: ProcessHost = {
     async spawn(request: SpawnRequest) {
@@ -90,6 +132,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     secrets: store,
     logger,
     processHost,
+    runnerAvailable: () => registry.list().length > 0,
     persistence: {
       get: (id) => store.getPluginState(id),
       set: (id, state) => store.setPluginState(id, state),
@@ -302,6 +345,15 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         }
       }
 
+      // Title generation runs alongside the turn rather than after it, so the
+      // extra round-trip is usually already paid for by the time the turn
+      // finishes. Only the first user message is worth naming, and only while
+      // the title is still the derived placeholder.
+      const titling =
+        session && session.titleSource === "derived" && options.userText?.trim()
+          ? generateTitle({ providers, model, subject: options.userText, logger })
+          : undefined;
+
       const producer = (async () => {
         try {
           for await (const event of agent.run({
@@ -315,6 +367,14 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
             reasoningEffort: session?.reasoningEffort,
           })) {
             queue.push(event);
+          }
+
+          // Awaited before the queue closes: AsyncQueue silently drops anything
+          // pushed afterwards, so a fire-and-forget title would never reach the
+          // client. The call is already bounded by its own timeout.
+          const title = titling ? await titling : undefined;
+          if (title && store.setGeneratedTitle(options.sessionId, title)) {
+            queue.push({ type: "session.title", sessionId: options.sessionId, title });
           }
         } catch (error) {
           queue.push({ type: "error", error: normalizeError(error, "turn_error") });

@@ -1,14 +1,25 @@
 import type { KernelEvent, ModelInfo, Part, ReasoningEffort, Usage } from "@hat/core";
 import { REASONING_EFFORTS, addUsage, sumUsage, usageTotal } from "@hat/core";
-import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Connect from "./Connect";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CopyIcon,
+  EditIcon,
+  RegenerateIcon,
+} from "./icons";
 import MessageImage from "./MessageImage";
 import ModelPicker from "./ModelPicker";
 import Settings from "./Settings";
 import Sidebar from "./Sidebar";
 import * as api from "./api";
 import type { PathNode, PluginDescriptor, ProviderStatus, RunnerSummary, SessionSummary } from "./api";
-import { capSummary, capTags } from "./capTags";
+import { capSummary, capTags, contextTag } from "./capTags";
+import CreatorIcon from "./CreatorIcon";
+import { creatorName, creatorSlug } from "./creators";
 import { formatTokens, usageDetail } from "./tokens";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
@@ -93,6 +104,97 @@ function imagesOf(parts: Part[]): { src: string; attachmentId?: string }[] {
   return out;
 }
 
+/** The one-word state shown at the end of a tool call's summary line. */
+function toolStatus(t: UiTool): string {
+  if (t.approval === "requested") return "awaiting approval";
+  if (t.running) return "running";
+  if (t.approval === "denied") return "denied";
+  if (t.isError) return "failed";
+  return "done";
+}
+
+/**
+ * The single line that identifies a tool call while collapsed. Shell calls get
+ * their command, everything else gets the first line of whatever the tool
+ * returned — the two things that actually tell you what the call was doing.
+ */
+function toolBrief(t: UiTool): string {
+  if (t.args && typeof t.args === "object" && "command" in t.args) {
+    return String((t.args as { command: unknown }).command);
+  }
+  const first = (t.result ?? "").split("\n").find((line) => line.trim().length > 0);
+  return first?.trim() ?? "";
+}
+
+/** The full argument payload, formatted for the expanded body. */
+function toolArgs(t: UiTool): string {
+  if (t.args && typeof t.args === "object" && "command" in t.args) {
+    return `$ ${String((t.args as { command: unknown }).command)}`;
+  }
+  return JSON.stringify(t.args, null, 2) ?? "";
+}
+
+/** Replace the in-flight message with `messageId`, or the newest one if unknown. */
+function patchMessage(
+  list: UiMessage[],
+  messageId: string | undefined,
+  fn: (m: UiMessage) => UiMessage,
+): UiMessage[] {
+  const known = messageId ? list.findIndex((m) => m.id === messageId) : -1;
+  const index = known === -1 ? list.length - 1 : known;
+  if (index < 0) return list;
+  const next = [...list];
+  next[index] = fn(next[index]);
+  return next;
+}
+
+/**
+ * Replace a tool by `callId`, searching newest message first. `tool.approval`
+ * and `tool.result` carry no message id, so the call id is the only handle.
+ */
+function patchTool(
+  list: UiMessage[],
+  callId: string,
+  fn: (t: UiTool) => UiTool,
+): UiMessage[] {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const index = list[i].tools.findIndex((t) => t.callId === callId);
+    if (index === -1) continue;
+    const tools = [...list[i].tools];
+    tools[index] = fn(tools[index]);
+    const next = [...list];
+    next[i] = { ...next[i], tools };
+    return next;
+  }
+  return list;
+}
+
+function CopyButton({ text, title }: { text: string; title: string }): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  function copy(): void {
+    void navigator.clipboard?.writeText(text);
+    setCopied(true);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setCopied(false), 1500);
+  }
+
+  return (
+    <button
+      className="icon-btn"
+      onClick={copy}
+      title={title}
+      aria-label={title}
+      aria-live="polite"
+    >
+      {copied ? <CheckIcon /> : <CopyIcon />}
+    </button>
+  );
+}
+
 /** Rebuild the visible conversation from the server's active branch path. */
 function buildMessages(path: PathNode[]): UiMessage[] {
   const out: UiMessage[] = [];
@@ -160,12 +262,18 @@ export default function App() {
     () => localStorage.getItem("hat.session"),
   );
   const [messages, setMessages] = useState<UiMessage[]>([]);
-  const [streaming, setStreaming] = useState<UiMessage | null>(null);
+  // One entry per assistant message produced so far in the *current* turn. A
+  // turn with tool calls emits several `message.start` events, and each one is a
+  // separate message in the transcript — keeping only the last one made the
+  // earlier tool calls and reasoning blink out of existence until the turn
+  // ended and the whole history was refetched.
+  const [inFlight, setInFlightState] = useState<UiMessage[]>([]);
+  const inFlightRef = useRef<UiMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
-  const [policyMode, setPolicyMode] = useState<"ask" | "auto" | "allowlist" | "deny">("ask");
+  const [policyMode, setPolicyMode] = useState<"ask" | "auto" | "allowlist" | "deny">("auto");
   const [allowedToolsText, setAllowedToolsText] = useState("");
   const [favorites, setFavorites] = useState<string[]>(() => {
     try {
@@ -179,7 +287,7 @@ export default function App() {
     const stored = localStorage.getItem("hat.effort");
     return (REASONING_EFFORTS as readonly string[]).includes(stored ?? "")
       ? (stored as ReasoningEffort)
-      : "off";
+      : "low";
   });
   const [editing, setEditing] = useState<{ messageId: string; text: string } | null>(null);
   const [pending, setPending] = useState<PendingAttachment[]>([]);
@@ -209,6 +317,22 @@ export default function App() {
     measure();
     return () => el.removeEventListener("scroll", measure);
   }, []);
+
+  /**
+   * Events arrive one at a time off a single SSE reader, so a ref is the
+   * source of truth for the in-flight turn and state only drives the render.
+   */
+  const setInFlight = useCallback((list: UiMessage[]): void => {
+    inFlightRef.current = list;
+    setInFlightState(list);
+  }, []);
+
+  const patchInFlight = useCallback(
+    (fn: (list: UiMessage[]) => UiMessage[]): void => {
+      setInFlight(fn(inFlightRef.current));
+    },
+    [setInFlight],
+  );
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -355,11 +479,14 @@ export default function App() {
     if (!el || !stickToBottom.current) return;
     // Smooth for a new message, instant while tokens stream in: animating every
     // delta makes the view lag behind the text.
-    el.scrollTo({ top: el.scrollHeight, behavior: streaming ? "auto" : "smooth" });
-  }, [messages, streaming]);
+    el.scrollTo({ top: el.scrollHeight, behavior: inFlight.length > 0 ? "auto" : "smooth" });
+  }, [messages, inFlight]);
 
   const selectedModel = models.find((m) => m.id === model);
   const effortSupported = Boolean(selectedModel?.capabilities.reasoningEffort);
+  // `low` is the default, so only flag the control when the user has actually
+  // pushed the model past it.
+  const effortRaised = reasoningEffort === "medium" || reasoningEffort === "high";
 
   // Everything the visible branch has cost so far, plus the turn in flight.
   const sessionUsage = useMemo(
@@ -378,69 +505,70 @@ export default function App() {
         setLiveUsage((prev) => addUsage(prev, event.usage));
         break;
       case "message.start":
-        setStreaming({
-          id: event.messageId,
-          role: "assistant",
-          text: "",
-          reasoning: "",
-          tools: [],
-          images: [],
-        });
+        // Append rather than replace: a tool-using turn emits one of these per
+        // model iteration, and the previous ones stay on screen.
+        patchInFlight((list) => [
+          ...list,
+          {
+            id: event.messageId,
+            role: "assistant",
+            text: "",
+            reasoning: "",
+            tools: [],
+            images: [],
+          },
+        ]);
         break;
       case "text.delta":
-        setStreaming((s) => (s ? { ...s, text: s.text + event.text } : s));
+        patchInFlight((list) =>
+          patchMessage(list, event.messageId, (m) => ({ ...m, text: m.text + event.text })),
+        );
+        break;
+      case "session.title":
+        // The header and the sidebar both read from `sessions`, so one update
+        // covers both without waiting for the post-turn refetch.
+        setSessions((prev) =>
+          prev.map((s) => (s.id === event.sessionId ? { ...s, title: event.title } : s)),
+        );
         break;
       case "reasoning.delta":
-        setStreaming((s) => (s ? { ...s, reasoning: s.reasoning + event.text } : s));
+        patchInFlight((list) =>
+          patchMessage(list, event.messageId, (m) => ({
+            ...m,
+            reasoning: m.reasoning + event.text,
+          })),
+        );
         break;
       case "tool.call":
-        setStreaming((s) =>
-          s
-            ? {
-                ...s,
-                tools: [
-                  ...s.tools,
-                  {
-                    callId: event.callId,
-                    name: event.name,
-                    args: event.args,
-                    approval: null,
-                    running: true,
-                  },
-                ],
-              }
-            : s,
+        patchInFlight((list) =>
+          patchMessage(list, event.messageId, (m) => ({
+            ...m,
+            tools: [
+              ...m.tools,
+              {
+                callId: event.callId,
+                name: event.name,
+                args: event.args,
+                approval: null,
+                running: true,
+              },
+            ],
+          })),
         );
         break;
       case "tool.approval":
-        setStreaming((s) =>
-          s
-            ? {
-                ...s,
-                tools: s.tools.map((t) =>
-                  t.callId === event.callId ? { ...t, approval: event.status } : t,
-                ),
-              }
-            : s,
+        patchInFlight((list) =>
+          patchTool(list, event.callId, (t) => ({ ...t, approval: event.status })),
         );
         break;
       case "tool.result":
-        setStreaming((s) =>
-          s
-            ? {
-                ...s,
-                tools: s.tools.map((t) =>
-                  t.callId === event.callId
-                    ? {
-                        ...t,
-                        running: false,
-                        isError: event.isError,
-                        result: textOf(event.parts),
-                      }
-                    : t,
-                ),
-              }
-            : s,
+        patchInFlight((list) =>
+          patchTool(list, event.callId, (t) => ({
+            ...t,
+            running: false,
+            isError: event.isError,
+            result: textOf(event.parts),
+          })),
         );
         break;
       case "error":
@@ -459,6 +587,11 @@ export default function App() {
     setPolicyMode(session.approvalMode);
     setAllowedToolsText(session.allowedTools.join(", "));
     setReasoningEffort(session.reasoningEffort);
+    // The header and sidebar both read from `sessions`, and the record we just
+    // fetched is fresher than whatever the list was holding.
+    setSessions((prev) =>
+      prev.map((s) => (s.id === session.id ? { ...s, title: session.title } : s)),
+    );
   }
 
   function parseAllowlist(text: string): string[] {
@@ -525,7 +658,7 @@ export default function App() {
     stickToBottom.current = true;
     setBusy(true);
     setError(null);
-    setStreaming(null);
+    setInFlight([]);
     setWarnings([]);
     try {
       await fn(handleEvent, controller.signal);
@@ -534,12 +667,19 @@ export default function App() {
       if (!api.isAbortError(e)) setError(String(e));
     } finally {
       abortRef.current = null;
+      // Hand the streamed turn to the history *before* the refetch. `refresh`
+      // replaces the list wholesale from the server's branch path, so promoting
+      // first means the refetch is a quiet reconciliation instead of a swap that
+      // blanks the last few deltas — and if the refetch fails outright, the
+      // turn the user just watched stream in is still on screen.
+      const streamed = inFlightRef.current;
+      if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
+      setInFlight([]);
       await refresh(id).catch(() => undefined);
       await refreshSessions();
       // Drop the live figure only once the persisted usage is in `messages`,
       // otherwise the two would be added together and double-count.
       setLiveUsage(undefined);
-      setStreaming(null);
       setBusy(false);
     }
   }
@@ -612,7 +752,7 @@ export default function App() {
   async function newChat(): Promise<void> {
     stop();
     setMessages([]);
-    setStreaming(null);
+    setInFlight([]);
     setError(null);
     setWarnings([]);
     setEditing(null);
@@ -629,7 +769,7 @@ export default function App() {
     setBusy(false);
     setError(null);
     setWarnings([]);
-    setStreaming(null);
+    setInFlight([]);
     setEditing(null);
     setView("chat");
     stickToBottom.current = true;
@@ -649,7 +789,7 @@ export default function App() {
     if (id === sessionId) {
       setSessionId(null);
       setMessages([]);
-      setStreaming(null);
+      setInFlight([]);
     }
     await refreshSessions();
   }
@@ -672,7 +812,7 @@ export default function App() {
     setAuth({ required: true, authenticated: false });
     setSessionId(null);
     setMessages([]);
-    setStreaming(null);
+    setInFlight([]);
   }
 
   async function regenerate(messageId: string): Promise<void> {
@@ -699,22 +839,15 @@ export default function App() {
   }
 
   async function decide(callId: string, decision: "approve" | "deny"): Promise<void> {
-    setStreaming((s) =>
-      s
-        ? {
-            ...s,
-            tools: s.tools.map((t) =>
-              t.callId === callId
-                ? { ...t, approval: decision === "deny" ? "denied" : "approved" }
-                : t,
-            ),
-          }
-        : s,
+    patchInFlight((list) =>
+      patchTool(list, callId, (t) => ({
+        ...t,
+        approval: decision === "deny" ? "denied" : "approved",
+      })),
     );
     await api.resolveApproval(callId, decision);
   }
 
-  const runnerOnline = runners.length > 0;
   const currentTitle =
     view === "settings"
       ? "Settings"
@@ -744,7 +877,7 @@ export default function App() {
             void submitLogin();
           }}
         >
-          <div className="brand">hat</div>
+          <div className="brand">Hat</div>
           <p className="settings-hint">Enter the server password to continue.</p>
           <input
             type="password"
@@ -763,52 +896,12 @@ export default function App() {
   }
 
   function renderMessage(m: UiMessage, streamingNow = false): JSX.Element {
-    return (
-      <div key={m.id} className={`msg ${m.role}`}>
-        <div className="msg-head">
-          <span className={`role-dot ${m.role}`} />
-          <span className="role">{m.role === "user" ? "You" : "Assistant"}</span>
-          {m.branch && m.branch.count > 1 && (
-            <span className="branch">
-              <button
-                className="ghost tiny"
-                disabled={m.branch.index <= 0 || busy}
-                onClick={() => void switchBranch(m.branch!.ids[m.branch!.index - 1])}
-                aria-label="Previous version"
-                title="Previous version"
-              >
-                ‹
-              </button>
-              <span className="branch-label">
-                {m.branch.index + 1}/{m.branch.count}
-              </span>
-              <button
-                className="ghost tiny"
-                disabled={m.branch.index >= m.branch.count - 1 || busy}
-                onClick={() => void switchBranch(m.branch!.ids[m.branch!.index + 1])}
-                aria-label="Next version"
-                title="Next version"
-              >
-                ›
-              </button>
-            </span>
-          )}
-          {m.role === "assistant" && !m.id.startsWith("local-") && (
-            <button className="ghost tiny" disabled={busy} onClick={() => void regenerate(m.id)}>
-              regenerate
-            </button>
-          )}
-          {m.role === "user" && !m.id.startsWith("local-") && (
-            <button
-              className="ghost tiny"
-              disabled={busy}
-              onClick={() => setEditing({ messageId: m.id, text: m.text })}
-            >
-              edit
-            </button>
-          )}
-        </div>
+    // An optimistic user message has no server id yet, so the actions that need
+    // one (regenerate, edit, branch) stay off it.
+    const persisted = !m.id.startsWith("local-");
 
+    return (
+      <div key={m.id} className={`msg ${m.role}${streamingNow ? " streaming" : ""}`}>
         {editing?.messageId === m.id ? (
           <div className="edit-box">
             <textarea
@@ -829,61 +922,117 @@ export default function App() {
           <>
             {m.reasoning && (
               <details className="reasoning">
-                <summary>reasoning</summary>
-                <pre>{m.reasoning}</pre>
+                <summary>
+                  <ChevronDownIcon className="disclosure" />
+                  <span>reasoning</span>
+                </summary>
+                <pre className="aside-body">{m.reasoning}</pre>
               </details>
             )}
+
             {m.text && (
               <div className={`markdown ${m.role}`}>
                 <Suspense fallback={<span className="md-fallback">{m.text}</span>}>
                   <Markdown>{m.text}</Markdown>
                 </Suspense>
+                {/* The caret lives inside the markdown block, not beside it:
+                    as a sibling it would be a block-level flex item of `.msg`
+                    and drop onto a line of its own. */}
+                {streamingNow && <span className="caret" />}
               </div>
             )}
-            {streamingNow && m.text && <span className="caret" />}
+
+            {m.images.length > 0 && (
+              <div className="msg-images">
+                {m.images.map((img, index) => (
+                  <MessageImage key={index} attachmentId={img.attachmentId} src={img.src} />
+                ))}
+              </div>
+            )}
+
+            {m.tools.map((t) => (
+              <details
+                key={t.callId}
+                className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
+                // An approval is a blocking question, so it must be visible
+                // rather than folded away behind a click.
+                open={t.approval === "requested"}
+              >
+                <summary>
+                  <ChevronDownIcon className="disclosure" />
+                  <span className="tool-name">{t.name}</span>
+                  <span className="tool-brief">{toolBrief(t)}</span>
+                  <span className={`tool-status ${t.approval ?? ""}`}>{toolStatus(t)}</span>
+                </summary>
+                <div className="aside-body">
+                  <pre className="tool-args">{toolArgs(t)}</pre>
+                  {t.approval === "requested" && (
+                    <div className="approval">
+                      <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
+                      <button className="danger" onClick={() => void decide(t.callId, "deny")}>
+                        Deny
+                      </button>
+                    </div>
+                  )}
+                  {t.result && <pre className="tool-result">{t.result}</pre>}
+                </div>
+              </details>
+            ))}
           </>
         )}
 
-        {m.images.length > 0 && (
-          <div className="msg-images">
-            {m.images.map((img, index) => (
-              <MessageImage key={index} attachmentId={img.attachmentId} src={img.src} />
-            ))}
+        {!streamingNow && !editing && (
+          <div className="msg-actions">
+            {m.branch && m.branch.count > 1 && (
+              <span className="branch">
+                <button
+                  className="icon-btn"
+                  title="Previous version"
+                  aria-label="Previous version"
+                  disabled={m.branch.index <= 0 || busy}
+                  onClick={() => void switchBranch(m.branch!.ids[m.branch!.index - 1])}
+                >
+                  <ChevronLeftIcon />
+                </button>
+                <span className="branch-label">
+                  {m.branch.index + 1}/{m.branch.count}
+                </span>
+                <button
+                  className="icon-btn"
+                  title="Next version"
+                  aria-label="Next version"
+                  disabled={m.branch.index >= m.branch.count - 1 || busy}
+                  onClick={() => void switchBranch(m.branch!.ids[m.branch!.index + 1])}
+                >
+                  <ChevronRightIcon />
+                </button>
+              </span>
+            )}
+            {m.text && <CopyButton text={m.text} title="Copy message" />}
+            {m.role === "assistant" && persisted && (
+              <button
+                className="icon-btn"
+                title="Regenerate"
+                aria-label="Regenerate"
+                disabled={busy}
+                onClick={() => void regenerate(m.id)}
+              >
+                <RegenerateIcon />
+              </button>
+            )}
+            {m.role === "user" && persisted && (
+              <button
+                className="icon-btn"
+                title="Edit"
+                aria-label="Edit"
+                disabled={busy}
+                onClick={() => setEditing({ messageId: m.id, text: m.text })}
+              >
+                <EditIcon />
+              </button>
+            )}
           </div>
         )}
-
-        {m.tools.map((t) => (
-          <div key={t.callId} className={`tool ${t.isError ? "err" : ""}`}>
-            <div className="tool-head">
-              <span className="tool-name">{t.name}</span>
-              <span className={`tool-status ${t.approval ?? ""}`}>
-                {t.running
-                  ? t.approval === "requested"
-                    ? "awaiting approval"
-                    : "running"
-                  : t.approval === "denied"
-                    ? "denied"
-                    : t.isError
-                      ? "failed"
-                      : "done"}
-              </span>
-            </div>
-            <pre className="tool-args">
-              {typeof t.args === "object" && t.args && "command" in t.args
-                ? `$ ${String((t.args as { command: unknown }).command)}`
-                : JSON.stringify(t.args)}
-            </pre>
-            {t.approval === "requested" && (
-              <div className="approval">
-                <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
-                <button className="danger" onClick={() => void decide(t.callId, "deny")}>
-                  Deny
-                </button>
-              </div>
-            )}
-            {t.result && <pre className="tool-result">{t.result}</pre>}
-          </div>
-        ))}
       </div>
     );
   }
@@ -905,12 +1054,6 @@ export default function App() {
       <header className="header">
         <div className="header-title">
           <h1>{currentTitle}</h1>
-        </div>
-        <div className="header-right">
-          <span className={`status ${runnerOnline ? "ok" : "bad"}`}>
-            <span className="dot" />
-            {runnerOnline ? runners.map((r) => r.id).join(", ") : "runner offline"}
-          </span>
         </div>
       </header>
 
@@ -940,13 +1083,13 @@ export default function App() {
           )}
 
           <div className="scroller" ref={scroller}>
-            {restoring && messages.length === 0 && !streaming && (
+            {restoring && messages.length === 0 && inFlight.length === 0 && (
               <div className="restoring">Restoring conversation…</div>
             )}
 
-            {messages.length === 0 && !streaming && !restoring && (
+            {messages.length === 0 && inFlight.length === 0 && !restoring && (
               <div className="empty">
-                <h2>hat</h2>
+                <h2>Hat</h2>
                 <p>
                   Try <code>run: echo hello from the runner</code>. Approve the tool call and it
                   runs on the runner.
@@ -955,7 +1098,9 @@ export default function App() {
             )}
 
             {messages.map((m) => renderMessage(m))}
-            {streaming && renderMessage(streaming, true)}
+            {/* The caret belongs to the message still being written, not to every
+                one the turn has produced so far. */}
+            {inFlight.map((m, i) => renderMessage(m, i === inFlight.length - 1))}
             {error && <div className="error">{error}</div>}
           </div>
 
@@ -1056,7 +1201,7 @@ export default function App() {
                 />
 
                 <select
-                  className={`composer-select ${reasoningEffort !== "off" ? "on" : ""}`}
+                  className={`composer-select ${effortRaised ? "on" : ""}`}
                   value={reasoningEffort}
                   onChange={(e) => changeEffort(e.target.value as ReasoningEffort)}
                   disabled={!effortSupported}
@@ -1075,7 +1220,7 @@ export default function App() {
                 </select>
 
                 <select
-                  className={`composer-select ${policyMode !== "ask" ? "on" : ""}`}
+                  className={`composer-select ${policyMode !== "auto" ? "on" : ""}`}
                   value={policyMode}
                   onChange={(e) => changePolicyMode(e.target.value as typeof policyMode)}
                   aria-label="Tool policy"
@@ -1105,14 +1250,17 @@ export default function App() {
 
                 {selectedModel && (
                   <span className="composer-caps" title={capSummary(selectedModel)}>
-                    {capTags(selectedModel.capabilities, selectedModel.contextWindow).map((tag) => (
-                      <span
-                        className={`cap ${tag.key === "ctx" ? "muted" : ""}`}
-                        key={tag.key}
-                      >
+                    <CreatorIcon slug={creatorSlug(selectedModel)} name={creatorName(selectedModel)} size={14} />
+                    {capTags(selectedModel.capabilities).map((tag) => (
+                      <span className="cap" key={tag.key} title={tag.title}>
                         {tag.label}
                       </span>
                     ))}
+                    {contextTag(selectedModel.contextWindow) && (
+                      <span className="ctx-label">
+                        {contextTag(selectedModel.contextWindow)!.label}
+                      </span>
+                    )}
                   </span>
                 )}
 

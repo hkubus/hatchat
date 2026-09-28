@@ -18,6 +18,12 @@ export interface PluginContext {
   secrets: SecretStore;
   /** Host for long-lived processes (stdio MCP); undefined when no runner is connected. */
   processHost?: ProcessHost;
+  /**
+   * Whether a runner is currently connected. Lets a plugin keep its
+   * registrations stable across runner churn and report a clear error instead
+   * of vanishing from the model's tool list.
+   */
+  runnerAvailable?: () => boolean;
   logger: Logger;
 }
 

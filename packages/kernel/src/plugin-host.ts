@@ -43,6 +43,8 @@ export interface PluginHostDeps {
   logger: Logger;
   persistence: PluginPersistence;
   processHost?: ProcessHost;
+  /** See `PluginContext.runnerAvailable`. */
+  runnerAvailable?: () => boolean;
 }
 
 /**
@@ -132,6 +134,7 @@ export class PluginHost {
       getConfig: <T = unknown>() => config as T,
       secrets: this.deps.secrets,
       processHost: this.deps.processHost,
+      runnerAvailable: this.deps.runnerAvailable,
       logger: scopedLogger(id, this.deps.logger),
     };
 

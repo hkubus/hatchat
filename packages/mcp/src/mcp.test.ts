@@ -152,3 +152,47 @@ test("mcp plugin fails cleanly without a runner", async () => {
     await createMcpPlugin().activate(ctx);
   }, /No runner connected/);
 });
+
+/**
+ * A runner that drops mid-conversation must not make the tools disappear: the
+ * model has already been given the tool list, and "Unknown tool" mid-turn is
+ * worse than saying the runner is down.
+ */
+test("tools stay registered when the runner drops, and say so", async () => {
+  const registered: Tool[] = [];
+  let runnerUp = true;
+  const processHost: ProcessHost = { async spawn() { return fakeProcess(); } };
+  const ctx: PluginContext = {
+    pluginId: "mcp",
+    register: { provider() {}, tool(tool) { registered.push(tool); } },
+    getConfig: (() => ({
+      serversJson: JSON.stringify([{ name: "fake server", transport: "stdio", command: "node" }]),
+      requireApproval: false,
+    })) as PluginContext["getConfig"],
+    secrets: { async get() { return undefined; } },
+    processHost,
+    runnerAvailable: () => runnerUp,
+    logger,
+  };
+
+  const plugin = createMcpPlugin();
+  await plugin.activate(ctx);
+  assert.equal(registered.length, 1);
+
+  const tool = registered[0];
+  const online = await tool.execute({ text: "hi" }, {} as ToolContext);
+  assert.match((online[0] as { text: string }).text, /mcp echo: hi/);
+
+  runnerUp = false;
+  // The tool is still registered — that is the point.
+  assert.equal(registered.length, 1);
+  const offline = await tool.execute({ text: "hi" }, {} as ToolContext);
+  assert.match((offline[0] as { text: string }).text, /no runner is connected/i);
+
+  // And it recovers without re-registration once a runner is back.
+  runnerUp = true;
+  const recovered = await tool.execute({ text: "again" }, {} as ToolContext);
+  assert.match((recovered[0] as { text: string }).text, /mcp echo: again/);
+
+  await plugin.deactivate?.();
+});

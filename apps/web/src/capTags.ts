@@ -24,33 +24,30 @@ export function formatContext(tokens: number): string {
 }
 
 /** The capability chips shown against a model, in a stable order. */
-export function capTags(caps: ProviderCapabilities, contextWindow?: number): CapTag[] {
+export function capTags(caps: ProviderCapabilities): CapTag[] {
   const tags: CapTag[] = [];
   if (caps.toolCalls) tags.push({ key: "tools", label: "tools", title: "Can call tools" });
   if (caps.vision) tags.push({ key: "vision", label: "vision", title: "Accepts image input" });
-  if (caps.reasoning) {
-    tags.push({ key: "reasoning", label: "reasoning", title: "Exposes reasoning output" });
-  }
-  if (caps.reasoningEffort) {
-    tags.push({
-      key: "effort",
-      label: "effort",
-      title: "Supports a tunable reasoning effort",
-    });
-  }
   if (caps.jsonMode) tags.push({ key: "json", label: "json", title: "Supports JSON mode" });
-  if (contextWindow) {
-    tags.push({
-      key: "ctx",
-      label: `${formatContext(contextWindow)} ctx`,
-      title: `${contextWindow.toLocaleString()} token context window`,
-    });
-  }
   return tags;
 }
 
-/** One-line capability summary, used where there is no room for chips. */
+/** Context window, rendered as its own dim label rather than a capability chip. */
+export function contextTag(contextWindow?: number): CapTag | undefined {
+  if (!contextWindow) return undefined;
+  return {
+    key: "ctx",
+    label: formatContext(contextWindow),
+    title: `${contextWindow.toLocaleString()} token context window`,
+  };
+}
+
+/** Full capability detail, including what is not chipped, for tooltips. */
 export function capSummary(model: ModelInfo): string {
-  const tags = capTags(model.capabilities, model.contextWindow);
-  return tags.length > 0 ? tags.map((t) => t.label).join(" · ") : "no capabilities reported";
+  const parts = capTags(model.capabilities).map((t) => t.label);
+  if (model.capabilities.reasoning) parts.push("reasoning");
+  if (model.capabilities.reasoningEffort) parts.push("effort");
+  const ctx = contextTag(model.contextWindow);
+  if (ctx) parts.push(`${ctx.label} context`);
+  return parts.length > 0 ? parts.join(" · ") : "no capabilities reported";
 }

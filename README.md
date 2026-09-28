@@ -131,6 +131,58 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 
 `scripts/fake-mcp-server.mjs` is a minimal stdio server used by the smoke test.
 
+### Runner dependency
+
+A stdio server is spawned **on the runner**, so the `mcp` plugin cannot connect
+one at boot if no runner has dialed in yet. It is wired up automatically as
+runners come and go:
+
+- a runner joining (re)spawns the servers and registers their tools;
+- a runner leaving does **not** unregister the tools. The model has already been
+  handed the tool list, so pulling the tools mid-turn would answer a call with
+  `Unknown tool`. Instead the tool reports that no runner is connected, and
+  works again once one returns.
+
+Only the first arrival and the last departure trigger this, so a runner that
+reconnects under the same id does not churn the tool list.
+
+### Scout
+
+[Scout](../scout) ships its own stdio MCP server, so it needs no MCP work here —
+point the plugin at the built artifact and its 18 read tools appear as
+`mcp__scout__*`. The MCP server runs on the runner and talks to Scout's API over
+HTTP, so the runner needs to reach `scout.internal.gaycats.ovh`.
+
+```sh
+# Build the MCP server once in Scout's checkout (it is not committed).
+cd ../scout && npm run build          # -> dist-mcp/mcp.js
+```
+
+Settings → Plugins → MCP servers:
+
+```json
+[
+  {
+    "name": "scout",
+    "transport": "stdio",
+    "command": "node",
+    "args": ["/root/scout/dist-mcp/mcp.js"],
+    "env": { "SCOUT_API_URL": "http://scout.internal.gaycats.ovh" }
+  }
+]
+```
+
+- `dist-mcp/mcp.js` keeps its bare imports external, so it needs Scout's
+  `node_modules` next to it — it is not a standalone bundle. It also needs
+  Node ≥ 22.5, which is above hat's own `engines.node: ">=20"`.
+- Scout is read-only over MCP unless `SCOUT_MCP_ALLOW_WRITES` is set, which
+  additionally exposes 10 mutating tools. Hat ignores MCP's `readOnlyHint`, so
+  leaving that variable unset is the stronger control.
+- `scout://status` and `scout://dashboard` are MCP *resources*; hat's client
+  implements tools only, so they are not exposed.
+- `search_listings` and the scan tools perform real marketplace scans over the
+  network and can take a couple of minutes (Scout allows 120s per request).
+
 ## Vision + attachments (M4)
 
 Attach images by button, paste, or drag-and-drop. Uploads are content-addressed

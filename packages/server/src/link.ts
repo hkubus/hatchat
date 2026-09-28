@@ -316,6 +316,13 @@ export class RunnerRegistry {
   constructor(
     private readonly log: Logger,
     private readonly enrollToken: string,
+    /**
+     * Called after a runner joins or leaves. Plugins that spawn processes
+     * through the runner (MCP stdio servers) have to be reactivated, because
+     * they are wired at activation time and would otherwise stay failed until
+     * the next restart.
+     */
+    private readonly onAvailabilityChange?: (available: boolean) => void,
   ) {}
 
   attach(server: Server): void {
@@ -385,17 +392,29 @@ export class RunnerRegistry {
         clearTimeout(handshake);
 
         const id = message.runnerId;
-        this.runners.get(id)?.close();
+        // A reconnect under the same id supersedes the old socket. Fail it
+        // explicitly: its close handler is a no-op now that the map points at
+        // the replacement, and its pending RPCs would otherwise hang.
+        const previous = this.runners.get(id);
+        // Sampled before the entry is dropped: a same-id reconnect must not
+        // look like the fleet emptying out and refilling.
+        const wasEmpty = this.runners.size === 0;
+        this.runners.delete(id);
+        previous?.close();
+        previous?.fail("superseded by a newer connection");
 
         connection = new RunnerConnection(ws, id, message.caps, this.log);
         this.runners.set(id, connection);
         ws.send(encodeLinkMessage({ t: "hello.ok", runnerId: id }));
         this.log.info(`runner connected: ${id} (${message.caps.os}/${message.caps.arch}) tags=${message.caps.tags.join(",")}`);
+        if (wasEmpty) this.onAvailabilityChange?.(true);
 
         ws.on("close", () => {
-          if (this.runners.get(id) === connection) this.runners.delete(id);
+          if (this.runners.get(id) !== connection) return;
+          this.runners.delete(id);
           connection?.fail("link closed");
           this.log.info(`runner disconnected: ${id}`);
+          if (this.runners.size === 0) this.onAvailabilityChange?.(false);
         });
         return;
       }

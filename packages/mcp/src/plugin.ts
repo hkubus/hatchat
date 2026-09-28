@@ -61,6 +61,7 @@ function makeTool(
   tool: McpTool,
   client: McpClient,
   requireApproval: boolean,
+  isRunnerUp: () => boolean,
 ): Tool {
   return {
     name: `mcp__${sanitize(serverName)}__${sanitize(tool.name)}`,
@@ -68,6 +69,19 @@ function makeTool(
     parameters: tool.inputSchema ?? { type: "object", properties: {} },
     requiresApproval: requireApproval,
     async execute(args): Promise<Part[]> {
+      // The stdio process lives on the runner, so it dies with it. The tool
+      // stays registered on purpose: unregistering would make it disappear
+      // from the model's tool list mid-turn, and "Unknown tool" is a far worse
+      // answer than saying the runner is down.
+      if (!isRunnerUp()) {
+        return [
+          {
+            type: "text",
+            text: `MCP server "${serverName}" is unavailable: no runner is connected. ` +
+              `It will work again once a runner joins; try another tool meanwhile.`,
+          },
+        ];
+      }
       const result = await client.callTool(tool.name, args ?? {});
       return toParts(result);
     },
@@ -90,6 +104,7 @@ export function createMcpPlugin(): Plugin {
       const config = ctx.getConfig<{ serversJson?: string; requireApproval?: boolean }>();
       const servers = parseServers(config.serversJson);
       const requireApproval = config.requireApproval ?? true;
+      const isRunnerUp = ctx.runnerAvailable ?? (() => Boolean(ctx.processHost));
 
       for (const server of servers) {
         if (!server.name) throw new Error("each MCP server needs a name");
@@ -104,17 +119,27 @@ export function createMcpPlugin(): Plugin {
           if (!server.command) {
             throw new Error(`MCP server ${server.name}: command is required`);
           }
-          connection = await connectStdio(ctx.processHost, {
-            command: server.command,
-            args: server.args,
-            env: server.env,
-          });
+          try {
+            connection = await connectStdio(ctx.processHost, {
+              command: server.command,
+              args: server.args,
+              env: server.env,
+            });
+          } catch (error) {
+            // The usual cause at boot is that no runner has dialed in yet. The
+            // server reactivates this plugin when one does, so say so instead
+            // of leaving a bare spawn failure in the plugin list.
+            throw new Error(
+              `MCP server ${server.name}: ${error instanceof Error ? error.message : String(error)} ` +
+                `(stdio servers run on the runner; this retries when one connects)`,
+            );
+          }
         }
 
         connections.set(server.name, { close: connection.close });
         const tools = await connection.client.listTools();
         for (const tool of tools) {
-          ctx.register.tool(makeTool(server.name, tool, connection.client, requireApproval));
+          ctx.register.tool(makeTool(server.name, tool, connection.client, requireApproval, isRunnerUp));
         }
         ctx.logger.info(`connected ${server.name}: ${tools.length} tool(s)`);
       }

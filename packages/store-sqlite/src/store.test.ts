@@ -52,6 +52,57 @@ test("titles the session from the first user message", () => {
   const session = store.createSession("fake/fake-agent");
   store.appendMessage(session.id, message("u1", "user", "Hello there world"));
   assert.equal(store.getSession(session.id)?.title, "Hello there world");
+  assert.equal(store.getSession(session.id)?.titleSource, "derived");
+  store.close();
+});
+
+test("a generated title replaces the derived one but never a rename", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("u1", "user", "why is the build slow"));
+
+  assert.equal(store.setGeneratedTitle(session.id, "Slow build diagnosis"), true);
+  assert.equal(store.getSession(session.id)?.title, "Slow build diagnosis");
+  assert.equal(store.getSession(session.id)?.titleSource, "model");
+
+  // A model title is final: later attempts are refused.
+  assert.equal(store.setGeneratedTitle(session.id, "Something else"), false);
+  assert.equal(store.getSession(session.id)?.title, "Slow build diagnosis");
+
+  store.close();
+});
+
+test("a rename beats an in-flight generated title", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("u1", "user", "why is the build slow"));
+
+  // The user renames while the model is still thinking about the title.
+  store.setSessionTitle(session.id, "CI triage");
+  assert.equal(store.setGeneratedTitle(session.id, "Slow build diagnosis"), false);
+  assert.equal(store.getSession(session.id)?.title, "CI triage");
+  assert.equal(store.getSession(session.id)?.titleSource, "user");
+
+  store.close();
+});
+
+test("titling a session does not count as activity", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const older = store.createSession("fake/fake-agent");
+  const newer = store.createSession("fake/fake-agent");
+  store.appendMessage(older.id, message("u1", "user", "first"));
+  store.appendMessage(newer.id, message("u2", "user", "second"));
+
+  // updated_at drives the sidebar ordering, so a title must not reorder it.
+  // Compare against the order as it stands rather than a fixed expectation:
+  // both sessions can share a millisecond, and ties are not deterministic.
+  const orderBefore = store.listSessions().map((s) => s.id);
+  const before = store.getSession(older.id)?.updatedAt;
+
+  assert.equal(store.setGeneratedTitle(older.id, "First conversation"), true);
+  assert.equal(store.getSession(older.id)?.updatedAt, before);
+  assert.deepEqual(store.listSessions().map((s) => s.id), orderBefore);
+
   store.close();
 });
 

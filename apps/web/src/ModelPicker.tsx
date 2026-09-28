@@ -1,6 +1,8 @@
 import type { ModelInfo } from "@hat/core";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { capTags } from "./capTags";
+import { capTags, contextTag } from "./capTags";
+import CreatorIcon from "./CreatorIcon";
+import { creatorName, creatorSlug, groupByCreator, modelName, shortModelId } from "./creators";
 
 interface ModelPickerProps {
   models: ModelInfo[];
@@ -14,10 +16,12 @@ interface Section {
   id: string;
   heading: string;
   models: ModelInfo[];
+  /** Creator slug, so the heading can carry a brand mark. */
+  icon?: { slug: string; name: string };
 }
 
 function byLabel(a: ModelInfo, b: ModelInfo): number {
-  return (a.label || a.id).localeCompare(b.label || b.id);
+  return modelName(a).localeCompare(modelName(b));
 }
 
 function Chevron(): JSX.Element {
@@ -64,8 +68,9 @@ export default function ModelPicker({
     const matches = (m: ModelInfo): boolean =>
       q === "" ||
       m.id.toLowerCase().includes(q) ||
-      (m.label || "").toLowerCase().includes(q) ||
-      m.provider.toLowerCase().includes(q);
+      modelName(m).toLowerCase().includes(q) ||
+      m.provider.toLowerCase().includes(q) ||
+      creatorName(m).toLowerCase().includes(q);
 
     const favModels = models.filter((m) => favorites.includes(m.id) && matches(m)).sort(byLabel);
     const out: Section[] = [];
@@ -73,15 +78,18 @@ export default function ModelPicker({
       out.push({ id: "favorites", heading: "Favorites", models: favModels });
     }
 
-    const byProvider = new Map<string, ModelInfo[]>();
-    for (const m of models) {
-      if (!matches(m)) continue;
-      const list = byProvider.get(m.provider) ?? [];
-      list.push(m);
-      byProvider.set(m.provider, list);
-    }
-    for (const [provider, list] of [...byProvider.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-      out.push({ id: provider, heading: provider, models: list.sort(byLabel) });
+    for (const creator of groupByCreator(models)) {
+      const list = creator.models.filter(matches);
+      if (list.length === 0) continue;
+      // OpenRouter's own router models have no lab behind them, and
+      // "OpenRouter" is the one heading that only ever repeats the provider.
+      const isRouter = creator.slug === "openrouter";
+      out.push({
+        id: `creator:${creator.slug}`,
+        heading: isRouter ? "Router" : creator.name,
+        models: list.sort(byLabel),
+        icon: isRouter ? undefined : { slug: creator.slug, name: creator.name },
+      });
     }
     return out;
   }, [models, favorites, query]);
@@ -154,9 +162,10 @@ export default function ModelPicker({
         onClick={() => setOpen((prev) => !prev)}
         aria-haspopup="listbox"
         aria-expanded={open}
-        title={current ? `${current.label} — ${current.id}` : "Choose a model"}
+        title={current ? `${modelName(current)} — ${current.id}` : "Choose a model"}
       >
-        <span className="picker-trigger-label">{current ? current.label || current.id : "no models"}</span>
+        {current && <CreatorIcon slug={creatorSlug(current)} name={creatorName(current)} size={15} />}
+        <span className="picker-trigger-label">{current ? modelName(current) : "no models"}</span>
         <Chevron />
       </button>
 
@@ -188,12 +197,14 @@ export default function ModelPicker({
             {sections.map((section) => (
               <div className="picker-section" key={section.id}>
                 <div className="picker-heading">
-                  {section.heading}
+                  {section.icon && <CreatorIcon slug={section.icon.slug} name={section.icon.name} size={13} />}
+                  <span>{section.heading}</span>
                   <span className="picker-count">{section.models.length}</span>
                 </div>
                 {section.models.map((m) => {
                   const index = flat.findIndex((f) => f.id === m.id);
                   const isFavorite = favorites.includes(m.id);
+                  const ctx = contextTag(m.contextWindow);
                   return (
                     <div
                       className={`picker-row ${m.id === value ? "selected" : ""} ${
@@ -212,15 +223,20 @@ export default function ModelPicker({
                         onClick={() => choose(m.id)}
                         onMouseEnter={() => setActive(index)}
                       >
-                        <span className="picker-row-name">{m.label || m.id}</span>
-                        {m.label && m.label !== m.id && <span className="picker-row-id">{m.id}</span>}
+                        <span className="picker-row-name">{modelName(m)}</span>
+                        <span className="picker-row-id">{shortModelId(m)}</span>
                         <span className="picker-tags">
-                          {capTags(m.capabilities, m.contextWindow).map((tag) => (
+                          {capTags(m.capabilities).map((tag) => (
                             <span className="cap" key={tag.key} title={tag.title}>
                               {tag.label}
                             </span>
                           ))}
                         </span>
+                        {ctx && (
+                          <span className="picker-ctx" title={ctx.title}>
+                            {ctx.label}
+                          </span>
+                        )}
                       </button>
                       <button
                         type="button"

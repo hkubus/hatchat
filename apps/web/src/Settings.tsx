@@ -9,7 +9,9 @@ import {
   setPluginEnabled,
   setSecret,
 } from "./api";
-import { capTags } from "./capTags";
+import { capTags, contextTag } from "./capTags";
+import CreatorIcon from "./CreatorIcon";
+import { creatorName, creatorSlug } from "./creators";
 
 interface SettingsProps {
   models: ModelInfo[];
@@ -429,13 +431,19 @@ export default function Settings({
         <h2>Models ({models.length})</h2>
         {models.map((m) => (
           <div key={m.id} className="settings-row compact">
+            <CreatorIcon slug={creatorSlug(m)} name={creatorName(m)} size={14} />
             <span className="settings-name mono">{m.id}</span>
             <span className="caps">
-              {capTags(m.capabilities, m.contextWindow).map((tag) => (
-                <span className={`cap ${tag.key === "ctx" ? "muted" : ""}`} key={tag.key} title={tag.title}>
+              {capTags(m.capabilities).map((tag) => (
+                <span className="cap" key={tag.key} title={tag.title}>
                   {tag.label}
                 </span>
               ))}
+              {contextTag(m.contextWindow) && (
+                <span className="ctx-label" title={contextTag(m.contextWindow)!.title}>
+                  {contextTag(m.contextWindow)!.label}
+                </span>
+              )}
             </span>
           </div>
         ))}

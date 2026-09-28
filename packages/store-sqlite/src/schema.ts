@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   approval_mode TEXT NOT NULL DEFAULT 'ask',
   allowed_tools TEXT NOT NULL DEFAULT '[]',
   reasoning_effort TEXT NOT NULL DEFAULT 'off',
+  title_source TEXT NOT NULL DEFAULT 'derived',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

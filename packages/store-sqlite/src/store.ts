@@ -18,9 +18,16 @@ import { DatabaseSync } from "node:sqlite";
 import { imageSize } from "./image.js";
 import { SCHEMA } from "./schema.js";
 
+export type TitleSource = "derived" | "model" | "user";
+
 export interface SessionRecord {
   id: string;
   title: string;
+  /**
+   * Who owns the title. `derived` is the truncated first user message and is
+   * safe to overwrite; `user` and `model` are final.
+   */
+  titleSource: TitleSource;
   model: string;
   activeLeafId: string | null;
   approvalMode: ApprovalMode;
@@ -61,6 +68,7 @@ interface MessageRow {
 interface SessionRow {
   id: string;
   title: string;
+  title_source: string;
   model: string;
   active_leaf_id: string | null;
   approval_mode: string;
@@ -106,6 +114,7 @@ export class Store implements SecretStore {
       "approval_mode TEXT NOT NULL DEFAULT 'ask'",
       "allowed_tools TEXT NOT NULL DEFAULT '[]'",
       "reasoning_effort TEXT NOT NULL DEFAULT 'off'",
+      "title_source TEXT NOT NULL DEFAULT 'derived'",
     ];
     for (const column of columns) {
       try {
@@ -135,18 +144,19 @@ export class Store implements SecretStore {
     const id = newId("sess");
     this.db
       .prepare(
-        `INSERT INTO sessions (id, title, model, active_leaf_id, created_at, updated_at)
-         VALUES (?, ?, ?, NULL, ?, ?)`,
+        `INSERT INTO sessions (id, title, title_source, model, active_leaf_id, created_at, updated_at)
+         VALUES (?, ?, 'derived', ?, NULL, ?, ?)`,
       )
       .run(id, title, model, now, now);
     return {
       id,
       title,
+      titleSource: "derived",
       model,
       activeLeafId: null,
-      approvalMode: "ask",
+      approvalMode: "auto",
       allowedTools: [],
-      reasoningEffort: "off",
+      reasoningEffort: "low",
       createdAt: now,
       updatedAt: now,
     };
@@ -172,10 +182,33 @@ export class Store implements SecretStore {
       .run(model, Date.now(), sessionId);
   }
 
+  /** A manual rename: always wins, and counts as activity. */
   setSessionTitle(sessionId: string, title: string): void {
     this.db
-      .prepare(`UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`)
+      .prepare(
+        `UPDATE sessions SET title = ?, title_source = 'user', updated_at = ? WHERE id = ?`,
+      )
       .run(title, Date.now(), sessionId);
+  }
+
+  /**
+   * Apply a model-written title, but only while the title is still the derived
+   * placeholder — a rename that landed while the model was thinking wins.
+   *
+   * Deliberately leaves `updated_at` alone: the turn that triggered this has
+   * already bumped it, and reordering the sidebar mid-conversation is just
+   * noise.
+   *
+   * @returns whether the title was written.
+   */
+  setGeneratedTitle(sessionId: string, title: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE sessions SET title = ?, title_source = 'model'
+         WHERE id = ? AND title_source = 'derived'`,
+      )
+      .run(title, sessionId);
+    return result.changes > 0;
   }
 
   deleteSession(sessionId: string): boolean {
@@ -493,9 +526,10 @@ function toSession(row: SessionRow): SessionRecord {
     title: row.title,
     model: row.model,
     activeLeafId: row.active_leaf_id,
-    approvalMode: (row.approval_mode as ApprovalMode) ?? "ask",
+    approvalMode: (row.approval_mode as ApprovalMode) ?? "auto",
     allowedTools: row.allowed_tools ? (JSON.parse(row.allowed_tools) as string[]) : [],
-    reasoningEffort: (row.reasoning_effort as ReasoningEffort) ?? "off",
+    reasoningEffort: (row.reasoning_effort as ReasoningEffort) ?? "low",
+    titleSource: (row.title_source as TitleSource) ?? "derived",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
