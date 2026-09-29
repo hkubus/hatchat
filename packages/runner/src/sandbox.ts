@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 
 export type SandboxMode = "auto" | "host" | "container";
@@ -206,7 +207,38 @@ export function containerUserArgs(sandbox: SandboxConfig, identity?: HostIdentit
   return ["--user", user];
 }
 
+/**
+ * A container name for a job or process: `hat-<sanitized id>-<random>`, so it
+ * is valid for docker/podman and unique even if an id is reused.
+ */
+export function containerName(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 40);
+  return `hat-${safe}-${randomBytes(4).toString("hex")}`;
+}
+
+export interface CleanupCommand {
+  bin: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+/**
+ * Best-effort `<runtime> rm -f <name>`. Resolves either way, within the
+ * timeout; a container that already exited (and was `--rm`ed) is not an error.
+ */
+export function removeContainer(
+  cleanup: CleanupCommand | undefined,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (!cleanup) return Promise.resolve();
+  return new Promise((resolve) => {
+    execFile(cleanup.bin, cleanup.args, { env: cleanup.env, timeout: timeoutMs }, () => resolve());
+  });
+}
+
 export interface SpawnOptions {
+  /** Job or process id, used to name the container. */
+  id?: string;
   /** Per-command env; filtered by `commandEnv` for the tier. */
   env?: Record<string, string>;
   /** Defaults to the runner's own identity. */
@@ -220,6 +252,8 @@ export interface SpawnPlan {
   args: string[];
   shell: boolean;
   env: NodeJS.ProcessEnv;
+  /** Container tier only: run when the job is killed, since killing the CLI leaves the container running. */
+  cleanup?: CleanupCommand;
 }
 
 /**
@@ -247,14 +281,18 @@ export function spawnPlan(
     };
   }
   const identity = "identity" in options ? options.identity : currentIdentity();
+  const name = containerName(options.id ?? "job");
   return {
     bin: sandbox.runtime,
     shell: false,
     env: { ...hostEnv, ...env },
+    cleanup: { bin: sandbox.runtime, args: ["rm", "-f", name], env: hostEnv },
     args: [
       "run",
       "--rm",
       "-i",
+      "--name",
+      name,
       "--network",
       sandbox.network,
       "--memory",

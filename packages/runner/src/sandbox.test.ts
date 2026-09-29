@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import {
+  containerName,
   parseProcessTier,
   parseSandboxMode,
   probeRuntime,
+  removeContainer,
   resolveSandbox,
   spawnPlan,
   type ProbeResult,
@@ -50,6 +52,34 @@ test("container mode wraps the command with isolation flags", () => {
   assert.match(args, /-e HOME=\/workspace/);
   assert.match(args, /-v \/srv\/work:\/workspace/);
   assert.match(args, /node:22-slim sh -lc echo hi$/);
+});
+
+test("container runs are named after the job and carry a matching rm -f cleanup", () => {
+  const plan = spawnPlan("echo hi", "/w", container, { id: "job_1", identity: runner, hostEnv });
+  assert.deepEqual(plan.args.slice(0, 5), ["run", "--rm", "-i", "--name", plan.args[4]]);
+  const name = plan.args[4]!;
+  assert.match(name, /^hat-job_1-[0-9a-f]{8}$/);
+  assert.deepEqual(plan.cleanup, { bin: "docker", args: ["rm", "-f", name], env: hostEnv });
+});
+
+test("host plans have no container cleanup", () => {
+  const plan = spawnPlan("echo hi", "/w", { ...container, mode: "host" }, { id: "job_1", hostEnv });
+  assert.equal(plan.cleanup, undefined);
+});
+
+test("containerName sanitizes ids and stays unique", () => {
+  const a = containerName("../evil id;rm -rf /");
+  assert.match(a, /^hat-\.\.-evil-id-rm--rf---[0-9a-f]{8}$/);
+  assert.match(containerName("x".repeat(200)), /^hat-x{40}-[0-9a-f]{8}$/);
+  assert.notEqual(containerName("same"), containerName("same"));
+});
+
+test("removeContainer is a no-op without cleanup and gives up after its timeout", async () => {
+  await removeContainer(undefined);
+  const bin = await fakeRuntime("docker", "exec sleep 30");
+  const started = Date.now();
+  await removeContainer({ bin, args: ["rm", "-f", "hat-x"], env: process.env }, 100);
+  assert.ok(Date.now() - started < 5_000);
 });
 
 test("rootful docker runs the container as the runner's uid:gid", () => {

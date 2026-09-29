@@ -127,6 +127,9 @@ Inside the container:
 - `HOME` is `/workspace`. Per-command env is forwarded as `-e KEY`, with values
   kept out of the runtime's argv; names that would steer the runtime CLI
   (`DOCKER_*`, `CONTAINER_*`, `XDG_*`, proxies, ...) are dropped.
+- Each container is named `hat-<job id>-<random>`. On cancel, timeout, output
+  cap, link loss or runner shutdown the runner runs `<runtime> rm -f <name>`
+  (best-effort, 5s timeout), since killing the CLI alone leaves it running.
 
 Background processes and the Python tool (shell-mode processes) stay on the
 **host** under `auto`, because the default image has no `python3` and the

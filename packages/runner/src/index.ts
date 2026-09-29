@@ -51,10 +51,12 @@ class Runner {
     this.connect();
   }
 
-  stop(): void {
+  /** Resolves once sandbox containers have been removed (best-effort, bounded). */
+  async stop(): Promise<void> {
     this.stopped = true;
-    this.killManaged();
+    const reaped = this.killManaged();
     this.ws?.close();
+    await reaped;
   }
 
   /**
@@ -63,11 +65,14 @@ class Runner {
    * so jobs and long-lived processes (stdio MCP servers) must die with the link
    * instead of piling up across reconnects.
    */
-  private killManaged(): void {
-    for (const job of this.jobs.values()) job.abort();
+  private async killManaged(): Promise<void> {
+    const pending = [
+      ...[...this.jobs.values()].map((job) => job.abort()),
+      ...[...this.processes.values()].map((proc) => proc.kill()),
+    ];
     this.jobs.clear();
-    for (const proc of this.processes.values()) proc.kill();
     this.processes.clear();
+    await Promise.all(pending);
   }
 
   private connect(): void {
@@ -98,8 +103,9 @@ class Runner {
     ws.on("close", () => {
       log("link closed; reconnecting in 1s");
       this.ws = undefined;
+      // Reap before failAllPending, which forgets the jobs map.
+      void this.killManaged();
       this.failAllPending("link closed");
-      this.killManaged();
       if (!this.stopped) setTimeout(() => this.connect(), 1000);
     });
 
@@ -130,7 +136,7 @@ class Runner {
         this.jobs.get(message.jobId)?.write(message.chunk);
         break;
       case "exec.cancel":
-        this.jobs.get(message.jobId)?.abort();
+        void this.jobs.get(message.jobId)?.abort();
         break;
       case "proc.start":
         this.handleProcStart(message);
@@ -142,7 +148,7 @@ class Runner {
         this.processes.get(message.procId)?.endStdin();
         break;
       case "proc.cancel":
-        this.processes.get(message.procId)?.kill();
+        void this.processes.get(message.procId)?.kill();
         break;
       case "fs.read":
         void this.handle(async () => ({
@@ -356,7 +362,6 @@ runner.start();
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     log(`received ${signal}, shutting down`);
-    runner.stop();
-    process.exit(0);
+    void runner.stop().finally(() => process.exit(0));
   });
 }

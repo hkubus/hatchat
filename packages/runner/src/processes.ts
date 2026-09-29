@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { RunnerToServer } from "@hat/runner-protocol";
-import { spawnPlan, type SandboxConfig } from "./sandbox.js";
+import { removeContainer, spawnPlan, type SandboxConfig, type SpawnPlan } from "./sandbox.js";
 
 export interface ProcessSpec {
   procId: string;
@@ -15,7 +15,8 @@ export interface ProcessSpec {
 export interface ProcessHandle {
   write(chunk: string): void;
   endStdin(): void;
-  kill(): void;
+  /** Resolves once any container cleanup has finished (or given up). */
+  kill(): Promise<void>;
 }
 
 /**
@@ -31,8 +32,8 @@ export function startProcess(
   let finished = false;
   let killed = false;
 
-  const plan = spec.shell
-    ? spawnPlan(spec.command, spec.cwd, spec.shell, { env: spec.env })
+  const plan: SpawnPlan = spec.shell
+    ? spawnPlan(spec.command, spec.cwd, spec.shell, { env: spec.env, id: spec.procId })
     : {
         bin: spec.command,
         args: spec.args ?? [],
@@ -51,9 +52,11 @@ export function startProcess(
     detached: process.platform !== "win32",
   });
 
-  const kill = (): void => {
+  let removal: Promise<void> | undefined;
+  /** Kill the process tree, then force-remove its container (if any). */
+  const kill = (): Promise<void> => {
     killed = true;
-    if (!child.pid) return;
+    if (finished || !child.pid) return removal ?? Promise.resolve();
     try {
       if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
       else child.kill("SIGKILL");
@@ -64,6 +67,8 @@ export function startProcess(
         /* gone */
       }
     }
+    removal ??= removeContainer(plan.cleanup);
+    return removal;
   };
 
   child.stdout.on("data", (data: Buffer) => {

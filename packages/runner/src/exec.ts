@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { RunnerToServer } from "@hat/runner-protocol";
-import { spawnPlan, type SandboxConfig } from "./sandbox.js";
+import { removeContainer, spawnPlan, type SandboxConfig } from "./sandbox.js";
 
 export interface RunSpec {
   jobId: string;
@@ -13,13 +13,14 @@ export interface RunSpec {
 }
 
 export interface JobHandle {
-  abort(): void;
+  /** Resolves once any container cleanup has finished (or given up). */
+  abort(): Promise<void>;
   write(chunk: string): void;
 }
 
 /**
  * Start a detached shell job. Output is streamed to the server; the process
- * tree is killed on timeout, cancel, or output-cap breach.
+ * tree (and container) is killed on timeout, cancel, or output-cap breach.
  */
 export function startJob(
   spec: RunSpec,
@@ -33,7 +34,7 @@ export function startJob(
   let timedOut = false;
 
   // The plan filters caller env: the model never overrides loader / runtime knobs.
-  const plan = spawnPlan(spec.command, spec.cwd, sandbox, { env: spec.env });
+  const plan = spawnPlan(spec.command, spec.cwd, sandbox, { env: spec.env, id: spec.jobId });
   const child = spawn(plan.bin, plan.args, {
     shell: plan.shell,
     cwd: spec.cwd,
@@ -42,8 +43,13 @@ export function startJob(
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  const kill = (): void => {
-    if (finished || !child.pid) return;
+  let removal: Promise<void> | undefined;
+  /**
+   * Kill the process tree, then force-remove the job's container (if any):
+   * killing the runtime CLI alone leaves the container running.
+   */
+  const kill = (): Promise<void> => {
+    if (finished || !child.pid) return removal ?? Promise.resolve();
     try {
       if (process.platform !== "win32") {
         process.kill(-child.pid, "SIGKILL");
@@ -57,6 +63,8 @@ export function startJob(
         /* already gone */
       }
     }
+    removal ??= removeContainer(plan.cleanup);
+    return removal;
   };
 
   const timer = setTimeout(() => {
@@ -66,7 +74,7 @@ export function startJob(
       jobId: spec.jobId,
       chunk: `\n[timeout after ${spec.timeoutMs}ms; killing process]\n`,
     });
-    kill();
+    void kill();
   }, spec.timeoutMs);
 
   const emit = (chunk: string, stream: "stdout" | "stderr"): void => {
@@ -78,7 +86,7 @@ export function startJob(
         jobId: spec.jobId,
         chunk: `\n[output limit ${spec.maxOutputBytes} bytes reached; killing process]\n`,
       });
-      kill();
+      void kill();
       return;
     }
     if (stream === "stdout") {
@@ -123,13 +131,13 @@ export function startJob(
   child.stdin.end();
 
   return {
-    abort(): void {
+    abort(): Promise<void> {
       send({
         t: "exec.stderr",
         jobId: spec.jobId,
         chunk: "\n[cancelled]\n",
       });
-      kill();
+      return kill();
     },
     write(chunk: string): void {
       if (!finished && child.stdin.writable) {
