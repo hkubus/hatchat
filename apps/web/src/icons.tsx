@@ -119,3 +119,99 @@ export function DownloadIcon(props: IconProps): JSX.Element {
     </Svg>
   );
 }
+
+export function PlusIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M12 5v14M5 12h14" />
+    </Svg>
+  );
+}
+
+export function SearchIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.5-3.5" />
+    </Svg>
+  );
+}
+
+export function TrashIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
+    </Svg>
+  );
+}
+
+export function GearIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
+    </Svg>
+  );
+}
+
+export function ImportIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M12 15V3M7 8l5-5 5 5M5 21h14" />
+    </Svg>
+  );
+}
+
+export function SignOutIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+    </Svg>
+  );
+}
+
+export function MenuIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </Svg>
+  );
+}
+
+export function PaperclipIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M21.4 11.05 12.5 20a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />
+    </Svg>
+  );
+}
+
+/** Reasoning effort: a small bulb whose rays stand for "thinking harder". */
+export function BulbIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z" />
+    </Svg>
+  );
+}
+
+export function WrenchIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M14.7 6.3a4 4 0 0 0 5 5L21 13a6 6 0 0 1-7.6 1.4l-6.7 6.7a2.1 2.1 0 0 1-3-3l6.7-6.7A6 6 0 0 1 11.8 3.8Z" />
+    </Svg>
+  );
+}
+
+/** The app mark: a top hat in the accent colour. */
+export function HatMark({ className }: IconProps): JSX.Element {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="var(--accent)"
+        d="M7.5 4.5c0-.8.7-1.5 1.5-1.5h6c.8 0 1.5.7 1.5 1.5V15h-9Z M2.5 16.8c0-.5.4-.8.9-.8h17.2c.5 0 .9.3.9.8 0 1.8-3.6 3.2-9.5 3.2s-9.5-1.4-9.5-3.2Z"
+      />
+      <path fill="var(--bg)" d="M7.5 12h9v2h-9Z" />
+    </svg>
+  );
+}

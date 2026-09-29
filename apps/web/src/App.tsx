@@ -13,18 +13,18 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChatSettings from "./ChatSettings";
 import Connect from "./Connect";
-import { DownloadIcon, SlidersIcon } from "./icons";
+import ComposerMenu, { type MenuOption } from "./ComposerMenu";
+import { BulbIcon, DownloadIcon, HatMark, MenuIcon, PaperclipIcon, SlidersIcon, WrenchIcon } from "./icons";
 import MessageView, { type MessageActions } from "./MessageView";
 import ModelPicker from "./ModelPicker";
 import Settings from "./Settings";
 import Sidebar from "./Sidebar";
 import * as api from "./api";
 import type { PluginDescriptor, ProviderStatus, RunnerSummary, SearchHit, SessionSummary } from "./api";
-import { capSummary, capTags, contextTag } from "./capTags";
-import CreatorIcon from "./CreatorIcon";
-import { creatorName, creatorSlug } from "./creators";
+import { modelName } from "./creators";
 import { notify } from "./notifications";
 import { formatTokens, cacheHitLabel, usageDetail } from "./tokens";
+import UsageMeter from "./UsageMeter";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
 
@@ -42,6 +42,26 @@ type SessionSettings = Pick<api.SessionRecord, "instructions" | "temperature" | 
 const NO_SETTINGS: SessionSettings = { instructions: "", temperature: null, maxTokens: null };
 
 const DEFAULT_MODEL = "fake/fake-agent";
+
+type PolicyMode = api.SessionRecord["approvalMode"];
+
+const EFFORT_LABEL: Record<ReasoningEffort, string> = { off: "Off", low: "Low", medium: "Medium", high: "High" };
+
+const EFFORT_OPTIONS: ReadonlyArray<MenuOption<ReasoningEffort>> = [
+  { value: "off", label: "Off", description: "Answer straight away" },
+  { value: "low", label: "Low", description: "A quick think first (default)" },
+  { value: "medium", label: "Medium", description: "More deliberate, a bit slower" },
+  { value: "high", label: "High", description: "Thinks hardest; slowest and costliest" },
+];
+
+const POLICY_LABEL: Record<PolicyMode, string> = { auto: "Auto", ask: "Ask", allowlist: "Allowlist", deny: "Blocked" };
+
+const POLICY_OPTIONS: ReadonlyArray<MenuOption<PolicyMode>> = [
+  { value: "auto", label: "Auto", description: "Tools run without asking (default)" },
+  { value: "ask", label: "Ask", description: "Confirm risky tool calls first" },
+  { value: "allowlist", label: "Allowlist", description: "Listed tools run; the rest ask", keepOpen: true },
+  { value: "deny", label: "Blocked", description: "Every tool call is refused" },
+];
 
 /** How close to the bottom the scroller has to be to keep following the stream. */
 const NEAR_BOTTOM_PX = 72;
@@ -75,7 +95,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
-  const [policyMode, setPolicyMode] = useState<"ask" | "auto" | "allowlist" | "deny">("auto");
+  const [policyMode, setPolicyMode] = useState<PolicyMode>("auto");
   const [allowedToolsText, setAllowedToolsText] = useState("");
   /** `ask_user` calls answered here, hidden until their result arrives. */
   const [answered, setAnswered] = useState<ReadonlySet<string>>(() => new Set());
@@ -98,6 +118,8 @@ export default function App() {
   const [restoring, setRestoring] = useState(false);
   const [sessionSettings, setSessionSettings] = useState<SessionSettings>(NO_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Narrow screens only: the sidebar is a drawer over the chat. */
+  const [navOpen, setNavOpen] = useState(false);
   /** A message opened from search, briefly highlighted and scrolled to. */
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -483,7 +505,7 @@ export default function App() {
     persist({ reasoningEffort: next });
   }
 
-  function changePolicyMode(mode: typeof policyMode): void {
+  function changePolicyMode(mode: PolicyMode): void {
     setPolicyMode(mode);
     persist({ approvalMode: mode });
   }
@@ -886,22 +908,46 @@ export default function App() {
   };
 
   return (
-    <div className="shell">
+    <div className={`shell ${navOpen ? "nav-open" : ""}`}>
       <Sidebar
         sessions={sessions}
         activeId={sessionId}
         view={view}
-        onSelect={(id) => void openSession(id)}
-        onNew={() => void newChat()}
+        onSelect={(id) => {
+          setNavOpen(false);
+          void openSession(id);
+        }}
+        onNew={() => {
+          setNavOpen(false);
+          void newChat();
+        }}
         onRename={(id, title) => void handleRename(id, title)}
         onDelete={(id) => void handleDelete(id)}
-        onView={setView}
+        onView={(next) => {
+          setNavOpen(false);
+          setView(next);
+        }}
         onLogout={auth?.required ? () => void doLogout() : undefined}
-        onOpenHit={(hit) => void openHit(hit)}
-        onImport={(file) => void importChat(file)}
+        onOpenHit={(hit) => {
+          setNavOpen(false);
+          void openHit(hit);
+        }}
+        onImport={(file) => {
+          setNavOpen(false);
+          void importChat(file);
+        }}
       />
+      {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} aria-hidden="true" />}
       <div className="app">
       <header className="header">
+        <button
+          className="icon-btn nav-toggle"
+          onClick={() => setNavOpen(true)}
+          aria-label="Show conversations"
+          title="Conversations"
+        >
+          <MenuIcon />
+        </button>
         <div className="header-title">
           <h1>{currentTitle}</h1>
         </div>
@@ -974,11 +1020,9 @@ export default function App() {
 
             {messages.length === 0 && inFlight.length === 0 && !restoring && (
               <div className="empty">
-                <h2>Hat</h2>
-                <p>
-                  Try <code>run: echo hello from the runner</code>. Approve the tool call and it
-                  runs on the runner.
-                </p>
+                <HatMark className="empty-mark" />
+                <h2>What can I help with?</h2>
+                {selectedModel && <p>Talking to {modelName(selectedModel)}. Drop in files, or ask it to run something.</p>}
               </div>
             )}
 
@@ -1072,17 +1116,83 @@ export default function App() {
                 }}
                 rows={1}
               />
-              <div className="composer-actions">
+              <div className="composer-bar">
                 <button
                   className="icon-btn"
                   onClick={() => fileInput.current?.click()}
                   title="Attach images, PDFs, text or code files"
                   aria-label="Attach files"
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M21.4 11.05 12.5 20a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />
-                  </svg>
+                  <PaperclipIcon />
                 </button>
+
+                <ModelPicker
+                  models={models}
+                  value={model}
+                  favorites={favorites}
+                  onChange={changeModel}
+                  onToggleFavorite={toggleFavorite}
+                />
+
+                {/* Only for models that take a reasoning effort: a disabled
+                    control nobody can use is just noise in the bar. */}
+                {effortSupported && (
+                  <ComposerMenu
+                    label="Reasoning effort"
+                    icon={<BulbIcon />}
+                    value={reasoningEffort}
+                    options={EFFORT_OPTIONS}
+                    onChange={changeEffort}
+                    display={reasoningEffort === "low" ? undefined : EFFORT_LABEL[reasoningEffort]}
+                    tone={effortRaised ? "accent" : undefined}
+                    title={`Reasoning effort: ${EFFORT_LABEL[reasoningEffort]}`}
+                  />
+                )}
+
+                <ComposerMenu
+                  label="Tool calls"
+                  icon={<WrenchIcon />}
+                  value={policyMode}
+                  options={POLICY_OPTIONS}
+                  onChange={changePolicyMode}
+                  display={policyMode === "auto" ? undefined : POLICY_LABEL[policyMode]}
+                  tone={policyMode === "deny" ? "warn" : policyMode === "auto" ? undefined : "accent"}
+                  title={`Tool calls: ${POLICY_LABEL[policyMode]}`}
+                  onClose={policyMode === "allowlist" ? () => void savePolicy() : undefined}
+                  footer={
+                    policyMode === "allowlist" && (
+                      <label className="cmenu-field">
+                        <span>Allowed tools</span>
+                        <input
+                          value={allowedToolsText}
+                          placeholder="tool_a, tool_b"
+                          autoFocus
+                          onChange={(e) => setAllowedToolsText(e.target.value)}
+                          onBlur={() => void savePolicy()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.currentTarget.blur();
+                          }}
+                        />
+                      </label>
+                    )
+                  }
+                />
+
+                <span className="composer-spacer" />
+
+                <UsageMeter
+                  fraction={fill ? fill.fraction : null}
+                  tokensLabel={sessionTokensLabel ? `${sessionTokensLabel} tokens` : ""}
+                  title={[
+                    fill &&
+                      `${Math.round(fill.fraction * 100)}% of the context window: the last request used ${formatTokens(fill.tokens)} of ${formatTokens(selectedModel?.contextWindow ?? 0)} tokens. Near the limit, older tool output and messages are left out of requests.`,
+                    sessionTokensLabel &&
+                      `${usageDetail(sessionUsage)} tokens in this conversation${sessionCacheLabel ? ` (${sessionCacheLabel})` : ""}.`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n")}
+                />
+
                 {busy ? (
                   <button
                     className="send-btn stop"
@@ -1106,102 +1216,6 @@ export default function App() {
                       <path d="M12 19V5M5 12l7-7 7 7" />
                     </svg>
                   </button>
-                )}
-              </div>
-
-              <div className="composer-footer">
-                <ModelPicker
-                  models={models}
-                  value={model}
-                  favorites={favorites}
-                  onChange={changeModel}
-                  onToggleFavorite={toggleFavorite}
-                />
-
-                <select
-                  className={`composer-select ${effortRaised ? "on" : ""}`}
-                  value={reasoningEffort}
-                  onChange={(e) => changeEffort(e.target.value as ReasoningEffort)}
-                  disabled={!effortSupported}
-                  aria-label="Reasoning effort"
-                  title={
-                    effortSupported
-                      ? "How much the model should think before answering"
-                      : `${selectedModel?.label ?? "This model"} does not expose a reasoning effort level`
-                  }
-                >
-                  {REASONING_EFFORTS.map((effort) => (
-                    <option key={effort} value={effort}>
-                      {effort === "off" ? "effort: off" : `effort: ${effort}`}
-                    </option>
-                  ))}
-                </select>
-
-                <select
-                  className={`composer-select ${policyMode !== "auto" ? "on" : ""}`}
-                  value={policyMode}
-                  onChange={(e) => changePolicyMode(e.target.value as typeof policyMode)}
-                  aria-label="Tool policy"
-                  title="Which tool calls run without asking you first"
-                >
-                  <option value="ask">tools: ask</option>
-                  <option value="auto">tools: auto</option>
-                  <option value="allowlist">tools: allowlist</option>
-                  <option value="deny">tools: deny</option>
-                </select>
-
-                {policyMode === "allowlist" && (
-                  <input
-                    className="allowlist-input"
-                    value={allowedToolsText}
-                    placeholder="tool_a, tool_b"
-                    aria-label="Allowed tools"
-                    onChange={(e) => setAllowedToolsText(e.target.value)}
-                    onBlur={() => void savePolicy()}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") e.currentTarget.blur();
-                    }}
-                  />
-                )}
-
-                <span className="composer-spacer" />
-
-                {selectedModel && (
-                  <span className="composer-caps" title={capSummary(selectedModel)}>
-                    <CreatorIcon slug={creatorSlug(selectedModel)} name={creatorName(selectedModel)} size={14} />
-                    {capTags(selectedModel.capabilities).map((tag) => (
-                      <span className="cap" key={tag.key} title={tag.title}>
-                        {tag.label}
-                      </span>
-                    ))}
-                    {contextTag(selectedModel.contextWindow) && (
-                      <span className="ctx-label">
-                        {contextTag(selectedModel.contextWindow)!.label}
-                      </span>
-                    )}
-                  </span>
-                )}
-
-                {fill && (
-                  <span
-                    className={`ctx-fill ${fill.fraction >= 0.8 ? "warn" : ""}`}
-                    title={`The last request used ${formatTokens(fill.tokens)} of ${formatTokens(selectedModel?.contextWindow ?? 0)} context tokens. Near the limit, older tool output and messages are left out of requests.`}
-                  >
-                    <span className="ctx-bar" aria-hidden="true">
-                      <span style={{ width: `${Math.round(fill.fraction * 100)}%` }} />
-                    </span>
-                    {Math.round(fill.fraction * 100)}% context
-                  </span>
-                )}
-
-                {sessionTokensLabel && (
-                  <span
-                    className="token-count"
-                    title={`${usageDetail(sessionUsage)} tokens in this conversation`}
-                  >
-                    {sessionTokensLabel} tokens
-                    {sessionCacheLabel && ` · ${sessionCacheLabel}`}
-                  </span>
                 )}
               </div>
             </div>

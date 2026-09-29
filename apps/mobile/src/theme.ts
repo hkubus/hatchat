@@ -2,9 +2,10 @@
  * Design tokens.
  *
  * iOS-native system palette. Colours are the iOS system colours
- * (systemBackground, systemGroupedBackground, separator, systemBlue, …)
- * resolved once here from the OS appearance, so every screen reads as a
- * first-party iOS app in both light and dark mode.
+ * (systemBackground, systemGroupedBackground, separator, …) resolved once
+ * here from the OS appearance, so every screen reads as a first-party iOS
+ * app in both light and dark mode. The one exception is the tint: hat's red
+ * accent (shared with the web app) instead of systemBlue.
  *
  * Type scale and radii follow the Human Interface Guidelines: 17pt body,
  * 15pt subhead, 13pt footnote, 10–12pt continuous corners, 44pt minimum
@@ -35,12 +36,12 @@ export interface Theme {
     textDim: string;
     /** `tertiaryLabel`. */
     textFaint: string;
-    /** iMessage blue, both appearances. */
+    /** Your messages: a neutral fill, like the web app, so red stays for actions. */
     userBubble: string;
     userBubbleText: string;
     /** Incoming-message grey. */
     assistantBubble: string;
-    /** `systemBlue`. */
+    /** hat red — the app tint: buttons, links, checkmarks, header items. */
     accent: string;
     accentText: string;
     /** Approval prompt — `systemOrange`. */
@@ -83,10 +84,10 @@ const light: Theme["color"] = {
   text: "#000000",
   textDim: "#636366",
   textFaint: "#8e8e93",
-  userBubble: "#007aff",
-  userBubbleText: "#ffffff",
+  userBubble: "#e9e9eb",
+  userBubbleText: "#000000",
   assistantBubble: "#e9e9eb",
-  accent: "#007aff",
+  accent: "#dc3e42",
   accentText: "#ffffff",
   warn: "#ff9500",
   warnSurface: "#fff4e0",
@@ -108,10 +109,10 @@ const dark: Theme["color"] = {
   text: "#ffffff",
   textDim: "#98989d",
   textFaint: "#636366",
-  userBubble: "#0a84ff",
+  userBubble: "#2c2c2e",
   userBubbleText: "#ffffff",
   assistantBubble: "#262629",
-  accent: "#0a84ff",
+  accent: "#e5484d",
   accentText: "#ffffff",
   warn: "#ff9f0a",
   warnSurface: "#33270a",

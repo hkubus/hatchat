@@ -452,11 +452,12 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
               <View style={styles.rowBody}>
                 <View style={styles.rowLine}>
                   {/* Waiting gets a symbol, not just a colour, so it reads as
-                      "needs you" rather than a busier kind of running. */}
+                      "needs you" rather than a busier kind of running. Running
+                      is grey: red is the tint and also means "error". */}
                   {status === "waiting" ? (
                     <Icon name="exclamationmark.circle.fill" size={15} color={theme.color.warn} />
                   ) : status === "running" ? (
-                    <View style={[styles.runningDot, { backgroundColor: theme.color.accent }]} />
+                    <View style={[styles.runningDot, { backgroundColor: theme.color.textDim }]} />
                   ) : null}
                   <Text style={[styles.rowTitle, { color: theme.color.text }]} numberOfLines={1}>
                     {item.title}
@@ -474,7 +475,7 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
                   {status === "waiting" ? (
                     <Text style={[styles.rowStatus, { color: theme.color.warn }]}>Needs you · </Text>
                   ) : status === "running" ? (
-                    <Text style={[styles.rowStatus, { color: theme.color.accent }]}>Responding · </Text>
+                    <Text style={[styles.rowStatus, { color: theme.color.text }]}>Responding · </Text>
                   ) : null}
                   {item.messageCount} {item.messageCount === 1 ? "message" : "messages"}
                   {tokens ? ` · ${tokens} tokens` : ""}
