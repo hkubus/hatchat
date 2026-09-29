@@ -1,3 +1,4 @@
+import type { KernelEvent } from "./events.js";
 import type { ExecutionHost } from "./execution.js";
 import type { ProcessHost } from "./process.js";
 
@@ -50,4 +51,10 @@ export interface ToolContext {
   audit: AuditLog;
   logger: Logger;
   signal: AbortSignal;
+  /** Id of the tool call being executed. */
+  callId?: string;
+  /** Id of the assistant message that issued the call. */
+  messageId?: string;
+  /** Push an out-of-band event into the session's live turn stream. */
+  emit?(event: KernelEvent): void;
 }

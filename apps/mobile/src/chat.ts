@@ -25,6 +25,20 @@ export interface UiTool {
   result?: string;
   isError?: boolean;
   running: boolean;
+  /** Images in the result (e.g. a plot from `python`), shown outside the details. */
+  images?: UiImage[];
+  /** Stored artifacts in the result, shown as tappable cards. */
+  files?: UiFile[];
+  /** Set optimistically once an `ask_user` question has been answered here. */
+  answered?: boolean;
+}
+
+/** An artifact the assistant produced, stored server-side as an attachment. */
+export interface UiFile {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
 }
 
 export interface UiBranch {
@@ -142,6 +156,17 @@ function imagesOf(parts: Part[]): UiImage[] {
   return out;
 }
 
+function filesOf(parts: Part[]): UiFile[] {
+  return parts
+    .filter((p): p is Extract<Part, { type: "file" }> => p.type === "file")
+    .map((p) => ({ id: p.id, name: p.name, mime: p.mime, size: p.size }));
+}
+
+/** What a tool result's content contributes to its card. */
+export function toolResultOf(parts: Part[]): { result: string; images: UiImage[]; files: UiFile[] } {
+  return { result: textOf(parts), images: imagesOf(parts), files: filesOf(parts) };
+}
+
 /**
  * Rebuild the visible conversation from the server's active branch path.
  *
@@ -188,7 +213,7 @@ export function buildMessages(path: PathNode[]): UiMessage[] {
         for (let i = out.length - 1; i >= 0; i--) {
           const tool = out[i].tools.find((t) => t.callId === part.id);
           if (tool) {
-            tool.result = textOf(part.content);
+            Object.assign(tool, toolResultOf(part.content));
             tool.isError = part.isError;
             tool.running = false;
             break;
@@ -209,7 +234,14 @@ export type ChatEffect =
   | { kind: "append-reasoning"; messageId: string | undefined; text: string }
   | { kind: "tool-call"; messageId: string | undefined; callId: string; name: string; args: unknown }
   | { kind: "tool-approval"; callId: string; status: "requested" | "approved" | "denied" }
-  | { kind: "tool-result"; callId: string; result: string; isError: boolean }
+  | {
+      kind: "tool-result";
+      callId: string;
+      result: string;
+      images: UiImage[];
+      files: UiFile[];
+      isError: boolean;
+    }
   | { kind: "session-title"; sessionId: string; title: string }
   | { kind: "error"; message: string }
   | { kind: "warning"; message: string };
@@ -249,7 +281,7 @@ export function readEvent(event: KernelEvent): ChatEffect {
       return {
         kind: "tool-result",
         callId: event.callId,
-        result: textOf(event.parts),
+        ...toolResultOf(event.parts),
         isError: event.isError,
       };
     case "session.title":
@@ -306,6 +338,8 @@ export function applyEffect(list: UiMessage[], effect: ChatEffect): UiMessage[] 
         running: false,
         isError: effect.isError,
         result: effect.result,
+        images: effect.images,
+        files: effect.files,
       }));
     default:
       return list;
@@ -317,6 +351,29 @@ export function approvalForDecision(decision: ApprovalDecision): "approved" | "d
   return decision === "deny" ? "denied" : "approved";
 }
 
+/** First non-blank line, for briefs of multi-line arguments like code. */
+function firstLine(value: string): string {
+  return value.split("\n").find((line) => line.trim())?.trim() ?? "";
+}
+
+/**
+ * Which argument makes the one-line brief for a known tool. `firstLine` marks
+ * arguments that are typically multi-line (code, task descriptions).
+ */
+const BRIEF_KEYS: Record<string, { key: string; firstLine?: boolean }> = {
+  read_file: { key: "path" },
+  write_file: { key: "path" },
+  edit_file: { key: "path" },
+  web_fetch: { key: "url" },
+  python: { key: "code", firstLine: true },
+  process_start: { key: "command" },
+  create_artifact: { key: "name" },
+  memory_save: { key: "text" },
+  ask_user: { key: "question" },
+  spawn_subagent: { key: "task", firstLine: true },
+  schedule_create: { key: "title" },
+};
+
 /** One-line preview of a tool call, for the collapsed card. */
 export function toolSummary(tool: UiTool): string {
   const args = tool.args;
@@ -324,8 +381,71 @@ export function toolSummary(tool: UiTool): string {
   if (typeof args === "string") return args;
   if (typeof args !== "object") return String(args);
   const record = args as Record<string, unknown>;
+  const brief = BRIEF_KEYS[tool.name];
+  if (brief) {
+    const value = record[brief.key];
+    if (typeof value === "string") return brief.firstLine ? firstLine(value) : value;
+  }
+  // The checklist itself is the preview; a JSON dump of it is noise.
+  if (tool.name === "todo_write") return "";
   const command = record.command ?? record.cmd;
   if (typeof command === "string") return command;
   const key = Object.keys(record)[0];
   return key ? `${key}: ${JSON.stringify(record[key])}` : "";
+}
+
+export interface UiTodo {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+/** The checklist from `todo_write` args; malformed entries are dropped, not fatal. */
+export function todosOf(args: unknown): UiTodo[] {
+  const todos = (args as { todos?: unknown } | null)?.todos;
+  if (!Array.isArray(todos)) return [];
+  const out: UiTodo[] = [];
+  for (const item of todos) {
+    const { content, status } = (item ?? {}) as Record<string, unknown>;
+    if (typeof content !== "string") continue;
+    out.push({
+      content,
+      status: status === "in_progress" || status === "completed" ? status : "pending",
+    });
+  }
+  return out;
+}
+
+export interface UiQuestion {
+  question: string;
+  options: string[];
+  multiSelect: boolean;
+}
+
+/** The prompt from `ask_user` args, or undefined when there is no question. */
+export function questionOf(args: unknown): UiQuestion | undefined {
+  const record = (args ?? {}) as Record<string, unknown>;
+  if (typeof record.question !== "string") return undefined;
+  const options = Array.isArray(record.options)
+    ? record.options.filter((o): o is string => typeof o === "string" && o.length > 0)
+    : [];
+  return { question: record.question, options, multiSelect: record.multi_select === true };
+}
+
+/** The answer string the server expects: multi-select choices joined by ", ". */
+export function joinAnswer(selected: string[], freeText: string): string {
+  return [...selected, freeText.trim()].filter(Boolean).join(", ");
+}
+
+/** Human-readable byte count: 512 B, 1.5 KB, 12 MB. */
+export function formatBytes(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return "";
+  if (size < 1024) return `${size} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = size / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }

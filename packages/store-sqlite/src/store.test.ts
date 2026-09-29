@@ -238,3 +238,92 @@ test("a message with unreadable metadata does not break usage aggregation", () =
   reopened.close();
   fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });
+
+test("memories can be added, updated and deleted", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const memory = store.addMemory("Prefers metric units");
+  assert.match(memory.id, /^mem_/);
+  assert.ok(store.updateMemory(memory.id, "Prefers metric units and 24h time"));
+  assert.deepEqual(
+    store.listMemories().map((m) => m.text),
+    ["Prefers metric units and 24h time"],
+  );
+  assert.ok(store.deleteMemory(memory.id));
+  assert.equal(store.deleteMemory(memory.id), false);
+  assert.deepEqual(store.listMemories(), []);
+});
+
+test("searchMessages finds prose across sessions and forgets deleted ones", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const a = store.createSession("fake/fake-agent", "Sourdough");
+  const b = store.createSession("fake/fake-agent", "Taxes");
+  store.appendMessage(a.id, message("a1", "user", "How long should I proof sourdough bread?"));
+  store.appendMessage(a.id, message("a2", "assistant", "Proof the dough 4-6 hours at room temperature."));
+  store.appendMessage(b.id, message("b1", "user", "When are quarterly taxes due?"));
+  // Tool output is not indexed.
+  store.appendMessage(a.id, {
+    id: "a3",
+    role: "tool",
+    parts: [{ type: "tool_result", id: "c", name: "x", content: [{ type: "text", text: "sourdough" }] }],
+    createdAt: Date.now(),
+  });
+
+  const hits = store.searchMessages("sourdough proofing?");
+  assert.deepEqual(hits.map((h) => h.messageId).sort(), ["a1", "a2"]);
+  assert.equal(hits[0].sessionTitle, "Sourdough");
+  assert.match(hits.find((h) => h.messageId === "a1")!.snippet, /«sourdough»/i);
+
+  assert.deepEqual(store.searchMessages("sourdough", { excludeSessionId: a.id }), []);
+  assert.deepEqual(store.searchMessages("!!!"), []);
+
+  store.deleteSession(a.id);
+  assert.deepEqual(store.searchMessages("sourdough"), []);
+  assert.equal(store.searchMessages("taxes").length, 1);
+});
+
+test("the search index is backfilled for databases created before it existed", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hat-fts-"));
+  const dbPath = path.join(dir, "hat.db");
+  const key = crypto.randomBytes(32);
+  const first = new Store(dbPath, key);
+  const session = first.createSession("fake/fake-agent");
+  first.appendMessage(session.id, message("m1", "user", "remember the lighthouse"));
+  first.close();
+
+  // Simulate a pre-index database: empty index, old schema version.
+  const raw = new DatabaseSync(dbPath);
+  raw.exec("DELETE FROM messages_fts; PRAGMA user_version = 1");
+  raw.close();
+
+  const reopened = new Store(dbPath, key);
+  assert.equal(reopened.searchMessages("lighthouse").length, 1);
+  reopened.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("schedules become due, advance, and one-shots disable themselves", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const schedule = store.createSchedule({
+    title: "Digest",
+    prompt: "Summarize the news",
+    cron: "0 8 * * *",
+    timezone: "UTC",
+    runAt: null,
+    sessionId: null,
+    model: "fake/fake-agent",
+    nextRunAt: 1_000,
+  });
+  assert.deepEqual(store.dueSchedules(999), []);
+  assert.deepEqual(store.dueSchedules(1_000).map((s) => s.id), [schedule.id]);
+
+  store.markScheduleRun(schedule.id, { at: 1_000, sessionId: "s1", error: null, nextRunAt: 5_000 });
+  assert.deepEqual(store.dueSchedules(4_999), []);
+  assert.equal(store.getSchedule(schedule.id)?.lastSessionId, "s1");
+
+  store.markScheduleRun(schedule.id, { at: 5_000, sessionId: "s2", error: "boom", nextRunAt: null });
+  const after = store.getSchedule(schedule.id)!;
+  assert.equal(after.enabled, false);
+  assert.equal(after.lastError, "boom");
+  assert.deepEqual(store.dueSchedules(Number.MAX_SAFE_INTEGER), []);
+  assert.ok(store.deleteSchedule(schedule.id));
+});

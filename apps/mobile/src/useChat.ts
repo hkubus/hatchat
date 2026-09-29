@@ -73,6 +73,8 @@ export interface ChatStore {
   editMessage: (messageId: string, text: string) => Promise<void>;
   switchBranch: (messageId: string) => Promise<void>;
   decide: (callId: string, decision: ApprovalDecision) => Promise<void>;
+  /** Answer a pending `ask_user` question. */
+  answer: (callId: string, answer: string) => Promise<void>;
   setModel: (next: string) => void;
   setEffort: (next: ReasoningEffort) => void;
   setPolicyMode: (next: ApprovalMode) => void;
@@ -623,6 +625,38 @@ export function useChat(): ChatStore {
     [sessionId],
   );
 
+  const answer = useCallback(
+    async (callId: string, text: string) => {
+      if (!sessionId || !text.trim()) return;
+      // Marked answered in both lists: after a reload the pending question
+      // lives in the stored messages, not the in-flight ones. The
+      // `tool.result` that follows fills in the rest.
+      const mark = (answered: boolean) => (list: UiMessage[]) =>
+        list.map((m) =>
+          m.tools.some((t) => t.callId === callId)
+            ? {
+                ...m,
+                tools: m.tools.map((t) => (t.callId === callId ? { ...t, answered } : t)),
+              }
+            : m,
+        );
+      setInFlight(mark(true));
+      setMessages(mark(true));
+      try {
+        await api.answerQuestion(callId, text, sessionId);
+      } catch (e) {
+        // A 404 means the question is no longer pending; anything else can be
+        // retried, so bring the question back.
+        if (!(e instanceof api.HttpError && e.status === 404)) {
+          setInFlight(mark(false));
+          setMessages(mark(false));
+        }
+        setError(describe(e));
+      }
+    },
+    [sessionId],
+  );
+
   // --- persisted bottom-bar settings --------------------------------------
 
   const persist = useCallback(
@@ -715,6 +749,7 @@ export function useChat(): ChatStore {
     editMessage,
     switchBranch,
     decide,
+    answer,
     setModel,
     setEffort,
     setPolicyMode,

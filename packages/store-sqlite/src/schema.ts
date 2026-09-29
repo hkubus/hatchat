@@ -49,4 +49,36 @@ CREATE TABLE IF NOT EXISTS attachments (
   height INTEGER,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  text TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  text,
+  message_id UNINDEXED,
+  session_id UNINDEXED,
+  role UNINDEXED,
+  tokenize = 'porter unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  cron TEXT,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  run_at INTEGER,
+  session_id TEXT,
+  model TEXT NOT NULL,
+  next_run_at INTEGER,
+  last_run_at INTEGER,
+  last_session_id TEXT,
+  last_error TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
 `;

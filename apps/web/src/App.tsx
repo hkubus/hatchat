@@ -1,6 +1,6 @@
 import type { KernelEvent, ModelInfo, Part, ReasoningEffort, Usage } from "@hat/core";
 import { REASONING_EFFORTS, addUsage, sumUsage, usageTotal } from "@hat/core";
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Connect from "./Connect";
 import {
   CheckIcon,
@@ -12,6 +12,7 @@ import {
   RegenerateIcon,
 } from "./icons";
 import MessageImage from "./MessageImage";
+import { QuestionCard, TodoList, ToolOutputs, argBrief, questionOf, todosOf } from "./ToolExtras";
 import ModelPicker from "./ModelPicker";
 import Settings from "./Settings";
 import Sidebar from "./Sidebar";
@@ -32,6 +33,8 @@ interface UiTool {
   args: unknown;
   approval: "requested" | "approved" | "denied" | null;
   result?: string;
+  /** Full result parts, for images and files the result carries. */
+  parts?: Part[];
   isError?: boolean;
   running: boolean;
 }
@@ -122,6 +125,8 @@ function toolStatus(t: UiTool): string | null {
  * returned — the two things that actually tell you what the call was doing.
  */
 function toolBrief(t: UiTool): string {
+  const brief = argBrief(t.name, t.args);
+  if (brief) return brief;
   if (t.args && typeof t.args === "object" && "command" in t.args) {
     return String((t.args as { command: unknown }).command);
   }
@@ -236,6 +241,7 @@ function buildMessages(path: PathNode[]): UiMessage[] {
           const tool = out[i].tools.find((t) => t.callId === part.id);
           if (tool) {
             tool.result = textOf(part.content);
+            tool.parts = part.content;
             tool.isError = part.isError;
             tool.running = false;
             break;
@@ -278,6 +284,8 @@ export default function App() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [policyMode, setPolicyMode] = useState<"ask" | "auto" | "allowlist" | "deny">("auto");
   const [allowedToolsText, setAllowedToolsText] = useState("");
+  /** `ask_user` calls answered here, hidden until their result arrives. */
+  const [answered, setAnswered] = useState<ReadonlySet<string>>(() => new Set());
   const [favorites, setFavorites] = useState<string[]>(() => {
     try {
       const raw = JSON.parse(localStorage.getItem("hat.favorites") ?? "[]");
@@ -588,6 +596,7 @@ export default function App() {
             running: false,
             isError: event.isError,
             result: textOf(event.parts),
+            parts: event.parts,
           })),
         );
         break;
@@ -1031,37 +1040,52 @@ export default function App() {
 
             {m.tools.map((t) => {
               const status = toolStatus(t);
+              const todos = t.name === "todo_write" ? todosOf(t.args) : null;
+              if (todos) return <TodoList key={t.callId} todos={todos} />;
+              const question = t.name === "ask_user" ? questionOf(t.args) : null;
+              const asking = question && t.running && !answered.has(t.callId) && sessionId;
               return (
-                <details
-                  key={t.callId}
-                  className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
-                  // An approval is a blocking question, so it must be visible
-                  // rather than folded away behind a click.
-                  open={t.approval === "requested"}
-                >
-                  <summary>
-                    <ChevronDownIcon className="disclosure" />
-                    <span className="tool-name">{t.name}</span>
-                    <span className="tool-brief">{toolBrief(t)}</span>
-                    {t.running && t.approval !== "requested" ? (
-                      <span className="tool-spinner" role="status" aria-label="Running" />
-                    ) : (
-                      status && <span className={`tool-status ${t.approval ?? ""}`}>{status}</span>
-                    )}
-                  </summary>
-                  <div className="aside-body">
-                    <pre className="tool-args">{toolArgs(t)}</pre>
-                    {t.approval === "requested" && (
-                      <div className="approval">
-                        <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
-                        <button className="danger" onClick={() => void decide(t.callId, "deny")}>
-                          Deny
-                        </button>
-                      </div>
-                    )}
-                    {t.result && <pre className="tool-result">{t.result}</pre>}
-                  </div>
-                </details>
+                <Fragment key={t.callId}>
+                  <details
+                    className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
+                    // An approval is a blocking question, so it must be visible
+                    // rather than folded away behind a click.
+                    open={t.approval === "requested"}
+                  >
+                    <summary>
+                      <ChevronDownIcon className="disclosure" />
+                      <span className="tool-name">{t.name}</span>
+                      <span className="tool-brief">{toolBrief(t)}</span>
+                      {t.running && t.approval !== "requested" ? (
+                        <span className="tool-spinner" role="status" aria-label="Running" />
+                      ) : (
+                        status && <span className={`tool-status ${t.approval ?? ""}`}>{status}</span>
+                      )}
+                    </summary>
+                    <div className="aside-body">
+                      <pre className="tool-args">{toolArgs(t)}</pre>
+                      {t.approval === "requested" && (
+                        <div className="approval">
+                          <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
+                          <button className="danger" onClick={() => void decide(t.callId, "deny")}>
+                            Deny
+                          </button>
+                        </div>
+                      )}
+                      {t.result && <pre className="tool-result">{t.result}</pre>}
+                    </div>
+                  </details>
+                  {asking && (
+                    <QuestionCard
+                      question={question}
+                      onAnswer={async (answer) => {
+                        await api.answerQuestion(t.callId, sessionId, answer);
+                        setAnswered((prev) => new Set(prev).add(t.callId));
+                      }}
+                    />
+                  )}
+                  {t.parts && <ToolOutputs parts={t.parts} />}
+                </Fragment>
               );
             })}
           </>
@@ -1152,6 +1176,7 @@ export default function App() {
           model={model}
           config={config}
           onModelChange={changeModel}
+          onOpenSession={(id) => void openSession(id)}
           onChanged={async () => {
             await Promise.all([refreshProviders(), refreshPlugins(), refreshModels()]);
           }}
