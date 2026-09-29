@@ -17,6 +17,11 @@ name: ios-ipa
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_ota_check:
+        description: Build even without expo.updates.url (the binary can never get OTA updates)
+        type: boolean
+        default: false
   push:
     tags:
       - "mobile-v*"
@@ -46,6 +51,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Refuse to build without over-the-air updates configured
+        if: ${{ !inputs.skip_ota_check }}
         # A build is the scarce resource. `expo-updates` bakes the update URL
         # into the binary; without it the app can never receive a JS update,
         # so every later fix would cost another build. Run
