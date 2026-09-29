@@ -91,6 +91,7 @@ async function runAgent(
   policy: Partial<ToolPolicy>,
   onApproval?: (req: ApprovalRequest) => void,
   onMessage?: (sessionId: string, message: ChatMessage) => void,
+  resolveHost: () => Promise<ExecutionHost> = async () => ({}) as ExecutionHost,
 ): Promise<KernelEvent[]> {
   const providers = new ProviderRegistry();
   providers.register(provider);
@@ -100,7 +101,7 @@ async function runAgent(
   const agent = new Agent({
     providers,
     tools,
-    resolveHost: async () => ({}) as ExecutionHost,
+    resolveHost,
     approval: {
       async request(req) {
         onApproval?.(req);
@@ -141,6 +142,62 @@ test("loop guard stops repeated identical tool calls", async () => {
   // 3 executions then the guard trips on the 4th call, plus the closing
   // no-tools call that lets the turn end with prose instead of a tool result.
   assert.equal(counter.calls, 5);
+});
+
+/** Each round calls `name` `perRound` times with fresh args; prose after `rounds`. */
+function roundsProvider(name: string, perRound: number, rounds: number): Provider {
+  let round = 0;
+  let n = 0;
+  return {
+    id: "rounds",
+    label: "rounds",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true }),
+    listModels: async () => [],
+    async *chat(req) {
+      if (req.tools && req.tools.length > 0 && round < rounds) {
+        round += 1;
+        for (let i = 0; i < perRound; i++) {
+          n += 1;
+          yield { type: "toolcall", call: { id: newId("call"), name, args: { x: n } } };
+        }
+        yield { type: "done", finishReason: "tool_calls" as const };
+        return;
+      }
+      yield { type: "text.delta", text: "final answer" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+}
+
+const warnings = (events: KernelEvent[]) =>
+  events.filter((e) => e.type === "warning").map((e) => (e as { message: string }).message);
+
+test("parallel failures in one round count once toward the failure streak", async () => {
+  const events = await runAgent(roundsProvider("missing_tool", 3, 2), { mode: "auto", maxConsecutiveFailures: 3 });
+  assert.deepEqual(warnings(events), []);
+  assert.equal(events.filter((e) => e.type === "tool.result").length, 6);
+});
+
+test("consecutive failing rounds trip the guard", async () => {
+  const events = await runAgent(roundsProvider("missing_tool", 1, 5), { mode: "auto", maxConsecutiveFailures: 3 });
+  assert.match(warnings(events)[0] ?? "", /loop guard/);
+  assert.equal(events.filter((e) => e.type === "tool.result").length, 3);
+});
+
+test("a missing runner does not count toward the failure streak", async () => {
+  const events = await runAgent(
+    roundsProvider("loop_tool", 2, 4),
+    { mode: "auto", maxConsecutiveFailures: 3 },
+    undefined,
+    undefined,
+    async () => {
+      throw new Error("No runner connected.");
+    },
+  );
+  assert.deepEqual(warnings(events), []);
+  const results = events.filter((e) => e.type === "tool.result") as Array<{ isError: boolean }>;
+  assert.equal(results.length, 8);
+  assert.ok(results.every((r) => r.isError));
 });
 
 /** Requests a fresh tool call while tools are offered, then writes prose. */

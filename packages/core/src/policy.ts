@@ -10,7 +10,7 @@ export interface ToolPolicy {
   maxIterations: number;
   /** Stop after this many identical (name+args) tool calls in one turn. */
   maxDuplicateCalls: number;
-  /** Stop after this many consecutive failing tool calls. */
+  /** Stop after this many consecutive tool rounds in which every call failed. */
   maxConsecutiveFailures: number;
 }
 

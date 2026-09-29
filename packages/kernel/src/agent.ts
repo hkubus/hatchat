@@ -269,6 +269,12 @@ export class Agent {
         break;
       }
 
+      // A round counts toward the failure streak only when every call in it
+      // failed for a reason the model controls. Parallel calls that fail
+      // together are one mistake, not several, and a missing runner or a
+      // user denial is not the model looping.
+      let roundFailed = true;
+      let roundCounted = false;
       for (const call of calls) {
         yield {
           type: "tool.call",
@@ -281,7 +287,7 @@ export class Agent {
         const signature = `${call.name}:${stableStringify(call.args)}`;
         const seen = callCounts.get(signature) ?? 0;
 
-        let result: { parts: Part[]; isError: boolean };
+        let result: ToolOutcome;
         if (seen >= policy.maxDuplicateCalls) {
           result = {
             parts: [
@@ -300,8 +306,8 @@ export class Agent {
             : await this.executeTool(call, input.sessionId, input.signal, policy, assistantId, input.emit);
         }
 
-        failureStreak = result.isError ? failureStreak + 1 : 0;
-        if (failureStreak >= policy.maxConsecutiveFailures) guardTripped = true;
+        if (!result.isError) roundFailed = false;
+        else if (!result.external) roundCounted = true;
 
         const { parts, isError } = result;
         yield { type: "tool.result", callId: call.id, name: call.name, parts, isError };
@@ -315,6 +321,8 @@ export class Agent {
         onMessage(toolMessage);
       }
 
+      failureStreak = roundFailed && roundCounted ? failureStreak + 1 : roundFailed ? failureStreak : 0;
+      if (failureStreak >= policy.maxConsecutiveFailures) guardTripped = true;
       if (guardTripped) break;
     }
 
@@ -512,7 +520,7 @@ export class Agent {
     policy: ToolPolicy,
     messageId?: string,
     emit?: (event: KernelEvent) => void,
-  ): Promise<{ parts: Part[]; isError: boolean }> {
+  ): Promise<ToolOutcome> {
     const tool = this.deps.tools.get(call.name);
     if (!tool) {
       return { parts: [{ type: "text", text: `Unknown tool: ${call.name}` }], isError: true };
@@ -538,6 +546,7 @@ export class Agent {
       return {
         parts: [{ type: "text", text: `Tool "${tool.name}" is blocked by the session policy.` }],
         isError: true,
+        external: true,
       };
     }
 
@@ -562,6 +571,7 @@ export class Agent {
         return {
           parts: [{ type: "text", text: `Tool "${tool.name}" was denied by the user.` }],
           isError: true,
+          external: true,
         };
       }
       await audit({ decision: answer });
@@ -571,7 +581,18 @@ export class Agent {
       // NOTE: approval mode `auto` is intentionally preserved — this host is
       // still gated by per-tool requiresApproval + loop guards when callers
       // choose `ask`/`allowlist`/`deny` per session.
-      const host = await this.resolveHostCached(sessionId);
+      let host: ExecutionHost;
+      try {
+        host = await this.resolveHostCached(sessionId);
+      } catch (error) {
+        const normalized = normalizeError(error, "host_unavailable");
+        await audit({ ok: false, detail: normalized.message });
+        return {
+          parts: [{ type: "text", text: `Tool "${tool.name}" failed: ${normalized.message}` }],
+          isError: true,
+          external: true,
+        };
+      }
       const ctx: ToolContext = {
         sessionId,
         host,
@@ -597,6 +618,13 @@ export class Agent {
       };
     }
   }
+}
+
+interface ToolOutcome {
+  parts: Part[];
+  isError: boolean;
+  /** Failed for a reason outside the model's control (no runner, denied, blocked). */
+  external?: boolean;
 }
 
 /**
