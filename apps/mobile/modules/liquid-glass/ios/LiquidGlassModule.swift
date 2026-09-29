@@ -11,14 +11,6 @@ import UIKit
 final class GlassView: ExpoView {
   private let backdrop = UIVisualEffectView(effect: nil)
 
-  /// The number of `UIGlassEffect` refinements this view uses. Maps to the
-  /// `variant` prop on the JS side: 0 regular, 1 clear.
-  private var glassVariant: Int = 0 {
-    didSet {
-      applyEffect()
-    }
-  }
-
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
 
@@ -40,18 +32,20 @@ final class GlassView: ExpoView {
 
   private func applyEffect() {
     if #available(iOS 26.0, *) {
-      let effect = UIGlassEffect()
       // `clear` drops the tint so only the distortion remains, which is what
-      // you want behind text-heavy chrome.
-      effect.isClear = glassVariant == 1
-      backdrop.effect = effect
+      // you want behind text-heavy chrome. The style is fixed at init time, so
+      // a variant change has to build a new effect rather than mutate one.
+      let style: UIGlassEffect.Style = variant == 1 ? .clear : .regular
+      backdrop.effect = UIGlassEffect(style: style)
     } else {
       backdrop.effect = UIBlurEffect(style: .systemMaterial)
     }
   }
 
-  @Prop("variant") var variant: Int = 0 {
-    didSet { glassVariant = variant }
+  /// Maps to the `variant` prop on the JS side: 0 regular, 1 clear. The prop
+  /// itself is declared by the `Prop` block in the module definition below.
+  var variant: Int = 0 {
+    didSet { applyEffect() }
   }
 }
 
