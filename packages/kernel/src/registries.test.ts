@@ -28,3 +28,22 @@ test("tool specs produce OpenAI-compatible JSON Schema", () => {
   assert.equal(typeof params.properties.timeoutMs.exclusiveMinimum, "number");
   assert.equal(params.properties.command.description, "the command");
 });
+
+test("tool specs are sorted by name for a stable prompt-cache prefix", () => {
+  const registry = new ToolRegistry();
+  for (const name of ["zebra", "apple", "mango"]) {
+    registry.register({
+      name,
+      description: `${name} tool`,
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return [];
+      },
+    });
+  }
+
+  assert.deepEqual(
+    registry.toToolSpecs().map((spec) => spec.name),
+    ["apple", "mango", "zebra"],
+  );
+});

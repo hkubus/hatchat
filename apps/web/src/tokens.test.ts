@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { formatContext } from "./capTags";
-import { formatTokens, totalTokens, usageDetail } from "./tokens";
+import { cacheHitLabel, formatCacheHitRate, formatCachedDetail, formatTokens, totalTokens, usageDetail } from "./tokens";
 
 test("formatTokens abbreviates thousands and millions", () => {
   assert.equal(formatTokens(812), "812");
@@ -51,4 +51,38 @@ test("usageDetail spells out the breakdown for the tooltip", () => {
   );
   assert.equal(usageDetail({ inputTokens: 0, outputTokens: 12 }), "12 out · 12 total");
   assert.equal(usageDetail(null), "");
+});
+
+test("usageDetail appends cached tokens with the hit rate", () => {
+  assert.equal(
+    usageDetail({ inputTokens: 1000, outputTokens: 10, totalTokens: 1010, cachedTokens: 800 }),
+    "1,000 in · 10 out · 1,010 total · 800 cached (80%)",
+  );
+  // No input to divide by: show the count without a percentage.
+  assert.equal(
+    usageDetail({ cachedTokens: 50 }),
+    "50 cached",
+  );
+  // Absent cache stats stay invisible.
+  assert.equal(
+    usageDetail({ inputTokens: 100, outputTokens: 10 }),
+    "100 in · 10 out · 110 total",
+  );
+});
+
+test("cacheHitLabel shows the hit percentage or hides unknown", () => {
+  assert.equal(cacheHitLabel({ inputTokens: 200, cachedTokens: 100 }), "50% cached");
+  assert.equal(cacheHitLabel({ inputTokens: 100, outputTokens: 5 }), "");
+  assert.equal(cacheHitLabel(null), "");
+  assert.equal(formatCacheHitRate(0.812), "81%");
+  assert.equal(formatCacheHitRate(undefined), "");
+});
+
+test("formatCachedDetail spells out count and rate", () => {
+  assert.equal(
+    formatCachedDetail({ inputTokens: 1000, cachedTokens: 250 }),
+    "250 cached (25%)",
+  );
+  assert.equal(formatCachedDetail({ cachedTokens: 10 }), "10 cached");
+  assert.equal(formatCachedDetail({ inputTokens: 10 }), "");
 });

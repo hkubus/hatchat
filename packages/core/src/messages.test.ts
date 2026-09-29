@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Usage } from "./messages.js";
-import { addUsage, sumUsage, usageTotal } from "./messages.js";
+import { addUsage, cacheHitRate, sumUsage, usageTotal } from "./messages.js";
 
 test("addUsage sums a reported total", () => {
   const merged = addUsage(
@@ -54,4 +54,34 @@ test("sumUsage adds a conversation's messages and skips empty ones", () => {
 test("sumUsage of nothing is a zeroed figure, not undefined", () => {
   assert.deepEqual(sumUsage([]), { inputTokens: 0, outputTokens: 0, totalTokens: 0 });
   assert.equal(usageTotal(sumUsage([undefined, undefined])), 0);
+});
+
+test("addUsage keeps cachedTokens absent when nobody reported it", () => {
+  const merged = addUsage({ inputTokens: 10, outputTokens: 2 }, { inputTokens: 5, outputTokens: 1 });
+  assert.equal("cachedTokens" in merged, false);
+  assert.equal(cacheHitRate(merged), undefined);
+});
+
+test("addUsage sums cachedTokens and cacheHitRate divides by input", () => {
+  const merged = addUsage(
+    { inputTokens: 100, outputTokens: 10, cachedTokens: 80 },
+    { inputTokens: 100, outputTokens: 10, cachedTokens: 20 },
+  );
+  assert.deepEqual(merged, {
+    inputTokens: 200,
+    outputTokens: 20,
+    totalTokens: 0,
+    cachedTokens: 100,
+  });
+  assert.equal(cacheHitRate(merged), 0.5);
+});
+
+test("cacheHitRate is undefined without input or without a report", () => {
+  assert.equal(cacheHitRate(undefined), undefined);
+  assert.equal(cacheHitRate({ inputTokens: 100, outputTokens: 5 }), undefined);
+  assert.equal(cacheHitRate({ inputTokens: 0, cachedTokens: 0 }), undefined);
+  assert.equal(cacheHitRate({ inputTokens: 100, cachedTokens: 0 }), 0);
+  assert.equal(cacheHitRate({ inputTokens: 100, cachedTokens: 100 }), 1);
+  // Clamp provider quirks rather than reporting >100%.
+  assert.equal(cacheHitRate({ inputTokens: 100, cachedTokens: 150 }), 1);
 });

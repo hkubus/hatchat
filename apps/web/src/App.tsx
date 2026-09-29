@@ -20,7 +20,7 @@ import type { PathNode, PluginDescriptor, ProviderStatus, RunnerSummary, Session
 import { capSummary, capTags, contextTag } from "./capTags";
 import CreatorIcon from "./CreatorIcon";
 import { creatorName, creatorSlug } from "./creators";
-import { formatTokens, usageDetail } from "./tokens";
+import { formatTokens, cacheHitLabel, usageDetail } from "./tokens";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
 
@@ -514,6 +514,7 @@ export default function App() {
   );
   const sessionTokens = usageTotal(sessionUsage);
   const sessionTokensLabel = formatTokens(sessionTokens);
+  const sessionCacheLabel = cacheHitLabel(sessionUsage);
 
   function handleEvent(event: KernelEvent): void {
     switch (event.type) {
@@ -1359,6 +1360,7 @@ export default function App() {
                     title={`${usageDetail(sessionUsage)} tokens in this conversation`}
                   >
                     {sessionTokensLabel} tokens
+                    {sessionCacheLabel && ` · ${sessionCacheLabel}`}
                   </span>
                 )}
               </div>

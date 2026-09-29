@@ -1,5 +1,5 @@
 import type { Usage } from "@hat/core";
-import { usageTotal } from "@hat/core";
+import { cacheHitRate, usageTotal } from "@hat/core";
 
 /**
  * Compact token label: 1048576 -> "1M", 4200 -> "4.2k", 812 -> "812".
@@ -25,7 +25,7 @@ export function totalTokens(usage: Usage | null | undefined): number {
   return usageTotal(usage ?? undefined);
 }
 
-/** Spoken-form breakdown for tooltips: "1,234 in · 567 out · 1,801 total". */
+/** Spoken-form breakdown for tooltips: "1,234 in · 567 out · 1,801 total · 1,000 cached (81%)". */
 export function usageDetail(usage: Usage | null | undefined): string {
   if (!usage) return "";
   const parts: string[] = [];
@@ -33,5 +33,28 @@ export function usageDetail(usage: Usage | null | undefined): string {
   if (usage.outputTokens) parts.push(`${usage.outputTokens.toLocaleString()} out`);
   const total = totalTokens(usage);
   if (total) parts.push(`${total.toLocaleString()} total`);
+  const cached = formatCachedDetail(usage);
+  if (cached) parts.push(cached);
   return parts.join(" · ");
+}
+
+/** "1,000 cached (81%)", "1,000 cached", or "" when the provider reported nothing. */
+export function formatCachedDetail(usage: Usage | null | undefined): string {
+  if (!usage || usage.cachedTokens === undefined) return "";
+  const count = `${usage.cachedTokens.toLocaleString()} cached`;
+  const rate = cacheHitRate(usage);
+  return rate === undefined ? count : `${count} (${formatCacheHitRate(rate)})`;
+}
+
+/** Compact "81%" label for a hit rate, or "" when unknown. */
+export function formatCacheHitRate(rate: number | undefined): string {
+  if (rate === undefined || !Number.isFinite(rate)) return "";
+  return `${Math.round(rate * 100)}%`;
+}
+
+/** Hit-rate label for a usage figure: "81% cached" or "" when unknown. */
+export function cacheHitLabel(usage: Usage | null | undefined): string {
+  if (!usage) return "";
+  const label = formatCacheHitRate(cacheHitRate(usage));
+  return label ? `${label} cached` : "";
 }

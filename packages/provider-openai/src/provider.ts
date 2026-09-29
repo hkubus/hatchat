@@ -51,6 +51,23 @@ function parseArgs(raw: string): unknown {
   }
 }
 
+/**
+ * Cached input tokens for a usage payload, or undefined when the provider
+ * didn't report any. Prefers the OpenAI/OpenRouter nested
+ * `prompt_tokens_details.cached_tokens` (even an explicit 0 wins) and falls
+ * back to DeepSeek's documented top-level `prompt_cache_hit_tokens`.
+ */
+export function extractCachedTokens(usage: {
+  prompt_tokens_details?: { cached_tokens?: unknown } | null;
+  prompt_cache_hit_tokens?: unknown;
+}): number | undefined {
+  const nested = usage.prompt_tokens_details?.cached_tokens;
+  if (typeof nested === "number" && Number.isFinite(nested) && nested >= 0) return Math.floor(nested);
+  const hit = usage.prompt_cache_hit_tokens;
+  if (typeof hit === "number" && Number.isFinite(hit) && hit >= 0) return Math.floor(hit);
+  return undefined;
+}
+
 async function safeText(response: Response): Promise<string> {
   try {
     return await response.text();
@@ -93,9 +110,13 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
         ...(config.extraBody?.(req) ?? {}),
       };
       // Map provider-safe wire names back to the canonical tool names.
+      // Sorted by wire name so the request prefix is byte-stable across
+      // turns: prompt caches key on the prefix, and tool order must not
+      // shuffle when plugins activate in a different order.
       const canonicalNames = new Map<string, string>();
       if (req.tools && req.tools.length > 0) {
-        body.tools = req.tools.map((tool) => {
+        const sorted = req.tools.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        body.tools = sorted.map((tool) => {
           const wire = toWireName(tool.name);
           canonicalNames.set(wire, tool.name);
           return {
@@ -108,6 +129,9 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
           };
         });
       }
+      // Stable per-conversation routing key: providers that support it use
+      // this to keep requests with a shared prefix on the same cache shard.
+      if (req.cacheKey) body.prompt_cache_key = req.cacheKey;
       if (req.temperature !== undefined) body.temperature = req.temperature;
       if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
       if (req.reasoningEffort && req.reasoningEffort !== "off") {
@@ -188,12 +212,14 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
           if (choice?.finish_reason) finishReason = mapFinish(choice.finish_reason);
 
           if (chunk.usage) {
+            const cachedTokens = extractCachedTokens(chunk.usage);
             yield {
               type: "usage",
               usage: {
                 inputTokens: chunk.usage.prompt_tokens,
                 outputTokens: chunk.usage.completion_tokens,
                 totalTokens: chunk.usage.total_tokens,
+                ...(cachedTokens !== undefined ? { cachedTokens } : {}),
               },
             };
           }

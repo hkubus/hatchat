@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ChatRequest, ProviderCapabilities } from "@hat/core";
 import { toWireName } from "./messages.js";
-import { createOpenAICompatibleProvider } from "./provider.js";
+import { createOpenAICompatibleProvider, extractCachedTokens } from "./provider.js";
 
 const CAPS: ProviderCapabilities = {
   streaming: true,
@@ -234,4 +234,87 @@ test("uses a custom reasoning effort encoding when provided", async () => {
   }
   assert.deepEqual(body.reasoning, { effort: "low" });
   assert.equal("reasoning_effort" in body, false);
+});
+
+test("extractCachedTokens prefers the nested OpenAI shape over DeepSeek's", () => {
+  assert.equal(extractCachedTokens({ prompt_tokens_details: { cached_tokens: 75 } }), 75);
+  assert.equal(extractCachedTokens({ prompt_cache_hit_tokens: 60 }), 60);
+  assert.equal(
+    extractCachedTokens({
+      prompt_tokens_details: { cached_tokens: 0 },
+      prompt_cache_hit_tokens: 60,
+    }),
+    0,
+  );
+  assert.equal(extractCachedTokens({}), undefined);
+  assert.equal(extractCachedTokens({ prompt_tokens_details: null }), undefined);
+});
+
+test("streams cached tokens from prompt_tokens_details", async () => {
+  const fetchImpl = (async () =>
+    sseResponse([
+      'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":80}}}\n\n',
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+
+  const events = await collect(makeProvider(fetchImpl));
+  assert.deepEqual(events.at(-2), {
+    type: "usage",
+    usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedTokens: 80 },
+  });
+});
+
+test("streams cached tokens from DeepSeek's prompt_cache_hit_tokens", async () => {
+  const fetchImpl = (async () =>
+    sseResponse([
+      'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}}\n\n',
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+
+  const events = await collect(makeProvider(fetchImpl));
+  assert.deepEqual(events.at(-2), {
+    type: "usage",
+    usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedTokens: 60 },
+  });
+});
+
+test("omits cachedTokens when the provider reports no cache stats", async () => {
+  const fetchImpl = (async () =>
+    sseResponse([
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n',
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+
+  const events = await collect(makeProvider(fetchImpl));
+  const usage = events.at(-2) as unknown as { usage: Record<string, unknown> };
+  assert.equal("cachedTokens" in usage.usage, false);
+});
+
+test("sends tools sorted and a stable prompt_cache_key", async () => {
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    return sseResponse(["data: [DONE]\n\n"]);
+  }) as unknown as typeof fetch;
+
+  const controller = new AbortController();
+  const provider = makeProvider(fetchImpl);
+  for await (const _ of provider.chat(
+    {
+      ...request([{ id: "1", role: "user", parts: [{ type: "text", text: "hi" }], createdAt: 0 }]),
+      tools: [
+        { name: "zebra", description: "z", parameters: { type: "object" } },
+        { name: "apple", description: "a", parameters: { type: "object" } },
+      ],
+      cacheKey: "session-123",
+    },
+    controller.signal,
+  )) {
+    /* drain */
+  }
+  const names = ((body.tools as Array<{ function: { name: string } }>) ?? []).map(
+    (t) => t.function.name,
+  );
+  assert.deepEqual(names, ["apple", "zebra"]);
+  assert.equal(body.prompt_cache_key, "session-123");
 });
