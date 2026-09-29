@@ -74,23 +74,29 @@ export class ToolRegistry {
   }
 
   toToolSpecs(): ToolSpec[] {
-    return this.list().map((tool) => {
-      let parameters: unknown = tool.parameters;
-      if (parameters === undefined && tool.schema) {
-        const jsonSchema = zodToJsonSchema(tool.schema, {
-          // OpenAI-compatible providers expect JSON Schema (numeric exclusiveMinimum),
-          // not OpenAPI 3.0's boolean form, and inline refs.
-          target: "jsonSchema7",
-          $refStrategy: "none",
-        }) as Record<string, unknown>;
-        delete jsonSchema.$schema;
-        parameters = jsonSchema;
-      }
-      return {
-        name: tool.name,
-        description: tool.description,
-        parameters: parameters ?? { type: "object", properties: {} },
-      };
-    });
+    // Sorted by name: prompt caches are prefix-sensitive, and registration
+    // order depends on plugin activation order, so an unstable order would
+    // bust the cache (and reshuffle tool choice) without any user change.
+    return this.list()
+      .slice()
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .map((tool) => {
+        let parameters: unknown = tool.parameters;
+        if (parameters === undefined && tool.schema) {
+          const jsonSchema = zodToJsonSchema(tool.schema, {
+            // OpenAI-compatible providers expect JSON Schema (numeric exclusiveMinimum),
+            // not OpenAPI 3.0's boolean form, and inline refs.
+            target: "jsonSchema7",
+            $refStrategy: "none",
+          }) as Record<string, unknown>;
+          delete jsonSchema.$schema;
+          parameters = jsonSchema;
+        }
+        return {
+          name: tool.name,
+          description: tool.description,
+          parameters: parameters ?? { type: "object", properties: {} },
+        };
+      });
   }
 }

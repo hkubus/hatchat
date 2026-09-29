@@ -50,6 +50,12 @@ export interface ChatRequest {
   maxTokens?: number;
   /** Ignored by providers whose capabilities do not include `reasoningEffort`. */
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Stable per-conversation key sent as `prompt_cache_key` where the provider
+   * supports it (OpenAI). It only optimizes cache routing for requests that
+   * already share a reusable prefix — it never merges different conversations.
+   */
+  cacheKey?: string;
 }
 
 export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "error";

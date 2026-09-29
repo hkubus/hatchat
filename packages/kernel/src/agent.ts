@@ -149,6 +149,9 @@ export class Agent {
         model,
         messages: toProviderMessages(messages, caps),
         tools: caps.toolCalls ? this.deps.tools.toToolSpecs() : undefined,
+        // Stable per-session key so providers can route same-prefix requests
+        // to the same prompt-cache shard (see `prompt_cache_key`).
+        cacheKey: input.sessionId,
         // Only meaningful for providers that advertise the knob; "off" is the
         // provider's own default, so we leave the field unset.
         reasoningEffort:
@@ -317,6 +320,7 @@ export class Agent {
     const request: ChatRequest = {
       model,
       messages: toProviderMessages([...messages, nudge], caps),
+      cacheKey: input.sessionId,
       reasoningEffort:
         input.reasoningEffort && input.reasoningEffort !== "off" && caps.reasoningEffort
           ? input.reasoningEffort

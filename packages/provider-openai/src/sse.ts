@@ -23,6 +23,10 @@ export interface OpenAIUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number } | null;
+  /** DeepSeek's native (documented) cache fields; also mirrored into the nested shape. */
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
 }
 
 export interface OpenAIStreamChunk {

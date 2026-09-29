@@ -22,6 +22,13 @@ export interface Usage {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+  /**
+   * Input tokens served from the provider's prompt cache. Absent when the
+   * provider did not report cache statistics; 0 means a reported miss.
+   * OpenAI/OpenRouter report it as `usage.prompt_tokens_details.cached_tokens`,
+   * DeepSeek as top-level `usage.prompt_cache_hit_tokens`.
+   */
+  cachedTokens?: number;
 }
 
 export interface MessageMeta {
@@ -37,12 +44,17 @@ export interface MessageMeta {
  * here would bake a guess into the accumulator, and the next `addUsage` would
  * then add to that guess instead of re-deriving it. Callers that need a total
  * for a figure with no reported one go through `usageTotal`.
+ *
+ * `cachedTokens` stays absent when neither side reported it, so callers can
+ * tell "provider doesn't report caching" apart from a reported 0% hit rate.
  */
 export function addUsage(base: Usage | undefined, next: Usage): Usage {
+  const hasCached = base?.cachedTokens !== undefined || next.cachedTokens !== undefined;
   return {
     inputTokens: (base?.inputTokens ?? 0) + (next.inputTokens ?? 0),
     outputTokens: (base?.outputTokens ?? 0) + (next.outputTokens ?? 0),
     totalTokens: (base?.totalTokens ?? 0) + (next.totalTokens ?? 0),
+    ...(hasCached ? { cachedTokens: (base?.cachedTokens ?? 0) + (next.cachedTokens ?? 0) } : {}),
   };
 }
 
@@ -64,6 +76,23 @@ export function sumUsage(list: ReadonlyArray<Usage | undefined>): Usage {
     (acc, usage) => (usage ? addUsage(acc, usage) : acc),
     undefined,
   ) ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+}
+
+/**
+ * Fraction of input tokens served from the prompt cache (0-1), or undefined
+ * when the provider didn't report cache statistics or no input is known.
+ * `prompt_tokens` already includes the cached subset, so this is simply
+ * `cachedTokens / inputTokens`, clamped to a valid fraction.
+ */
+export function cacheHitRate(usage: Usage | null | undefined): number | undefined {
+  if (!usage || usage.cachedTokens === undefined) return undefined;
+  const input = usage.inputTokens ?? 0;
+  if (!Number.isFinite(input) || input <= 0) return undefined;
+  if (!Number.isFinite(usage.cachedTokens)) return undefined;
+  const rate = usage.cachedTokens / input;
+  if (rate <= 0) return 0;
+  if (rate >= 1) return 1;
+  return rate;
 }
 
 export interface ChatMessage {
