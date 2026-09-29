@@ -28,8 +28,8 @@ import {
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { fetchAttachmentBase64 } from "../api";
-import type { UiFile, UiImage, UiMessage, UiTool } from "../chat";
-import { formatBytes, joinAnswer, questionOf, todosOf, toolSummary } from "../chat";
+import type { UiFile, UiImage, UiMessage, UiTool } from "@hat/core";
+import { formatBytes, joinAnswer, questionOf, todosOf, toolSummary } from "@hat/core";
 import * as haptics from "../haptics";
 import { useTheme } from "../theme";
 import { Badge, Button, Mono } from "./controls";

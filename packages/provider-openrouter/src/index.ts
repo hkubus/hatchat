@@ -80,6 +80,7 @@ export function createOpenRouterProvider(options: OpenRouterOptions): Provider {
           jsonMode:
             params.includes("response_format") || params.includes("structured_outputs"),
           systemPrompt: "native",
+          contextWindow: model.context_length,
         };
         cache.set(model.id, capabilities);
         const info: ModelInfo = {

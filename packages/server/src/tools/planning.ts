@@ -11,22 +11,29 @@ const text = (value: string): Part => ({ type: "text", text: value });
 export class QuestionManager {
   private readonly pending = new Map<string, { sessionId: string; answer: (value: string) => void }>();
 
+  /** @param timeoutMs 0 waits until answered or cancelled, like tool approvals. */
   constructor(private readonly timeoutMs = 30 * 60_000) {}
+
+  /** Whether a conversation is blocked on the user answering a question. */
+  isWaiting(sessionId: string): boolean {
+    for (const entry of this.pending.values()) if (entry.sessionId === sessionId) return true;
+    return false;
+  }
 
   ask(sessionId: string, callId: string, signal: AbortSignal): Promise<string | undefined> {
     return new Promise((resolve, reject) => {
       const finish = (value: string | undefined): void => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         this.pending.delete(callId);
         resolve(value);
       };
       const onAbort = (): void => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         this.pending.delete(callId);
         reject(new Error("question cancelled"));
       };
-      const timer = setTimeout(() => finish(undefined), this.timeoutMs);
+      const timer = this.timeoutMs > 0 ? setTimeout(() => finish(undefined), this.timeoutMs) : undefined;
       if (signal.aborted) {
         onAbort();
         return;

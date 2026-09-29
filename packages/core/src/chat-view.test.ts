@@ -1,12 +1,12 @@
-import type { KernelEvent, Part, Usage } from "@hat/core";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { PathNode } from "./api";
-import type { UiMessage } from "./chat";
+import type { ChatPathNode as PathNode, UiMessage } from "./chat-view.js";
 import {
   applyEffect,
   buildMessages,
+  contextFill,
   emptyAssistant,
+  endsTruncated,
   formatBytes,
   joinAnswer,
   questionOf,
@@ -14,7 +14,9 @@ import {
   todosOf,
   toolResultOf,
   toolSummary,
-} from "./chat.js";
+} from "./chat-view.js";
+import type { KernelEvent } from "./events.js";
+import type { MessageMeta, Part } from "./messages.js";
 
 // --- fixtures --------------------------------------------------------------
 
@@ -22,7 +24,7 @@ let seq = 0;
 const message = (
   role: "user" | "assistant" | "tool",
   parts: Part[],
-  meta?: { usage?: Usage },
+  meta?: MessageMeta,
 ): PathNode => {
   seq += 1;
   return {
@@ -177,12 +179,62 @@ test("readEvent maps every event the turn stream emits", () => {
   }
 });
 
-test("readEvent treats the non-visual events as no-ops", () => {
-  assert.deepEqual(readEvent({ type: "message.done", messageId: "m1", finishReason: "stop" }), {
-    kind: "none",
-  });
+test("readEvent treats turn.done as a no-op", () => {
   assert.deepEqual(readEvent({ type: "turn.done", turnId: "turn_1" }), { kind: "none" });
-  assert.deepEqual(readEvent({ type: "usage", usage: { totalTokens: 5 } }), { kind: "none" });
+});
+
+test("message.done records the finish reason on its own message only", () => {
+  let inFlight: UiMessage[] = [emptyAssistant("m1"), emptyAssistant("m2")];
+  inFlight = applyEffect(inFlight, readEvent({ type: "message.done", messageId: "m1", finishReason: "length" }));
+  assert.equal(inFlight[0].finishReason, "length");
+  assert.equal(inFlight[1].finishReason, undefined);
+  const after = applyEffect(inFlight, readEvent({ type: "message.done", messageId: "zz", finishReason: "stop" }));
+  assert.equal(after, inFlight, "an unknown id changes nothing");
+});
+
+test("usage accumulates onto the newest in-flight message", () => {
+  let inFlight: UiMessage[] = [emptyAssistant("m1")];
+  inFlight = applyEffect(inFlight, readEvent({ type: "usage", usage: { inputTokens: 10, outputTokens: 2 } }));
+  inFlight = applyEffect(inFlight, readEvent({ type: "usage", usage: { outputTokens: 3 } }));
+  assert.equal(inFlight[0].usage?.inputTokens, 10);
+  assert.equal(inFlight[0].usage?.outputTokens, 5);
+});
+
+test("contextFill reads the most recent model call", () => {
+  const rows = [
+    { role: "assistant" as const, usage: { inputTokens: 100, outputTokens: 10 } },
+    { role: "user" as const },
+    { role: "assistant" as const, usage: { inputTokens: 700, outputTokens: 100 } },
+    { role: "user" as const },
+  ];
+  assert.deepEqual(contextFill(rows, 1000), { tokens: 800, fraction: 0.8 });
+  assert.equal(contextFill(rows, undefined), undefined);
+  assert.equal(contextFill([{ role: "user" }], 1000), undefined);
+});
+
+test("endsTruncated only flags a final reply cut off at the length limit", () => {
+  assert.equal(endsTruncated([{ role: "assistant", finishReason: "length" }]), true);
+  assert.equal(endsTruncated([{ role: "assistant", finishReason: "stop" }]), false);
+  assert.equal(endsTruncated([{ role: "assistant", finishReason: "length" }, { role: "user" }]), false);
+  assert.equal(endsTruncated([]), false);
+});
+
+test("buildMessages shows attached documents and hides the Continue nudge", () => {
+  const out = buildMessages([
+    message("user", [
+      text("see attached"),
+      { type: "file", id: "att_9", name: "notes.txt", mime: "text/plain", size: 12 },
+    ]),
+    message("assistant", [text("partial")], { finishReason: "length" }),
+    message("user", [text("Continue")], { synthetic: "continue" }),
+    message("assistant", [text(" rest")]),
+  ]);
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ["user", "assistant", "assistant"],
+  );
+  assert.deepEqual(out[0].files, [{ id: "att_9", name: "notes.txt", mime: "text/plain", size: 12 }]);
+  assert.equal(out[1].finishReason, "length");
 });
 
 test("a full turn folds into one assistant message", () => {

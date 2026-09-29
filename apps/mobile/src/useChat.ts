@@ -24,8 +24,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState } from "react-native";
 import * as api from "./api";
 import type { ApprovalMode, ApprovalDecision, RunnerSummary, SessionRecord, SessionSummary } from "./api";
-import type { UiMessage } from "./chat";
-import { applyEffect, approvalForDecision, buildMessages, readEvent } from "./chat";
+import type { UiMessage } from "@hat/core";
+import { applyEffect, approvalForDecision, buildMessages, readEvent } from "@hat/core";
 import { loadPref, savePref } from "./runtime";
 
 const DEFAULT_MODEL = "fake/fake-agent";
@@ -501,6 +501,7 @@ export function useChat(): ChatStore {
           reasoning: "",
           tools: [],
           images: attachments.map((a) => ({ src: a.previewUri })),
+          files: [],
         },
       ]);
 

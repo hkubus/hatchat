@@ -2,16 +2,24 @@
  * The chat view-model: turning the server's message tree into a flat
  * transcript, and folding a live `KernelEvent` stream into the same shape.
  *
- * This is deliberately pure and free of React. It is the part of the client
- * that has to agree exactly with what the server sends, so it is the part
- * worth testing directly — see `chat.test.ts`.
- *
- * The shapes mirror `apps/web/src/App.tsx`, which is where the semantics come
- * from; the differences are only in how the state is threaded through React.
+ * This is deliberately pure and free of any UI framework. It is the part of
+ * the client that has to agree exactly with what the server sends, so the web,
+ * desktop and mobile clients all share it — see `chat-view.test.ts`.
  */
 
-import type { KernelEvent, Part, Usage } from "@hat/core";
-import type { ApprovalDecision, PathNode } from "./api";
+import type { ApprovalDecision } from "./context.js";
+import type { KernelEvent } from "./events.js";
+import type { ChatMessage, Part, Usage } from "./messages.js";
+import { addUsage } from "./messages.js";
+
+/** One node of the active root-to-leaf path, as the session API returns it. */
+export interface ChatPathNode {
+  message: ChatMessage;
+  parentId: string | null;
+  siblingIndex: number;
+  siblingCount: number;
+  siblingIds: string[];
+}
 
 export interface UiTool {
   callId: string;
@@ -33,7 +41,10 @@ export interface UiTool {
   answered?: boolean;
 }
 
-/** An artifact the assistant produced, stored server-side as an attachment. */
+/**
+ * A stored file: an artifact the assistant produced, or a document the user
+ * attached. Either way it is an attachment on the server.
+ */
 export interface UiFile {
   id: string;
   name: string;
@@ -61,13 +72,26 @@ export interface UiMessage {
   tools: UiTool[];
   branch?: UiBranch;
   images: UiImage[];
+  /** Documents attached to a user message. */
+  files: UiFile[];
   usage?: Usage;
+  /** Why the model stopped; `length` means the reply was cut off. */
+  finishReason?: string;
   /** True while this is the in-flight assistant message rather than stored state. */
   streaming?: boolean;
 }
 
 export function emptyAssistant(id: string): UiMessage {
-  return { id, role: "assistant", text: "", reasoning: "", tools: [], images: [], streaming: true };
+  return {
+    id,
+    role: "assistant",
+    text: "",
+    reasoning: "",
+    tools: [],
+    images: [],
+    files: [],
+    streaming: true,
+  };
 }
 
 /**
@@ -176,7 +200,7 @@ export function toolResultOf(parts: Part[]): { result: string; images: UiImage[]
  * message that made the call — so the walk walks backwards to find the card and
  * mutates it in place.
  */
-export function buildMessages(path: PathNode[]): UiMessage[] {
+export function buildMessages(path: ChatPathNode[]): UiMessage[] {
   const out: UiMessage[] = [];
   for (const node of path) {
     const { message } = node;
@@ -187,6 +211,9 @@ export function buildMessages(path: PathNode[]): UiMessage[] {
     };
 
     if (message.role === "user") {
+      // The "Continue" nudge is the app talking, not the user: the reply it
+      // produced reads as a continuation of the message above.
+      if (message.meta?.synthetic) continue;
       out.push({
         id: message.id,
         role: "user",
@@ -194,6 +221,7 @@ export function buildMessages(path: PathNode[]): UiMessage[] {
         reasoning: "",
         tools: [],
         images: imagesOf(message.parts),
+        files: filesOf(message.parts),
         branch,
       });
     } else if (message.role === "assistant") {
@@ -204,8 +232,10 @@ export function buildMessages(path: PathNode[]): UiMessage[] {
         reasoning: reasoningOf(message.parts),
         tools: toolsOf(message.parts),
         images: imagesOf(message.parts),
+        files: [],
         branch,
         usage: message.meta?.usage,
+        finishReason: message.meta?.finishReason,
       });
     } else if (message.role === "tool") {
       for (const part of message.parts) {
@@ -242,6 +272,8 @@ export type ChatEffect =
       files: UiFile[];
       isError: boolean;
     }
+  | { kind: "finish-message"; messageId: string; finishReason: string }
+  | { kind: "usage"; usage: Usage }
   | { kind: "session-title"; sessionId: string; title: string }
   | { kind: "error"; message: string }
   | { kind: "warning"; message: string };
@@ -284,6 +316,10 @@ export function readEvent(event: KernelEvent): ChatEffect {
         ...toolResultOf(event.parts),
         isError: event.isError,
       };
+    case "message.done":
+      return { kind: "finish-message", messageId: event.messageId, finishReason: event.finishReason };
+    case "usage":
+      return { kind: "usage", usage: event.usage };
     case "session.title":
       return { kind: "session-title", sessionId: event.sessionId, title: event.title };
     case "error":
@@ -291,9 +327,8 @@ export function readEvent(event: KernelEvent): ChatEffect {
     case "warning":
       return { kind: "warning", message: event.message };
     default:
-      // `usage`, `message.done` and `turn.done` carry no view-model change of
-      // their own: usage is accumulated by the caller, and a finished message
-      // becomes visible through the post-turn refresh.
+      // `turn.done` carries no view-model change of its own: a finished turn
+      // becomes durable through the post-turn refresh.
       return { kind: "none" };
   }
 }
@@ -341,9 +376,46 @@ export function applyEffect(list: UiMessage[], effect: ChatEffect): UiMessage[] 
         images: effect.images,
         files: effect.files,
       }));
+    case "finish-message":
+      // Only a known id: a stale `message.done` must not stamp its finish
+      // reason onto whatever happens to be newest.
+      if (!list.some((m) => m.id === effect.messageId)) return list;
+      return patchMessage(list, effect.messageId, (m) => ({ ...m, finishReason: effect.finishReason }));
+    case "usage":
+      // Usage arrives once per model call, before its message.done, so the
+      // newest message is the one it belongs to.
+      return patchMessage(list, undefined, (m) => ({ ...m, usage: addUsage(m.usage, effect.usage) }));
     default:
       return list;
   }
+}
+
+/**
+ * How full the model's context window is, judged by the most recent model
+ * call: its prompt plus its reply is what the next call starts from. Undefined
+ * when the window is unknown or nothing has been reported yet.
+ */
+export function contextFill(
+  messages: ReadonlyArray<Pick<UiMessage, "role" | "usage">>,
+  contextWindow: number | undefined,
+): { tokens: number; fraction: number } | undefined {
+  if (!contextWindow || contextWindow <= 0) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const usage = messages[i].usage;
+    if (messages[i].role !== "assistant" || !usage) continue;
+    const tokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+    if (tokens <= 0) continue;
+    return { tokens, fraction: Math.min(1, tokens / contextWindow) };
+  }
+  return undefined;
+}
+
+/** Whether the conversation ends on a reply that was cut off at the output limit. */
+export function endsTruncated(
+  messages: ReadonlyArray<Pick<UiMessage, "role" | "finishReason">>,
+): boolean {
+  const last = messages[messages.length - 1];
+  return Boolean(last && last.role === "assistant" && last.finishReason === "length");
 }
 
 /** The local decision recorded optimistically on a tool card, before the POST. */

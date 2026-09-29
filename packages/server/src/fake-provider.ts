@@ -65,6 +65,9 @@ function titleWords(text: string): string {
  *
  * Behaviour:
  *  - "run: <cmd>"  -> calls the shell.exec tool
+ *  - "long: <text>" -> writes <text> and stops at the output limit
+ *    (finish reason `length`), for exercising "Continue"
+ *  - the Continue nudge -> finishes the cut-off reply
  *  - after a tool result -> summarizes the output
  *  - anything else -> echoes
  */
@@ -137,6 +140,19 @@ export class FakeProvider implements Provider {
       yield* this.streamText(`Calling tool ${name}.\n`, signal);
       yield { type: "toolcall", call: { id: newId("call"), name, args } };
       yield { type: "done", finishReason: "tool_calls" };
+      return;
+    }
+
+    const longMatch = /^long:\s*([\s\S]*)$/i.exec(text.trim());
+    if (longMatch) {
+      yield* this.streamText(`${longMatch[1]} and then`, signal);
+      yield { type: "usage", usage: { inputTokens: text.length, outputTokens: 20 } };
+      yield { type: "done", finishReason: "length" };
+      return;
+    }
+    if (/^Your previous reply was cut off/.test(text.trim())) {
+      yield* this.streamText(" the rest of the reply.", signal);
+      yield { type: "done", finishReason: "stop" };
       return;
     }
 

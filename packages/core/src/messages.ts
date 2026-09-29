@@ -1,3 +1,5 @@
+import type { FinishReason } from "./provider.js";
+
 export type ImageSource =
   | { kind: "url"; url: string; mime: string }
   | { kind: "data"; data: string; mime: string }
@@ -38,6 +40,16 @@ export interface MessageMeta {
   model?: string;
   usage?: Usage;
   incomplete?: boolean;
+  /**
+   * Why the model stopped. Persisted so a reply cut off at the output limit
+   * (`length`) can still be offered a "Continue" after a reload.
+   */
+  finishReason?: FinishReason;
+  /**
+   * A user message the app wrote on the user's behalf (the "Continue" nudge).
+   * Sent to the model like any other, but not shown as a chat bubble.
+   */
+  synthetic?: "continue";
 }
 
 /**

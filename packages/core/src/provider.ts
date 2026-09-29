@@ -11,6 +11,11 @@ export interface ProviderCapabilities {
   reasoningEffort?: boolean;
   jsonMode: boolean;
   systemPrompt: "native" | "merge-first-user" | "none";
+  /**
+   * Maximum prompt + completion tokens, when the provider knows it. The kernel
+   * uses it to keep long conversations from overflowing the model.
+   */
+  contextWindow?: number;
 }
 
 /**
