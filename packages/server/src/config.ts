@@ -56,6 +56,8 @@ export interface ServerConfig {
   titleModel?: string;
   /** Set HAT_ENABLE_EXTERNAL_PLUGINS=false to disable loading ./plugins. */
   enableExternalPlugins: boolean;
+  /** Run each external plugin in its own sandboxed process; HAT_PLUGINS_ISOLATION=off loads them in-process. */
+  pluginIsolation: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -151,5 +153,6 @@ export function loadConfig(): ServerConfig {
     sseKeepaliveMs: envInt("HAT_SSE_KEEPALIVE_MS", 1_000),
     titleModel: process.env.HAT_TITLE_MODEL || undefined,
     enableExternalPlugins: envBool("HAT_ENABLE_EXTERNAL_PLUGINS", true),
+    pluginIsolation: envBool("HAT_PLUGINS_ISOLATION", true),
   };
 }

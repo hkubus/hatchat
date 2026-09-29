@@ -289,7 +289,7 @@ plugin is disabled, errors, or is reconfigured.
 ### External plugins
 
 Drop ESM modules into `HAT_PLUGINS_DIR` (default `./plugins`) that default-export
-a `Plugin`. They are **trusted and in-process** (sandboxing is a later milestone):
+a `Plugin`. Each one runs **in its own child process**, not in the server:
 
 ```js
 import { definePlugin, z } from "@hat/plugin-sdk";
@@ -312,6 +312,39 @@ export default definePlugin({
 ```
 
 See `plugins/example.mjs`. Manage everything under **Settings → Plugins**.
+
+The same plugin API works across the process boundary
+(`packages/server/src/plugin-isolation/`): the server registers proxy
+tools/providers that forward calls over IPC, provider streams come back as
+events, and aborts are passed on as cancellations. Zod schemas stay in the
+child, which validates tool args and config itself and sends the server JSON
+Schema.
+
+- **Environment**: the child gets none of the server's env vars (only
+  `NODE_ENV`, `TZ`, `LANG`), so no `HAT_MASTER_KEY`, `HAT_AUTH_*` or provider keys.
+- **Sandbox** (Node >= 22.18): the child runs under Node's permission model.
+  It can read only the plugin directory and the code it imports (`node_modules`
+  and linked workspace packages). It can't write files, spawn processes, start
+  workers or load native addons. On older Node the child still runs in its own
+  process with a scrubbed env, but without the filesystem sandbox (a warning is
+  logged).
+- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`.
+  Anything else is refused.
+- **Tool context**: `sessionId`, `callId`, `signal`, `logger` and `secrets`.
+  `ctx.host` forwards to the call's execution host, stays pinned to that session,
+  and works only while the call runs. Each part needs its declared permission:
+  `runner:exec` (exec), `runner:fs` (fs), `runner:net` (fetch). `ctx.processHost`,
+  `runnerAvailable`, approval requests and `emit` are not available.
+- **Lifecycle**: every activation starts a fresh process. Disabling or
+  reconfiguring kills it. If it crashes, the plugin goes to `error` with the
+  reason and its tools/providers are unregistered; re-enable it to restart.
+- **Limits**: network access isn't restricted (Node's permission model has no
+  network control). A `requiresApproval` predicate is treated as "always ask".
+  Provider `capabilities(model)` answers from the last `listModels()` result.
+  `id`, `requiresSecrets` and `permissions` are read once at startup.
+
+`HAT_PLUGINS_ISOLATION=off` loads external plugins into the server process
+instead, where they are fully trusted, as before.
 
 ## Persistence + branching (M1)
 
