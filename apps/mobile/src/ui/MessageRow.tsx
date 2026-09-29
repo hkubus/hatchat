@@ -54,7 +54,7 @@ function ToolCard({
     <View
       style={[
         styles.tool,
-        { backgroundColor: theme.color.surfaceAlt, borderColor: theme.color.border },
+        { backgroundColor: theme.color.surfaceAlt },
         awaiting && { borderColor: theme.color.warn },
       ]}
     >
@@ -166,7 +166,7 @@ function MessageRowBase({
           styles.bubble,
           isUser
             ? { backgroundColor: theme.color.userBubble }
-            : { backgroundColor: theme.color.assistantBubble, borderColor: theme.color.border },
+            : { backgroundColor: "transparent" },
           isUser ? styles.bubbleUser : styles.bubbleAssistant,
         ]}
       >
@@ -187,7 +187,7 @@ function MessageRowBase({
         {streaming && !message.text ? <StreamingCaret /> : null}
 
         {message.reasoning ? (
-          <View style={[styles.reasoning, { borderColor: theme.color.border }]}>
+          <View style={[styles.reasoning, { backgroundColor: theme.color.surfaceAlt }]}>
             <Text style={[styles.reasoningLabel, { color: theme.color.textFaint }]}>
               Reasoning
             </Text>
@@ -283,29 +283,32 @@ const styles = StyleSheet.create({
   rowUser: { alignItems: "flex-end" },
   rowAssistant: { alignItems: "flex-start" },
   bubble: {
-    borderRadius: 18,
-    borderWidth: StyleSheet.hairlineWidth,
     gap: 8,
     overflow: "hidden",
   },
-  bubbleUser: { maxWidth: "88%", paddingHorizontal: 14, paddingVertical: 10 },
-  bubbleAssistant: { maxWidth: "94%", padding: 14 },
-  userText: { fontSize: 16, lineHeight: 22 },
-  rowActions: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 4 },
-  action: { fontSize: 13, fontWeight: "600" },
-  branch: { flexDirection: "row", alignItems: "center", gap: 6 },
-  branchButton: { width: 28, height: 28, borderRadius: 8, alignItems: "center", justifyContent: "center" },
-  branchCount: { fontSize: 12, fontVariant: ["tabular-nums"] },
-  caretRow: { height: 18, justifyContent: "center" },
-  caret: { width: 8, height: 8, borderRadius: 4 },
-  reasoning: { gap: 4, borderTopWidth: StyleSheet.hairlineWidth, paddingTop: 8 },
-  reasoningLabel: {
-    fontSize: 11,
-    fontWeight: "700",
-    textTransform: "uppercase",
-    letterSpacing: 0.6,
+  bubbleUser: {
+    maxWidth: "78%",
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 20,
   },
-  tool: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, padding: 12, gap: 8 },
+  bubbleAssistant: { maxWidth: "100%", paddingHorizontal: 2, paddingVertical: 2 },
+  userText: { fontSize: 17, lineHeight: 23, letterSpacing: -0.2 },
+  rowActions: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 4 },
+  action: { fontSize: 14, fontWeight: "500" },
+  branch: { flexDirection: "row", alignItems: "center", gap: 6 },
+  branchButton: { width: 28, height: 28, borderRadius: 14, alignItems: "center", justifyContent: "center" },
+  branchCount: { fontSize: 13, fontVariant: ["tabular-nums"] },
+  caretRow: { height: 20, justifyContent: "center" },
+  caret: { width: 8, height: 8, borderRadius: 4 },
+  reasoning: { gap: 4, borderRadius: 10, padding: 10 },
+  reasoningLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  tool: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: "transparent", padding: 12, gap: 8 },
   toolHead: {
     flexDirection: "row",
     alignItems: "center",
@@ -316,9 +319,9 @@ const styles = StyleSheet.create({
   toolStatus: { flexDirection: "row", alignItems: "center", gap: 6 },
   toolSummary: { marginTop: -2 },
   approval: { gap: 8 },
-  approvalText: { fontSize: 13 },
+  approvalText: { fontSize: 14 },
   approvalButtons: { flexDirection: "row", gap: 8 },
   flex: { flex: 1 },
   images: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  image: { width: 96, height: 96, borderRadius: 10 },
+  image: { width: 96, height: 96, borderRadius: 12 },
 });

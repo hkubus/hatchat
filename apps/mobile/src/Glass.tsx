@@ -54,7 +54,7 @@ export function Glass({ variant = "regular", style, children, intensity }: Glass
 
   if (NativeGlass) {
     return (
-      <NativeGlass variant={variant} style={style}>
+      <NativeGlass variant={variant} style={[styles.host, style]}>
         {children}
       </NativeGlass>
     );

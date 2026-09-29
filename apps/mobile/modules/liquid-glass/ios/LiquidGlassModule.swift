@@ -30,6 +30,14 @@ final class GlassView: ExpoView {
     applyEffect()
   }
 
+  override func mountChildComponentView(_ childComponentView: UIView, index: Int) {
+    super.mountChildComponentView(childComponentView, index: index + 1)
+  }
+
+  override func unmountChildComponentView(_ childComponentView: UIView, index: Int) {
+    super.unmountChildComponentView(childComponentView, index: index + 1)
+  }
+
   private func applyEffect() {
     if #available(iOS 26.0, *) {
       // `clear` drops the tint so only the distortion remains, which is what
