@@ -216,12 +216,14 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createMcpPlugin());
 
   for (const plugin of config.enableExternalPlugins
-    ? await loadExternalPlugins(config.pluginsDir, logger)
+    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation })
     : []) {
     pluginHost.register(plugin, "external");
   }
   if (!config.enableExternalPlugins) {
     logger.info("external plugins disabled (HAT_ENABLE_EXTERNAL_PLUGINS=false)");
+  } else if (!config.pluginIsolation) {
+    logger.warn("external plugin isolation is off (HAT_PLUGINS_ISOLATION); plugins run in-process");
   }
 
   await pluginHost.activateAll();

@@ -2,9 +2,23 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Logger, Plugin } from "@hat/core";
+import { loadIsolatedPlugin, sandboxSupported } from "./plugin-isolation/host.js";
 
-/** Load trusted in-process plugins from a directory of ESM modules. */
-export async function loadExternalPlugins(dir: string, logger: Logger): Promise<Plugin[]> {
+export interface ExternalPluginOptions {
+  /**
+   * Run each plugin in its own process (see `plugin-isolation/`). When false,
+   * plugins are imported into the server process and fully trusted.
+   */
+  isolate?: boolean;
+}
+
+/** Load plugins from a directory of ESM modules. */
+export async function loadExternalPlugins(
+  dir: string,
+  logger: Logger,
+  options: ExternalPluginOptions = {},
+): Promise<Plugin[]> {
+  const isolate = options.isolate ?? true;
   const absolute = path.resolve(dir);
   if (!fs.existsSync(absolute)) return [];
   const stat = fs.statSync(absolute);
@@ -26,6 +40,18 @@ export async function loadExternalPlugins(dir: string, logger: Logger): Promise<
       continue;
     }
     try {
+      if (isolate) {
+        if (!sandboxSupported && plugins.length === 0) {
+          logger.warn(
+            `Node ${process.version} lacks the permission model or native type stripping: ` +
+              "external plugins get their own process but no filesystem sandbox (needs Node >= 22.18)",
+          );
+        }
+        const plugin = await loadIsolatedPlugin(file, { logger });
+        plugins.push(plugin);
+        logger.info(`loaded external plugin: ${plugin.id} (${entry.name}, isolated)`);
+        continue;
+      }
       const mod = (await import(pathToFileURL(file).href)) as {
         default?: Plugin;
         plugin?: Plugin;
@@ -36,7 +62,7 @@ export async function loadExternalPlugins(dir: string, logger: Logger): Promise<
         continue;
       }
       plugins.push(plugin);
-      logger.info(`loaded external plugin: ${plugin.id} (${entry.name})`);
+      logger.info(`loaded external plugin: ${plugin.id} (${entry.name}, in-process)`);
     } catch (error) {
       logger.error(`failed to load plugin ${entry.name}`, String(error));
     }
