@@ -9,6 +9,7 @@ export interface McpServerDraft {
   envText: string;
   url: string;
   token: string;
+  trustReadOnlyHint: boolean;
 }
 
 interface ParsedServer {
@@ -19,6 +20,7 @@ interface ParsedServer {
   env?: unknown;
   url?: string;
   token?: string;
+  trustReadOnlyHint?: unknown;
 }
 
 function newKey(): string {
@@ -76,6 +78,7 @@ function draftFromServer(server: ParsedServer): McpServerDraft {
     envText: env,
     url: typeof server.url === "string" ? server.url : "",
     token: typeof server.token === "string" ? server.token : "",
+    trustReadOnlyHint: server.trustReadOnlyHint !== false,
   };
 }
 
@@ -113,6 +116,8 @@ export function draftToServer(draft: McpServerDraft): Record<string, unknown> {
     if (args.length > 0) base.args = args;
     if (Object.keys(env).length > 0) base.env = env;
   }
+  // Only the opt-out is stored; the server treats a missing value as true.
+  if (!draft.trustReadOnlyHint) base.trustReadOnlyHint = false;
   return base;
 }
 
@@ -143,6 +148,7 @@ function blankDraft(transport: "stdio" | "http"): McpServerDraft {
     envText: "",
     url: transport === "http" ? "https://" : "",
     token: "",
+    trustReadOnlyHint: true,
   };
 }
 
@@ -471,7 +477,10 @@ export default function McpConfigEditor({
         />
         <span>
           <span className="mcp-approval-title">Require approval before running MCP tools</span>
-          <span className="mcp-hint">Recommended — the model asks before calling a server tool.</span>
+          <span className="mcp-hint">
+            Recommended — the model asks before calling a server tool. Tools a server marks
+            read-only skip this unless that server sets <code>"trustReadOnlyHint": false</code>.
+          </span>
         </span>
       </label>
 

@@ -125,7 +125,13 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 - **http** uses the Streamable HTTP transport (JSON or SSE responses, session id
   propagation) on the server.
 - MCP tools carry their real JSON Schema (`Tool.parameters`), so no zod
-  conversion is needed; `requiresApproval` defaults to true.
+  conversion is needed.
+- Tools require approval by default. The exception is a tool whose
+  `annotations` say `readOnlyHint: true` without `destructiveHint: true`: it
+  runs without asking. Annotations are only hints from the server, so a missing
+  or malformed hint keeps the approval. To ignore a server's hints entirely, set
+  `"trustReadOnlyHint": false` on that server. `requireApproval: false` on the
+  plugin still turns approval off for every MCP tool.
 - `notifications/tools/list_changed` is wired; server→client requests we don't
   implement (sampling, elicitation) are declined with a JSON-RPC error, which
   servers handle gracefully.
@@ -177,8 +183,10 @@ Settings → Plugins → MCP servers:
   `node_modules` next to it — it is not a standalone bundle. It also needs
   Node ≥ 22.5, which is above hat's own `engines.node: ">=20"`.
 - Scout is read-only over MCP unless `SCOUT_MCP_ALLOW_WRITES` is set, which
-  additionally exposes 10 mutating tools. Hat ignores MCP's `readOnlyHint`, so
-  leaving that variable unset is the stronger control.
+  additionally exposes 10 mutating tools. Hat skips approval for tools marked
+  `readOnlyHint`, but that trusts Scout's own labels; leaving the variable unset
+  is the stronger control, and `"trustReadOnlyHint": false` makes every Scout
+  tool ask.
 - `scout://status` and `scout://dashboard` are MCP *resources*; hat's client
   implements tools only, so they are not exposed.
 - `search_listings` and the scan tools perform real marketplace scans over the
