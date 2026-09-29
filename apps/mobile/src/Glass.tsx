@@ -3,9 +3,8 @@ import { BlurView } from "expo-blur";
 // of these, and taking the module core as a direct dependency is what
 // `expo-doctor` flags (it is not part of the public surface of this package).
 import { requireNativeView as requireNativeViewManager, requireOptionalNativeModule } from "expo";
-import type { ComponentType } from "react";
 import { Platform, StyleSheet, View } from "react-native";
-import type { GlassProps, GlassVariant } from "../modules/liquid-glass";
+import type { GlassProps, GlassViewComponent, GlassVariant } from "../modules/liquid-glass";
 import { useTheme } from "./theme";
 
 export type { GlassProps, GlassVariant };
@@ -28,7 +27,7 @@ export type { GlassProps, GlassVariant };
  * which renders as a red box instead of falling back.
  */
 
-type NativeGlass = ComponentType<GlassProps>;
+type NativeGlass = GlassViewComponent;
 
 let nativeGlass: NativeGlass | null = null;
 try {
