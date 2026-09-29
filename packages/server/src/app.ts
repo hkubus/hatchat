@@ -716,7 +716,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         id: s.id,
         title: s.title,
         model: s.model,
-        messageCount: store.countMessages(s.id),
+        messageCount: store.countVisibleMessages(s.id),
         usage: usage.get(s.id) ?? null,
         status: statusOf(s.id),
         updatedAt: s.updatedAt,
@@ -977,7 +977,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       /* ignore */
     }
     if (!body.messageId) return c.json({ error: "messageId is required" }, 400);
-    const target = store.getMessage(body.messageId);
+    const target = store.hasMessage(session.id, body.messageId) ? store.getMessage(body.messageId) : undefined;
     if (!target || target.role !== "assistant") {
       return c.json({ error: "messageId must reference an assistant message" }, 400);
     }
@@ -1002,7 +1002,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!body.messageId || !body.text?.trim()) {
       return c.json({ error: "messageId and text are required" }, 400);
     }
-    const target = store.getMessage(body.messageId);
+    const target = store.hasMessage(session.id, body.messageId) ? store.getMessage(body.messageId) : undefined;
     if (!target || target.role !== "user") {
       return c.json({ error: "messageId must reference a user message" }, 400);
     }
@@ -1044,7 +1044,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     } catch {
       /* ignore */
     }
-    if (!body.messageId || !store.getMessage(body.messageId)) {
+    if (!body.messageId || !store.hasMessage(session.id, body.messageId)) {
       return c.json({ error: "valid messageId is required" }, 400);
     }
     store.selectBranch(session.id, body.messageId);

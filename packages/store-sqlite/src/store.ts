@@ -577,7 +577,12 @@ export class Store implements SecretStore {
         message.createdAt || now,
       );
       touch.run(message.id, now, title, sessionId);
-      const searchable = message.role === "user" || message.role === "assistant" ? searchableText(message.parts) : "";
+      // The synthetic "Continue" nudge is hidden in every client, so it must
+      // not turn up as a search hit either.
+      const searchable =
+        (message.role === "user" || message.role === "assistant") && !message.meta?.synthetic
+          ? searchableText(message.parts)
+          : "";
       if (searchable) {
         this.db
           .prepare(`INSERT INTO messages_fts (text, message_id, session_id, role) VALUES (?, ?, ?, ?)`)
@@ -656,6 +661,23 @@ export class Store implements SecretStore {
       if (kids.length === 0) return current;
       current = kids[kids.length - 1].id;
     }
+  }
+
+  /** Messages a client shows as rows: user and assistant, minus synthetic nudges. */
+  countVisibleMessages(sessionId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM messages
+          WHERE session_id = ? AND role IN ('user', 'assistant')
+            AND (meta IS NULL OR json_extract(meta, '$.synthetic') IS NULL)`,
+      )
+      .get(sessionId) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
+  /** Whether `messageId` is a message of `sessionId` (not merely some message). */
+  hasMessage(sessionId: string, messageId: string): boolean {
+    return this.sessionOf(messageId) === sessionId;
   }
 
   countMessages(sessionId: string): number {

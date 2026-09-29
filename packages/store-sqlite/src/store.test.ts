@@ -448,3 +448,22 @@ test("document attachments keep their name and extracted text", async () => {
   assert.equal(image.hasText, undefined);
   assert.equal(store.getAttachmentText(image.id), undefined);
 });
+
+test("synthetic nudges are neither searchable nor counted as visible rows", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("m1", "user", "tell me about otters"));
+  store.appendMessage(session.id, message("m2", "assistant", "otters are"));
+  store.appendMessage(session.id, {
+    ...message("m3", "user", "Continue exactly where it stopped"),
+    meta: { synthetic: "continue" },
+  });
+  store.appendMessage(session.id, message("m4", "assistant", " very playful"));
+  assert.equal(store.searchMessages("stopped").length, 0);
+  assert.equal(store.searchMessages("playful").length, 1);
+  assert.equal(store.countVisibleMessages(session.id), 3);
+  assert.equal(store.countMessages(session.id), 4);
+  assert.equal(store.hasMessage(session.id, "m1"), true);
+  const other = store.createSession("fake/fake-agent");
+  assert.equal(store.hasMessage(other.id, "m1"), false);
+});
