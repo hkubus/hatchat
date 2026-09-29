@@ -52,7 +52,7 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
   const normalized = normalizeServerUrl(serverUrl);
 
   return (
-    <SafeAreaView style={[styles.root, { backgroundColor: theme.color.bg }]}>
+    <SafeAreaView style={[styles.root, { backgroundColor: theme.color.grouped }]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -70,7 +70,7 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
           </View>
 
           <Glass
-            style={[styles.card, { borderColor: theme.color.border }]}
+            style={styles.card}
             intensity={60}
           >
             <View style={styles.cardBody}>
@@ -128,9 +128,9 @@ const styles = StyleSheet.create({
     gap: 24,
   },
   hero: { gap: 6 },
-  wordmark: { fontSize: 40, fontWeight: "800", letterSpacing: -1 },
-  tagline: { fontSize: 16, lineHeight: 22 },
-  card: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth },
+  wordmark: { fontSize: 34, fontWeight: "800", letterSpacing: -0.8 },
+  tagline: { fontSize: 17, lineHeight: 23 },
+  card: { borderRadius: 16, overflow: "hidden" },
   cardBody: { padding: 20, gap: 18 },
   footnote: { fontSize: 12, textAlign: "center" },
 });

@@ -9,38 +9,37 @@
  *   2. With no server URL, the user has never connected: show the connect
  *      screen. This is the same gate the desktop shell uses, and for the same
  *      reason — the app is a thin client that has to be pointed at a server.
- *   3. Otherwise mount the chat state machine and the three tabs.
- *
- * The tab bar is drawn in JS rather than using a native tab controller. That is
- * the one place this app knowingly gives up automatic iOS 26 glass: a native
- * `UITabBarController` gets the Liquid Glass treatment from the system for
- * free, and moving this onto Expo Router's native tabs is the follow-up noted
- * in docs/ios-app.md. The `Glass` wrapper is used here so the bar still picks
- * up the real material wherever it does exist.
+ *   3. Otherwise mount the chat state machine inside an iOS-native split
+ *      shell: chats live in a sidebar (persistent split on wide windows,
+ *      slide-over drawer on iPhone), the detail is Chat or Settings under an
+ *      iOS navigation bar. There is no bottom tab bar — navigation is the
+ *      sidebar plus the bar, as in Mail and Settings.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Animated,
+  Pressable,
+  StyleSheet,
+  View,
+  useWindowDimensions,
+} from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { setUnauthorizedHandler } from "./src/api";
-import { Glass } from "./src/Glass";
 import type { HatConfig } from "./src/runtime";
 import { clearConfig, loadConfig } from "./src/runtime";
 import ChatScreen from "./src/screens/ChatScreen";
 import ConnectScreen from "./src/screens/ConnectScreen";
-import SessionsScreen from "./src/screens/SessionsScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import { useTheme } from "./src/theme";
+import Sidebar from "./src/ui/Sidebar";
 import { useChat } from "./src/useChat";
 
-type Tab = "chat" | "sessions" | "settings";
+type Route = "chat" | "settings";
 
-const TABS: { id: Tab; label: string; glyph: string }[] = [
-  { id: "chat", label: "Chat", glyph: "💬" },
-  { id: "sessions", label: "Chats", glyph: "🗂" },
-  { id: "settings", label: "Settings", glyph: "⚙︎" },
-];
+const SIDEBAR_WIDTH = 320;
 
 export default function App() {
   return (
@@ -65,7 +64,7 @@ function Root() {
     // server's `HAT_AUTH_TOKEN` was rotated. Dropping the config returns the
     // user to the connect screen instead of letting every screen fail on its
     // own. Registered here, above the chat state, so it fires no matter which
-    // tab is mounted.
+    // route is mounted.
     setUnauthorizedHandler(() => {
       void clearConfig().then(() => setGeneration((n) => n + 1));
     });
@@ -116,43 +115,123 @@ function RootBody({
 function Shell({ onDisconnect }: { onDisconnect: () => Promise<void> }) {
   const theme = useTheme();
   const chat = useChat();
-  const [tab, setTab] = useState<Tab>("chat");
+  const { width } = useWindowDimensions();
+  const isWide = width >= 768;
 
-  const openChat = useCallback(() => setTab("chat"), []);
+  const [route, setRoute] = useState<Route>("chat");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Drawer animation (narrow only): slide the panel in, fade the scrim.
+  const slide = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(slide, {
+      toValue: sidebarOpen && !isWide ? 1 : 0,
+      duration: 240,
+      useNativeDriver: true,
+    }).start();
+  }, [sidebarOpen, isWide, slide]);
+
+  const drawerWidth = Math.min(SIDEBAR_WIDTH, width * 0.85);
+  const translateX = slide.interpolate({
+    inputRange: [0, 1],
+    outputRange: [-drawerWidth - 16, 0],
+  });
+  const scrimOpacity = slide.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 0.35],
+  });
+
+  const closeSidebar = useCallback(() => setSidebarOpen(false), []);
+  const openSidebar = useCallback(() => setSidebarOpen(true), []);
+
+  const goChat = useCallback(() => {
+    setRoute("chat");
+    setSidebarOpen(false);
+  }, []);
+
+  const goSettings = useCallback(() => {
+    setRoute("settings");
+    setSidebarOpen(false);
+  }, []);
+
+  const sidebar = (
+    <Sidebar
+      chat={chat}
+      onSelect={goChat}
+      onNewChat={goChat}
+      onOpenSettings={goSettings}
+      settingsActive={route === "settings"}
+    />
+  );
 
   return (
     <View style={[styles.root, { backgroundColor: theme.color.bg }]}>
-      <SafeAreaView style={styles.body} edges={["top", "left", "right"]}>
-        {tab === "chat" ? <ChatScreen chat={chat} /> : null}
-        {tab === "sessions" ? <SessionsScreen chat={chat} onOpenChat={openChat} /> : null}
-        {tab === "settings" ? <SettingsScreen chat={chat} onDisconnect={onDisconnect} /> : null}
-      </SafeAreaView>
+      {isWide ? (
+        <View style={styles.split}>
+          <SafeAreaView
+            edges={["top", "left", "bottom"]}
+            style={[styles.sidebarPane, { borderRightColor: theme.color.hairline }]}
+          >
+            {sidebar}
+          </SafeAreaView>
+          <View style={styles.detail}>
+            {route === "chat" ? (
+              <ChatScreen chat={chat} showMenuButton={false} onMenu={openSidebar} onNewChat={goChat} />
+            ) : (
+              <SettingsScreen
+                chat={chat}
+                onDisconnect={onDisconnect}
+                onBack={goChat}
+                showMenuButton={false}
+                onMenu={openSidebar}
+              />
+            )}
+          </View>
+        </View>
+      ) : (
+        <View style={styles.detail}>
+          {route === "chat" ? (
+            <ChatScreen chat={chat} showMenuButton onMenu={openSidebar} onNewChat={goChat} />
+          ) : (
+            <SettingsScreen
+              chat={chat}
+              onDisconnect={onDisconnect}
+              onBack={goChat}
+              showMenuButton
+              onMenu={openSidebar}
+            />
+          )}
 
-      <Glass style={[styles.tabBar, { borderTopColor: theme.color.hairline }]} intensity={70}>
-        {TABS.map((item) => {
-          const selected = item.id === tab;
-          return (
+          {/* Slide-over drawer + scrim. Kept mounted so the close animates;
+              pointer events only while open. */}
+          <Animated.View
+            style={[styles.scrim, { opacity: scrimOpacity }]}
+            pointerEvents={sidebarOpen ? "auto" : "none"}
+          >
             <Pressable
-              key={item.id}
-              accessibilityRole="tab"
-              accessibilityState={{ selected }}
-              accessibilityLabel={item.label}
-              onPress={() => setTab(item.id)}
-              style={styles.tab}
-            >
-              <Text style={[styles.glyph, selected && styles.glyphSelected]}>{item.glyph}</Text>
-              <Text
-                style={[
-                  styles.tabLabel,
-                  { color: selected ? theme.color.accent : theme.color.textFaint },
-                ]}
-              >
-                {item.label}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </Glass>
+              accessibilityRole="button"
+              accessibilityLabel="Close chats"
+              onPress={closeSidebar}
+              style={StyleSheet.absoluteFill}
+            />
+          </Animated.View>
+          <Animated.View
+            style={[
+              styles.drawer,
+              {
+                width: drawerWidth,
+                transform: [{ translateX }],
+                borderRightColor: theme.color.hairline,
+                backgroundColor: theme.color.grouped,
+              },
+            ]}
+          >
+            <SafeAreaView edges={["top", "left", "bottom"]} style={styles.drawerSafe}>
+              {sidebar}
+            </SafeAreaView>
+          </Animated.View>
+        </View>
+      )}
     </View>
   );
 }
@@ -160,18 +239,28 @@ function Shell({ onDisconnect }: { onDisconnect: () => Promise<void> }) {
 const styles = StyleSheet.create({
   boot: { flex: 1, alignItems: "center", justifyContent: "center" },
   root: { flex: 1 },
-  body: { flex: 1 },
-  tabBar: { flexDirection: "row", borderTopWidth: StyleSheet.hairlineWidth },
-  tab: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 2,
-    paddingTop: 10,
-    paddingBottom: 6,
-    minHeight: 52,
+  split: { flex: 1, flexDirection: "row" },
+  sidebarPane: { width: SIDEBAR_WIDTH, borderRightWidth: StyleSheet.hairlineWidth },
+  detail: { flex: 1 },
+  scrim: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "#000",
   },
-  glyph: { fontSize: 20, opacity: 0.55 },
-  glyphSelected: { opacity: 1 },
-  tabLabel: { fontSize: 11, fontWeight: "600" },
+  drawer: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    shadowColor: "#000",
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    shadowOffset: { width: 4, height: 0 },
+    elevation: 8,
+  },
+  drawerSafe: { flex: 1 },
 });

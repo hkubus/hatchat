@@ -7,7 +7,7 @@
  */
 
 import { requireNativeView as requireNativeViewManager } from "expo";
-import type { ComponentType, ReactNode } from "react";
+import type { ReactNode } from "react";
 import type { StyleProp, ViewStyle } from "react-native";
 
 export type GlassVariant = "regular" | "clear";
@@ -25,7 +25,8 @@ export interface GlassProps {
  * a view that does not exist, which renders as a red box. Probe with
  * `requireOptionalNativeModule` first, as `src/Glass.tsx` does.
  */
-export const GlassView: ComponentType<GlassProps> =
-  requireNativeViewManager<GlassProps>("LiquidGlass");
+export const GlassView = requireNativeViewManager<GlassProps>("LiquidGlass");
+
+export type GlassViewComponent = typeof GlassView;
 
 export default GlassView;

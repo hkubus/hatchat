@@ -20,14 +20,25 @@ export default function ModelPickerBar({
   models,
   value,
   onChange,
+  open: controlledOpen,
+  onOpenChange,
+  showTrigger = true,
 }: {
   models: ModelInfo[];
   value: string;
   onChange: (next: string) => void;
+  /** Controlled sheet state. When omitted the trigger manages it internally. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** Hide the inline pill trigger (the nav title opens the sheet instead). */
+  showTrigger?: boolean;
 }) {
   const theme = useTheme();
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
   const [query, setQuery] = useState("");
+
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = onOpenChange ?? setInternalOpen;
 
   const current = models.find((m) => m.id === value);
 
@@ -53,21 +64,23 @@ export default function ModelPickerBar({
 
   return (
     <>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="Choose a model"
-        onPress={() => setOpen(true)}
-        style={({ pressed }) => [
-          styles.trigger,
-          { backgroundColor: theme.color.surfaceAlt, borderColor: theme.color.border },
-          pressed && { opacity: 0.6 },
-        ]}
-      >
-        <Text style={[styles.triggerText, { color: theme.color.text }]} numberOfLines={1}>
-          {current?.label ?? value ?? "model"}
-        </Text>
-        <Text style={[styles.caret, { color: theme.color.textDim }]}>▾</Text>
-      </Pressable>
+      {showTrigger ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Choose a model"
+          onPress={() => setOpen(true)}
+          style={({ pressed }) => [
+            styles.trigger,
+            { backgroundColor: theme.color.surfaceAlt },
+            pressed && { opacity: 0.6 },
+          ]}
+        >
+          <Text style={[styles.triggerText, { color: theme.color.text }]} numberOfLines={1}>
+            {current?.label ?? value ?? "model"}
+          </Text>
+          <Text style={[styles.caret, { color: theme.color.textDim }]}>▾</Text>
+        </Pressable>
+      ) : null}
 
       <Modal
         visible={open}
@@ -111,23 +124,27 @@ function ModelSheet({
   const insets = useSafeAreaInsets();
 
   return (
-    <View style={[styles.sheet, { backgroundColor: theme.color.bg }]}>
+    <View style={[styles.sheet, { backgroundColor: theme.color.grouped }]}>
       <View style={[styles.sheetHead, { borderBottomColor: theme.color.hairline }]}>
         <Text style={[styles.sheetTitle, { color: theme.color.text }]}>Model</Text>
         <Button label="Done" compact onPress={onClose} />
       </View>
 
-      <TextInput
-        value={query}
-        onChangeText={onQueryChange}
-        placeholder="Search models"
-        placeholderTextColor={theme.color.textFaint}
-        autoCapitalize="none"
-        style={[
-          styles.search,
-          { color: theme.color.text, backgroundColor: theme.color.surface },
-        ]}
-      />
+      <View style={styles.searchWrap}>
+        <TextInput
+          value={query}
+          onChangeText={onQueryChange}
+          placeholder="Search"
+          placeholderTextColor={theme.color.textFaint}
+          autoCapitalize="none"
+          autoCorrect={false}
+          clearButtonMode="while-editing"
+          style={[
+            styles.search,
+            { color: theme.color.text, backgroundColor: theme.color.surfaceAlt },
+          ]}
+        />
+      </View>
 
       <ScrollView contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 16 }]}>
         {grouped.length === 0 ? (
@@ -149,10 +166,7 @@ function ModelSheet({
                   onPress={() => onPick(model.id)}
                   style={({ pressed }) => [
                     styles.item,
-                    {
-                      backgroundColor: selected ? theme.color.surfaceAlt : theme.color.surface,
-                      borderColor: selected ? theme.color.accent : theme.color.border,
-                    },
+                    { backgroundColor: theme.color.surface },
                     pressed && { opacity: 0.7 },
                   ]}
                 >
@@ -187,11 +201,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
-    minHeight: 36,
+    minHeight: 32,
     maxWidth: 220,
     paddingHorizontal: 12,
     borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
   },
   triggerText: { fontSize: 14, fontWeight: "600", flexShrink: 1 },
   caret: { fontSize: 11 },
@@ -204,22 +217,21 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  sheetTitle: { fontSize: 20, fontWeight: "700" },
+  sheetTitle: { fontSize: 17, fontWeight: "600" },
+  searchWrap: { paddingHorizontal: 16, paddingTop: 12 },
   search: {
-    margin: 16,
-    marginBottom: 0,
-    minHeight: 44,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    fontSize: 16,
+    minHeight: 36,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    fontSize: 17,
   },
   list: { padding: 16, gap: 20 },
   empty: { fontSize: 15, textAlign: "center", paddingVertical: 32 },
   group: { gap: 8 },
-  groupTitle: { fontSize: 12, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.6 },
-  item: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, padding: 12, gap: 8 },
+  groupTitle: { fontSize: 13, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4, paddingHorizontal: 4 },
+  item: { borderRadius: 12, padding: 14, gap: 8 },
   itemHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
-  itemLabel: { fontSize: 16, fontWeight: "600", flexShrink: 1 },
-  check: { fontSize: 16, fontWeight: "700" },
+  itemLabel: { fontSize: 17, fontWeight: "600", flexShrink: 1, letterSpacing: -0.2 },
+  check: { fontSize: 17, fontWeight: "700" },
   tags: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
 });

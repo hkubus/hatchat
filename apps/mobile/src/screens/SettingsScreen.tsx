@@ -16,6 +16,7 @@ import { currentConfig, saveConfig } from "../runtime";
 import { useTheme } from "../theme";
 import type { ChatStore } from "../useChat";
 import { Badge, Banner, Button, Field, SectionHeader, Segmented, ToggleRow } from "../ui/controls";
+import NavBar, { NavButton } from "../ui/NavBar";
 
 const PLUGIN_STATUS = {
   active: { label: "active", tone: "good" as const },
@@ -27,9 +28,15 @@ const PLUGIN_STATUS = {
 export default function SettingsScreen({
   chat,
   onDisconnect,
+  onBack,
+  showMenuButton,
+  onMenu,
 }: {
   chat: ChatStore;
   onDisconnect: () => Promise<void>;
+  onBack: () => void;
+  showMenuButton: boolean;
+  onMenu: () => void;
 }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
@@ -77,125 +84,140 @@ export default function SettingsScreen({
   }
 
   return (
-    <ScrollView
-      style={{ backgroundColor: theme.color.bg }}
-      contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 32 }]}
-      keyboardShouldPersistTaps="handled"
-    >
-      <Text style={[styles.heading, { color: theme.color.text }]}>Settings</Text>
-
-      {error ? <Banner tone="error" title="Request failed" detail={error} /> : null}
-      {notice ? <Banner tone="info" title={notice} onDismiss={() => setNotice(null)} /> : null}
-
-      {/* --- tool policy ------------------------------------------------- */}
-      <SectionHeader
-        title="Tool policy"
-        detail="How the agent is allowed to run tools in the current conversation."
+    <View style={[styles.root, { backgroundColor: theme.color.grouped }]}>
+      <NavBar
+        title="Settings"
+        leading={
+          showMenuButton ? (
+            <NavButton label="☰" accessibilityLabel="Open chats" onPress={onMenu} />
+          ) : (
+            <NavButton label="‹ Chats" accessibilityLabel="Back to chat" onPress={onBack} />
+          )
+        }
+        trailing={
+          showMenuButton ? (
+            <NavButton label="Done" accessibilityLabel="Done" onPress={onBack} />
+          ) : undefined
+        }
       />
-      <View style={styles.block}>
-        <Segmented
-          value={chat.policyMode}
-          onChange={chat.setPolicyMode}
-          options={[
-            { value: "ask", label: "ask" },
-            { value: "auto", label: "auto" },
-            { value: "allowlist", label: "allowlist" },
-            { value: "deny", label: "deny" },
-          ]}
-        />
-        {chat.policyMode === "allowlist" ? (
-          <AllowlistEditor value={chat.allowedTools} onChange={chat.setAllowedTools} known={tools} />
-        ) : null}
-        <Text style={[styles.note, { color: theme.color.textFaint }]}>
-          {POLICY_NOTES[chat.policyMode]}
-        </Text>
-      </View>
+      <ScrollView
+        style={{ backgroundColor: theme.color.grouped }}
+        contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 32 }]}
+        keyboardShouldPersistTaps="handled"
+      >
+        {error ? <Banner tone="error" title="Request failed" detail={error} /> : null}
+        {notice ? <Banner tone="info" title={notice} onDismiss={() => setNotice(null)} /> : null}
 
-      {/* --- providers --------------------------------------------------- */}
-      <SectionHeader
-        title="Providers & API keys"
-        detail="Keys are sent to the server and stored encrypted there. They never reach this device again."
-      />
-      {providers.length === 0 ? (
-        <Text style={[styles.note, { color: theme.color.textFaint }]}>
-          This server exposes no key-backed providers.
-        </Text>
-      ) : null}
-      {providers.map((provider) => (
-        <ProviderRow
-          key={provider.id}
-          provider={provider}
-          onSave={(value) =>
-            guard(() => api.setSecret(provider.secretName, value), `${provider.label} key saved.`)
-          }
-          onClear={() =>
-            guard(
-              () => api.deleteSecret(provider.secretName),
-              `${provider.label} key removed.`,
-            )
-          }
+        {/* --- tool policy ------------------------------------------------- */}
+        <SectionHeader
+          title="Tool policy"
+          detail="How the agent is allowed to run tools in the current conversation."
         />
-      ))}
-
-      {/* --- plugins ----------------------------------------------------- */}
-      <SectionHeader
-        title={`Plugins (${plugins.length})`}
-        detail="Providers and tools are contributed by plugins on the server."
-      />
-      {plugins.map((plugin) => (
-        <PluginRow
-          key={plugin.id}
-          plugin={plugin}
-          onToggle={(enabled) =>
-            guard(
-              () => api.setPluginEnabled(plugin.id, enabled),
-              `${plugin.name} ${enabled ? "enabled" : "disabled"}.`,
-            )
-          }
-          onConfig={(config) =>
-            guard(
-              () => api.setPluginConfig(plugin.id, config),
-              `${plugin.name} updated.`,
-            )
-          }
-        />
-      ))}
-
-      {/* --- runners ----------------------------------------------------- */}
-      <SectionHeader
-        title={`Execution runners (${runners.length})`}
-        detail="Work happens on a runner that dials out to the server. Secrets and approvals never leave it."
-      />
-      {runners.length === 0 ? (
-        <Banner
-          tone="warn"
-          title="No runner connected"
-          detail="Chat will work, but any tool call will fail until a runner is online."
-        />
-      ) : null}
-      {runners.map((runner) => (
-        <View
-          key={runner.id}
-          style={[styles.row, { backgroundColor: theme.color.surface, borderColor: theme.color.border }]}
-        >
-          <View style={styles.rowMain}>
-            <Text style={[styles.rowTitle, { color: theme.color.text }]}>{runner.id}</Text>
-            <Text style={[styles.note, { color: theme.color.textFaint }]}>
-              {runner.capabilities.os}/{runner.capabilities.arch}
-              {runner.capabilities.tags.length > 0 ? ` · ${runner.capabilities.tags.join(", ")}` : ""}
-            </Text>
-          </View>
-          <Badge
-            label={`${runner.load} busy`}
-            tone={runner.load === 0 ? "good" : "warn"}
+        <View style={[styles.card, { backgroundColor: theme.color.surface }]}>
+          <Segmented
+            value={chat.policyMode}
+            onChange={chat.setPolicyMode}
+            options={[
+              { value: "ask", label: "ask" },
+              { value: "auto", label: "auto" },
+              { value: "allowlist", label: "allow" },
+              { value: "deny", label: "deny" },
+            ]}
           />
+          {chat.policyMode === "allowlist" ? (
+            <AllowlistEditor value={chat.allowedTools} onChange={chat.setAllowedTools} known={tools} />
+          ) : null}
+          <Text style={[styles.note, { color: theme.color.textFaint }]}>
+            {POLICY_NOTES[chat.policyMode]}
+          </Text>
         </View>
-      ))}
 
-      {/* --- connection -------------------------------------------------- */}
-      <SectionHeader title="Connection" />
-      <ConnectionCard onDisconnect={onDisconnect} />
-    </ScrollView>
+        {/* --- providers --------------------------------------------------- */}
+        <SectionHeader
+          title="Providers & API keys"
+          detail="Keys are sent to the server and stored encrypted there. They never reach this device again."
+        />
+        {providers.length === 0 ? (
+          <Text style={[styles.note, { color: theme.color.textFaint }]}>
+            This server exposes no key-backed providers.
+          </Text>
+        ) : null}
+        {providers.map((provider) => (
+          <ProviderRow
+            key={provider.id}
+            provider={provider}
+            onSave={(value) =>
+              guard(() => api.setSecret(provider.secretName, value), `${provider.label} key saved.`)
+            }
+            onClear={() =>
+              guard(
+                () => api.deleteSecret(provider.secretName),
+                `${provider.label} key removed.`,
+              )
+            }
+          />
+        ))}
+
+        {/* --- plugins ----------------------------------------------------- */}
+        <SectionHeader
+          title={`Plugins (${plugins.length})`}
+          detail="Providers and tools are contributed by plugins on the server."
+        />
+        {plugins.map((plugin) => (
+          <PluginRow
+            key={plugin.id}
+            plugin={plugin}
+            onToggle={(enabled) =>
+              guard(
+                () => api.setPluginEnabled(plugin.id, enabled),
+                `${plugin.name} ${enabled ? "enabled" : "disabled"}.`,
+              )
+            }
+            onConfig={(config) =>
+              guard(
+                () => api.setPluginConfig(plugin.id, config),
+                `${plugin.name} updated.`,
+              )
+            }
+          />
+        ))}
+
+        {/* --- runners ----------------------------------------------------- */}
+        <SectionHeader
+          title={`Execution runners (${runners.length})`}
+          detail="Work happens on a runner that dials out to the server. Secrets and approvals never leave it."
+        />
+        {runners.length === 0 ? (
+          <Banner
+            tone="warn"
+            title="No runner connected"
+            detail="Chat will work, but any tool call will fail until a runner is online."
+          />
+        ) : null}
+        {runners.map((runner) => (
+          <View
+            key={runner.id}
+            style={[styles.row, { backgroundColor: theme.color.surface }]}
+          >
+            <View style={styles.rowMain}>
+              <Text style={[styles.rowTitle, { color: theme.color.text }]}>{runner.id}</Text>
+              <Text style={[styles.note, { color: theme.color.textFaint }]}>
+                {runner.capabilities.os}/{runner.capabilities.arch}
+                {runner.capabilities.tags.length > 0 ? ` · ${runner.capabilities.tags.join(", ")}` : ""}
+              </Text>
+            </View>
+            <Badge
+              label={`${runner.load} busy`}
+              tone={runner.load === 0 ? "good" : "warn"}
+            />
+          </View>
+        ))}
+
+        {/* --- connection -------------------------------------------------- */}
+        <SectionHeader title="Connection" />
+        <ConnectionCard onDisconnect={onDisconnect} />
+      </ScrollView>
+    </View>
   );
 }
 
@@ -261,7 +283,6 @@ function AllowlistEditor({
                 styles.chip,
                 {
                   backgroundColor: selected.has(name) ? theme.color.accent : theme.color.surfaceAlt,
-                  borderColor: selected.has(name) ? theme.color.accent : theme.color.border,
                 },
               ]}
             >
@@ -296,7 +317,7 @@ function ProviderRow({
 
   return (
     <View
-      style={[styles.row, { backgroundColor: theme.color.surface, borderColor: theme.color.border }]}
+      style={[styles.row, { backgroundColor: theme.color.surface }]}
     >
       <View style={styles.rowMain}>
         <Text style={[styles.rowTitle, { color: theme.color.text }]}>{provider.label}</Text>
@@ -356,7 +377,7 @@ function PluginRow({
 
   return (
     <View
-      style={[styles.row, { backgroundColor: theme.color.surface, borderColor: theme.color.border }]}
+      style={[styles.row, { backgroundColor: theme.color.surface }]}
     >
       <ToggleRow
         label={plugin.name}
@@ -491,7 +512,7 @@ function ConnectionCard({ onDisconnect }: { onDisconnect: () => Promise<void> })
 
   return (
     <View
-      style={[styles.row, { backgroundColor: theme.color.surface, borderColor: theme.color.border }]}
+      style={[styles.row, { backgroundColor: theme.color.surface }]}
     >
       <Field label="Server URL" value={serverUrl} onChangeText={setServerUrl} keyboardType="url" />
       <Field
@@ -522,22 +543,22 @@ function ConnectionCard({ onDisconnect }: { onDisconnect: () => Promise<void> })
 }
 
 const styles = StyleSheet.create({
-  content: { padding: 16, gap: 16 },
-  heading: { fontSize: 28, fontWeight: "800", letterSpacing: -0.5, marginBottom: 4 },
+  root: { flex: 1 },
+  content: { paddingHorizontal: 16, paddingBottom: 16, gap: 4 },
+  card: { borderRadius: 12, padding: 14, gap: 12 },
   block: { gap: 10 },
   chipRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   chip: {
-    minHeight: 36,
+    minHeight: 32,
     paddingHorizontal: 14,
     borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
     alignItems: "center",
     justifyContent: "center",
   },
   chipLabel: { fontSize: 14, fontWeight: "600" },
-  row: { borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, padding: 14, gap: 12 },
+  row: { borderRadius: 12, padding: 14, gap: 12, marginTop: 8 },
   rowMain: { gap: 2 },
   rowSide: { flexDirection: "row", alignItems: "center", gap: 10, flexWrap: "wrap" },
-  rowTitle: { fontSize: 16, fontWeight: "600" },
-  note: { fontSize: 12, lineHeight: 17 },
+  rowTitle: { fontSize: 17, fontWeight: "600", letterSpacing: -0.2 },
+  note: { fontSize: 13, lineHeight: 18 },
 });
