@@ -1,32 +1,38 @@
 :root {
-  /* Monochrome palette: pure neutral greys, no colour cast. The accent is a
-     near-white so buttons, links, focus rings and active states all read as
-     "bright ink on black" rather than carrying a hue. Only genuinely semantic
-     signals (ok / warn / danger) keep a desaturated hue, muted enough to sit
-     inside the greyscale. */
+  /* Neutral greys; colour comes only from the accent and the status hues. The
+     accent is defined once (`--accent`, plus the fill and text shades and the
+     ink that sits on it) and every tint is mixed from it, so swapping it is a
+     four-line change. */
   --bg: #0a0a0a;
-  --bg-sidebar: #0c0c0c;
+  --bg-sidebar: #0d0d0d;
   --surface: #141414;
   --surface-2: #1c1c1c;
   --surface-3: #262626;
   --border: #242424;
   --border-2: #333333;
+  --border-3: #454545;
   --fg: #ededed;
   --fg-muted: #a3a3a3;
   --fg-dim: #757575;
-  --accent: #e8e8e8;
-  --accent-strong: #f4f4f4;
-  --accent-soft: rgba(255, 255, 255, 0.1);
-  --ok: #7d9a72;
-  --warn: #c4a852;
-  --danger: #c9705f;
+  --accent: #e5484d;
+  --accent-hover: #ec5d5e;
+  --accent-text: #ff9592;
+  --on-accent: #ffffff;
+  --accent-strong: var(--accent);
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 45%, transparent);
+  --ok: #4fcf8a;
+  --warn: #f2b53c;
+  --danger: #f2736a;
   --radius-sm: 7px;
   --radius: 10px;
   --radius-lg: 14px;
-  --shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
-  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* Bundled (not fetched from a CDN) so the desktop and mobile shells render
+     the same type offline; the system stacks are only a fallback. */
+  --font: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
   color-scheme: dark;
 }
 
@@ -45,6 +51,9 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font);
+  /* Inter alternates: open 4, 6 and 9 (cv02-04) and a single-storey a (cv11),
+     which keep dense UI text a little softer and easier to scan. */
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   font-size: 14px;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
@@ -52,7 +61,7 @@ body {
 }
 
 ::selection {
-  background: rgba(255, 255, 255, 0.22);
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 * {
@@ -73,7 +82,7 @@ body {
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #454545;
+  background: var(--border-3);
   background-clip: content-box;
 }
 
@@ -83,7 +92,7 @@ button {
   cursor: pointer;
   border: 1px solid transparent;
   background: var(--accent-strong);
-  color: #0a0a0a;
+  color: var(--on-accent);
   padding: 8px 14px;
   border-radius: var(--radius);
   font-weight: 550;
@@ -99,7 +108,7 @@ button {
    swallows every quiet control. Each rule below re-states its own hover with a
    matching `:not(:disabled)`, which is the only way to outrank that rule. */
 button:hover:not(:disabled) {
-  background: #ffffff;
+  background: var(--accent-hover);
 }
 
 button:active:not(:disabled) {
@@ -120,16 +129,16 @@ button.ghost {
 button.ghost:hover:not(:disabled) {
   background: var(--surface-2);
   color: var(--fg);
-  border-color: #454545;
+  border-color: var(--border-3);
 }
 
 button.danger {
   background: var(--danger);
-  color: #0a0a0a;
+  color: var(--on-accent);
 }
 
 button.danger:hover:not(:disabled) {
-  background: #d97f6d;
+  background: #f58c84;
 }
 
 :focus-visible {
@@ -152,7 +161,7 @@ select {
 }
 
 .sidebar {
-  width: 268px;
+  width: 260px;
   flex-shrink: 0;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
@@ -164,14 +173,23 @@ select {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 16px 14px 10px;
+  padding: 14px 12px 10px 16px;
 }
 
 .sidebar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
-  font-size: 16px;
+  font-size: 15px;
   letter-spacing: -0.01em;
   flex: 1;
+}
+
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
 /* Icon-only, so it is sized like the other square controls rather than taking
@@ -188,14 +206,45 @@ select {
 }
 
 .new-chat svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
+  stroke-width: 2.2;
+}
+
+.session-search {
+  position: relative;
+  padding: 0 10px 6px;
+}
+
+.session-search-icon {
+  position: absolute;
+  left: 20px;
+  top: 8px;
+  width: 14px;
+  height: 14px;
+  color: var(--fg-dim);
+  pointer-events: none;
+}
+
+.session-search input {
+  width: 100%;
+  font-size: 12.5px;
+  padding: 5px 10px 5px 30px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.session-search input:focus {
+  border-color: var(--accent-line);
+  background: var(--surface-2);
 }
 
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 8px 8px;
+  padding: 0 8px 8px;
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -208,11 +257,37 @@ select {
   text-align: center;
 }
 
+.session-group {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  padding: 12px 8px 4px;
+}
+
+/* Conversations doing something right now sit on top in a tinted panel, so
+   "which one needs me" is answered before reading any titles. */
+.session-live {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 2px;
+  padding: 0 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.session-live .session-group {
+  padding: 7px 4px 3px;
+  color: var(--fg-muted);
+}
+
 .session-item {
   position: relative;
   display: flex;
   align-items: stretch;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 .session-item:hover {
@@ -223,16 +298,8 @@ select {
   background: var(--surface-2);
 }
 
-.session-item.active::before {
-  content: "";
-  position: absolute;
-  left: -8px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 3px;
-  height: 18px;
-  border-radius: 999px;
-  background: var(--accent);
+.session-item.active .session-title {
+  color: var(--fg);
 }
 
 .session-open {
@@ -242,7 +309,8 @@ select {
   background: transparent;
   color: inherit;
   border: none;
-  padding: 8px 10px;
+  border-radius: inherit;
+  padding: 6px 8px;
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -253,23 +321,90 @@ select {
   background: transparent;
 }
 
+.session-line {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
 .session-title {
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
+  color: var(--fg-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.session-meta {
-  font-size: 10.5px;
-  color: var(--fg-dim);
+.session-item:hover .session-title,
+.session-item.live .session-title {
+  color: var(--fg);
 }
 
+.session-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-state {
+  padding-left: 14px;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* Working is grey on purpose: red is the accent and also means "error", and a
+   busy conversation is neither. Only "needs you" gets a colour. */
+.session-item.running .session-state {
+  color: var(--fg-muted);
+}
+
+.session-item.waiting .session-state {
+  color: var(--warn);
+}
+
+.session-status {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.session-status.running {
+  background: var(--fg-muted);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.session-status.waiting {
+  background: var(--warn);
+}
+
+@keyframes status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Actions replace the age on hover, so idle rows stay one line tall and the
+   title truncates instead of running under the buttons. */
 .session-actions {
   display: none;
   align-items: center;
-  gap: 2px;
-  padding-right: 6px;
+  padding-right: 4px;
+}
+
+.session-actions .icon-btn {
+  width: 24px;
+  height: 24px;
+}
+
+.session-actions .icon-btn svg {
+  width: 13.5px;
+  height: 13.5px;
 }
 
 .session-item:hover .session-actions,
@@ -277,14 +412,20 @@ select {
   display: flex;
 }
 
+.session-item:hover .session-time,
+.session-item:focus-within .session-time {
+  display: none;
+}
+
 .session-rename {
   flex: 1;
-  margin: 4px 6px;
+  margin: 2px 0;
   background: var(--surface-3);
-  border: 1px solid #454545;
+  border: 1px solid var(--accent-line);
   border-radius: var(--radius-sm);
-  padding: 5px 8px;
+  padding: 4px 8px;
   font-size: 13px;
+  outline: none;
 }
 
 /* Delete confirms in place: the row swaps its actions for the question, so the
@@ -294,7 +435,7 @@ select {
   align-items: center;
   gap: 6px;
   flex: 1;
-  padding: 4px 6px 4px 10px;
+  padding: 3px 4px 3px 8px;
 }
 
 .session-confirm-text {
@@ -305,13 +446,14 @@ select {
 
 .sidebar-foot {
   border-top: 1px solid var(--border);
-  padding: 8px;
+  padding: 6px 8px;
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 2px;
 }
 
 .side-btn {
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -320,8 +462,8 @@ select {
   color: var(--fg-muted);
   font-weight: 500;
   font-size: 13px;
-  padding: 8px 10px;
-  border-radius: var(--radius);
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
   text-align: left;
 }
 
@@ -393,11 +535,11 @@ select {
 
 .warning {
   font-size: 12.5px;
-  color: #d6c48e;
-  border: 1px solid rgba(196, 168, 82, 0.32);
+  color: #f6d58a;
+  border: 1px solid rgba(242, 181, 60, 0.32);
   border-radius: var(--radius);
   padding: 7px 11px;
-  background: rgba(196, 168, 82, 0.07);
+  background: rgba(242, 181, 60, 0.07);
 }
 
 /* ---- messages ----------------------------------------------------------- */
@@ -425,10 +567,16 @@ select {
 }
 
 .empty h2 {
-  font-size: 26px;
+  font-size: 24px;
   letter-spacing: -0.02em;
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   color: var(--fg);
+}
+
+.empty-mark {
+  width: 44px;
+  height: 44px;
+  margin-bottom: 14px;
 }
 
 .restoring {
@@ -710,7 +858,7 @@ select {
   height: 15px;
   margin-left: 2px;
   border-radius: 2px;
-  background: var(--accent);
+  background: var(--fg-muted);
   vertical-align: text-bottom;
   animation: blink 1s steps(2, start) infinite;
 }
@@ -759,9 +907,9 @@ select {
 }
 
 .error {
-  color: #e0b0a4;
-  border: 1px solid rgba(201, 112, 95, 0.4);
-  background: rgba(201, 112, 95, 0.09);
+  color: #f7b7b1;
+  border: 1px solid rgba(242, 115, 106, 0.4);
+  background: rgba(242, 115, 106, 0.09);
   border-radius: var(--radius);
   padding: 10px 12px;
 }
@@ -777,7 +925,7 @@ select {
   width: 100%;
   resize: vertical;
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius);
   padding: 10px 12px;
 }
@@ -791,7 +939,7 @@ select {
 
 .composer {
   padding: 10px 20px 16px;
-  background: linear-gradient(to bottom, transparent, var(--bg) 42%);
+  background: var(--bg);
 }
 
 .composer-box {
@@ -801,21 +949,15 @@ select {
   background: var(--surface);
   border: 1px solid var(--border-2);
   border-radius: var(--radius-lg);
-  padding: 8px 12px 6px;
+  padding: 8px 8px 8px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  box-shadow: var(--shadow);
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
+  gap: 4px;
+  transition: border-color 0.15s ease;
 }
 
 .composer-box:focus-within {
-  border-color: #4a4a4a;
-  box-shadow:
-    var(--shadow),
-    0 0 0 4px rgba(255, 255, 255, 0.05);
+  border-color: var(--accent-line);
 }
 
 .composer-box textarea {
@@ -823,7 +965,7 @@ select {
   resize: none;
   border: none;
   background: transparent;
-  padding: 6px 0;
+  padding: 6px 4px 4px 0;
   max-height: 200px;
   line-height: 1.5;
   outline: none;
@@ -831,13 +973,6 @@ select {
 
 .composer-box textarea::placeholder {
   color: var(--fg-dim);
-}
-
-.composer-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
 }
 
 .icon-btn {
@@ -862,6 +997,7 @@ select {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   width: 32px;
   height: 32px;
   padding: 0;
@@ -869,8 +1005,14 @@ select {
   background: var(--accent-strong);
 }
 
+.send-btn:disabled {
+  background: var(--surface-3);
+  color: var(--fg-dim);
+  opacity: 1;
+}
+
 .send-btn:hover:not(:disabled) {
-  background: #ffffff;
+  background: var(--accent-hover);
 }
 
 .send-btn svg {
@@ -888,105 +1030,231 @@ select {
 
 .send-btn.stop:hover {
   background: var(--danger);
-  color: #0a0a0a;
+  color: var(--on-accent);
   border-color: transparent;
 }
 
-/* The bottom bar: model, reasoning effort and tool policy sit directly under
-   the message box, in the same visual unit. */
-/* The negative margin cancels the box's padding so the divider runs the full
-   width of the composer, while the padding puts the controls back on the same
-   left edge as the text and the attach button. */
-.composer-footer {
+/* One row under the text: attach, model, effort, tools on the left; context
+   use and send on the right. Settings at their defaults collapse to an icon. */
+.composer-bar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: nowrap;
-  padding: 6px 12px 0;
-  margin: 2px -12px 0;
-  border-top: 1px solid var(--border);
+  gap: 2px;
+  margin-left: -4px;
+  min-width: 0;
 }
 
-.composer-select {
-  appearance: none;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  padding: 3px 20px 3px 8px;
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--fg-muted);
-  max-width: 210px;
-  text-overflow: ellipsis;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
-    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position:
-    calc(100% - 12px) 52%,
-    calc(100% - 8px) 52%;
-  background-size:
-    4px 4px,
-    4px 4px;
-  background-repeat: no-repeat;
-  transition:
-    background-color 0.12s ease,
-    color 0.12s ease;
-}
-
-.composer-select:hover:not(:disabled) {
-  background-color: var(--surface-2);
-  color: var(--fg);
-}
-
-.composer-select:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.composer-select.on {
-  color: var(--accent);
-  background-color: var(--accent-soft);
+.composer-bar > .icon-btn {
+  flex-shrink: 0;
 }
 
 .composer-spacer {
   flex: 1;
+  min-width: 4px;
 }
 
-.composer-caps {
-  display: flex;
-  gap: 5px;
+.cmenu {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.cmenu-trigger {
+  display: inline-flex;
   align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 9px 0 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.cmenu-trigger.icon-only {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
+}
+
+.cmenu-trigger svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.cmenu-trigger:hover:not(:disabled),
+.cmenu-trigger.open {
+  background: var(--surface-3);
+  color: var(--fg);
+}
+
+.cmenu-trigger.accent {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.cmenu-trigger.accent:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent-text);
+}
+
+.cmenu-trigger.warn {
+  color: var(--warn);
+  background: rgba(242, 181, 60, 0.12);
+}
+
+.cmenu-trigger.warn:hover:not(:disabled) {
+  background: rgba(242, 181, 60, 0.2);
+  color: var(--warn);
+}
+
+/* Opens upward, like the model picker: the bar sits at the bottom of the view. */
+.cmenu-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 40;
+  width: 260px;
+  max-width: calc(100vw - 32px);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius);
+}
+
+.cmenu-heading {
   font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--fg-dim);
-  white-space: nowrap;
+  padding: 6px 8px 4px;
 }
 
-/* Padded to the same box as the selects and the picker trigger, so the row
-   reads as a single line of controls rather than two sizes. */
-.composer-caps .cap {
-  padding: 4px 8px;
-  border-color: var(--border-2);
-  color: var(--fg-dim);
+.cmenu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-weight: 400;
 }
 
-.token-count {
+.cmenu-item:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.cmenu-item.selected {
+  background: var(--accent-soft);
+}
+
+.cmenu-item-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cmenu-item-label {
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.cmenu-item-desc {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+}
+
+.cmenu-check {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--accent-text);
+}
+
+.cmenu-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 3px;
+  padding: 8px 8px 6px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--fg-muted);
+}
+
+.cmenu-field input {
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 12px;
+  outline: none;
+}
+
+.cmenu-field input:focus {
+  border-color: var(--accent-line);
+}
+
+.usage-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 30px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
   color: var(--fg-dim);
-  white-space: nowrap;
   cursor: default;
 }
 
-.allowlist-input {
-  /* Shrinkable: the footer no longer wraps, so this must not hold the row
-     open past the composer width. */
-  flex: 1 1 90px;
-  min-width: 0;
-  background: var(--surface-2);
-  border: 1px solid #454545;
-  border-radius: var(--radius-sm);
-  padding: 3px 9px;
-  font-family: var(--mono);
-  font-size: 11.5px;
+.usage-meter svg {
+  width: 17px;
+  height: 17px;
+  transform: rotate(-90deg);
+}
+
+.usage-meter circle {
+  fill: none;
+  stroke-width: 2.4;
+}
+
+.usage-track {
+  stroke: var(--surface-3);
+}
+
+.usage-fill {
+  stroke: var(--fg-muted);
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.4s ease;
+}
+
+.usage-meter.warn {
+  color: var(--warn);
+}
+
+.usage-meter.warn .usage-fill {
+  stroke: var(--warn);
+}
+
+.usage-meter.danger {
+  color: var(--danger);
+}
+
+.usage-meter.danger .usage-fill {
+  stroke: var(--danger);
 }
 
 .chips {
@@ -1004,7 +1272,7 @@ select {
   height: 52px;
   object-fit: cover;
   border-radius: 9px;
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   display: block;
 }
 
@@ -1017,14 +1285,14 @@ select {
   padding: 0;
   border-radius: 50%;
   background: var(--danger);
-  color: #0a0a0a;
+  color: var(--on-accent);
   font-size: 13px;
   line-height: 1;
   font-weight: 700;
 }
 
 .chip-remove:hover:not(:disabled) {
-  background: #d97f6d;
+  background: #f58c84;
 }
 
 /* ---- model picker ------------------------------------------------------- */
@@ -1089,7 +1357,6 @@ select {
   background: var(--surface);
   border: 1px solid var(--border-2);
   border-radius: var(--radius);
-  box-shadow: var(--shadow);
   overflow: hidden;
 }
 
@@ -1206,7 +1473,7 @@ select {
 }
 
 .picker-row.selected .picker-row-name {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .picker-row-main {
@@ -1303,7 +1570,7 @@ select {
 }
 
 .picker-star.on {
-  color: var(--accent);
+  color: var(--warn);
 }
 
 @media (hover: none) {
@@ -1367,7 +1634,7 @@ select {
 }
 
 .markdown a {
-  color: var(--accent);
+  color: var(--accent-text);
   text-decoration: none;
 }
 
@@ -1432,7 +1699,7 @@ select {
 
 .code-block pre {
   margin: 0;
-  background: #101010;
+  background: #0e0e14;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 13px 14px;
@@ -1446,7 +1713,7 @@ select {
   font-size: 11px;
   padding: 3px 9px;
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   color: var(--fg-muted);
   border-radius: 7px;
   opacity: 0;
@@ -1482,7 +1749,6 @@ select {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 18px;
-  box-shadow: var(--shadow);
 }
 
 .login-card .brand {
@@ -1493,7 +1759,7 @@ select {
 
 .login-card input {
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius);
   padding: 11px 13px;
 }
@@ -1517,7 +1783,6 @@ select {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 18px;
-  box-shadow: var(--shadow);
 }
 
 .fatal-card h1 {
@@ -1656,7 +1921,7 @@ select {
   flex: 1;
   min-width: 200px;
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius-sm);
   padding: 8px 11px;
   font-family: var(--mono);
@@ -1674,20 +1939,20 @@ select {
 
 .pill.ok {
   color: var(--ok);
-  border-color: rgba(125, 154, 114, 0.42);
-  background: rgba(125, 154, 114, 0.08);
+  border-color: rgba(79, 207, 138, 0.42);
+  background: rgba(79, 207, 138, 0.08);
 }
 
 .pill.warn {
   color: var(--warn);
-  border-color: rgba(196, 168, 82, 0.42);
-  background: rgba(196, 168, 82, 0.08);
+  border-color: rgba(242, 181, 60, 0.42);
+  background: rgba(242, 181, 60, 0.08);
 }
 
 .pill.bad {
   color: var(--danger);
-  border-color: rgba(201, 112, 95, 0.42);
-  background: rgba(201, 112, 95, 0.08);
+  border-color: rgba(242, 115, 106, 0.42);
+  background: rgba(242, 115, 106, 0.08);
 }
 
 .pill.muted {
@@ -1704,7 +1969,7 @@ select {
   padding: 2px 8px;
   border-radius: 999px;
   border: 1px solid var(--border-2);
-  color: #c4c4c4;
+  color: var(--fg-muted);
 }
 
 .ctx-label {
@@ -1740,7 +2005,7 @@ select {
 .cfg-field input[type="number"],
 .cfg-field select {
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   font-size: 13px;
@@ -1770,7 +2035,7 @@ select {
   width: 100%;
   resize: vertical;
   background: var(--surface-2);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius-sm);
   padding: 9px 11px;
   font-family: var(--mono);
@@ -1794,9 +2059,9 @@ select {
 .mcp-notice {
   margin: 0;
   font-size: 12.5px;
-  color: #d6c48e;
-  border: 1px solid rgba(196, 168, 82, 0.32);
-  background: rgba(196, 168, 82, 0.07);
+  color: #f6d58a;
+  border: 1px solid rgba(242, 181, 60, 0.32);
+  background: rgba(242, 181, 60, 0.07);
   border-radius: var(--radius-sm);
   padding: 8px 11px;
 }
@@ -1886,7 +2151,7 @@ select {
 }
 
 .mcp-card.invalid {
-  border-color: rgba(201, 112, 95, 0.55);
+  border-color: rgba(242, 115, 106, 0.55);
 }
 
 .mcp-card-head {
@@ -1992,7 +2257,7 @@ select {
 .mcp-field input[type="text"],
 .mcp-field input[type="password"] {
   background: var(--surface);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   font-size: 13px;
@@ -2006,16 +2271,15 @@ select {
 
 .mcp-field input:focus,
 .mcp-textarea:focus {
-  border-color: #5a5a5a;
+  border-color: var(--accent-line);
   outline: none;
-  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
 }
 
 .mcp-textarea {
   width: 100%;
   resize: vertical;
   background: var(--surface);
-  border: 1px solid #454545;
+  border: 1px solid var(--border-3);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   font-size: 12.5px;
@@ -2053,12 +2317,12 @@ select {
 
 .mcp-seg.active {
   background: var(--accent-strong);
-  color: #0a0a0a;
+  color: var(--on-accent);
 }
 
 .mcp-seg.active:hover:not(:disabled) {
-  background: #ffffff;
-  color: #0a0a0a;
+  background: var(--accent-hover);
+  color: var(--on-accent);
 }
 
 .mcp-hint {
@@ -2071,9 +2335,9 @@ select {
   margin: 0;
   padding: 8px 11px 8px 28px;
   font-size: 12px;
-  color: #e0b0a4;
-  background: rgba(201, 112, 95, 0.09);
-  border: 1px solid rgba(201, 112, 95, 0.4);
+  color: #f7b7b1;
+  background: rgba(242, 115, 106, 0.09);
+  border: 1px solid rgba(242, 115, 106, 0.4);
   border-radius: var(--radius-sm);
   line-height: 1.5;
 }
@@ -2092,13 +2356,13 @@ p.mcp-errors {
   font-size: 12px;
   border-radius: 999px;
   color: var(--danger);
-  border-color: rgba(201, 112, 95, 0.4);
+  border-color: rgba(242, 115, 106, 0.4);
 }
 
 .mcp-remove:hover:not(:disabled) {
-  background: rgba(201, 112, 95, 0.12);
-  color: #e0b0a4;
-  border-color: rgba(201, 112, 95, 0.6);
+  background: rgba(242, 115, 106, 0.12);
+  color: #f7b7b1;
+  border-color: rgba(242, 115, 106, 0.6);
 }
 
 .mcp-approval {
@@ -2182,9 +2446,39 @@ p.mcp-errors {
   border: 0;
 }
 
+/* Only shown once the sidebar turns into a drawer. */
+.nav-toggle {
+  display: none;
+  margin-left: -6px;
+}
+
+.nav-scrim {
+  display: none;
+}
+
+/* Narrow: the sidebar slides over the chat instead of squeezing it. */
 @media (max-width: 760px) {
   .sidebar {
-    width: 210px;
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 60;
+    width: min(300px, 86vw);
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+  }
+  .shell.nav-open .sidebar {
+    transform: none;
+  }
+  .nav-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(5, 5, 10, 0.6);
+    animation: fade-in 0.18s ease;
+  }
+  .nav-toggle {
+    display: inline-flex;
   }
   .scroller,
   .composer,
@@ -2193,15 +2487,16 @@ p.mcp-errors {
     padding-left: 12px;
     padding-right: 12px;
   }
-  .composer-caps {
-    display: none;
-  }
 }
 
-/* Touch + reduced-motion: larger targets, no hover-only hiding on touch. */
+/* Touch: no hover, so the open conversation keeps its actions visible (every
+   row showing them would bury the titles). */
 @media (hover: none) {
-  .session-actions {
+  .session-item.active .session-actions {
     display: flex;
+  }
+  .session-item.active .session-time {
+    display: none;
   }
   .code-copy {
     opacity: 1;
@@ -2221,18 +2516,6 @@ p.mcp-errors {
 }
 
 @media (max-width: 560px) {
-  .shell {
-    flex-direction: column;
-  }
-  .sidebar {
-    width: 100%;
-    max-height: 32vh;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-  .composer-footer {
-    overflow-x: auto;
-  }
   .icon-btn,
   .send-btn {
     min-width: 36px;
@@ -2461,27 +2744,22 @@ p.mcp-errors {
 .memory-row input {
   flex: 1;
   min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border-3);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+  font-size: 13px;
+  outline: none;
 }
 
-/* ---- search, status, import (sidebar) ------------------------------------ */
-
-.session-search {
-  padding: 0 12px 8px;
+.memory-input:focus,
+.memory-row input:focus,
+.secret-input:focus {
+  border-color: var(--accent-line);
+  outline: none;
 }
 
-.session-search input {
-  width: 100%;
-  font-size: 12.5px;
-  padding: 7px 10px;
-}
-
-.session-group {
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--fg-dim);
-  padding: 10px 10px 4px;
-}
+/* ---- message search results (sidebar) --------------------------------- */
 
 .search-hit {
   display: flex;
@@ -2520,30 +2798,6 @@ p.mcp-errors {
 
 .search-role {
   color: var(--fg-dim);
-}
-
-.session-status {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  margin-right: 6px;
-  vertical-align: 1px;
-}
-
-.session-status.running {
-  background: var(--fg-muted);
-  animation: status-pulse 1.4s ease-in-out infinite;
-}
-
-.session-status.waiting {
-  background: var(--warn);
-}
-
-@keyframes status-pulse {
-  50% {
-    opacity: 0.3;
-  }
 }
 
 /* ---- header actions + conversation settings ------------------------------ */
@@ -2599,7 +2853,6 @@ p.mcp-errors {
   background: var(--surface-2);
   border: 1px solid var(--border-2);
   border-radius: var(--radius);
-  box-shadow: var(--shadow);
 }
 
 .menu-items button {
@@ -2746,38 +2999,6 @@ p.mcp-errors {
   text-overflow: ellipsis;
 }
 
-.ctx-fill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--fg-dim);
-  white-space: nowrap;
-}
-
-.ctx-bar {
-  display: inline-block;
-  width: 36px;
-  height: 4px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  overflow: hidden;
-}
-
-.ctx-bar > span {
-  display: block;
-  height: 100%;
-  background: var(--fg-muted);
-}
-
-.ctx-fill.warn {
-  color: var(--warn);
-}
-
-.ctx-fill.warn .ctx-bar > span {
-  background: var(--warn);
-}
-
 .settings-check {
   display: flex;
   align-items: flex-start;
@@ -2785,7 +3006,6 @@ p.mcp-errors {
   font-size: 12.5px;
 }
 
-.session-search input,
 .chat-settings-field input,
 .chat-settings-field textarea {
   background: var(--surface-2);
@@ -2795,7 +3015,6 @@ p.mcp-errors {
   outline: none;
 }
 
-.session-search input:focus,
 .chat-settings-field input:focus,
 .chat-settings-field textarea:focus {
   border-color: var(--fg-dim);

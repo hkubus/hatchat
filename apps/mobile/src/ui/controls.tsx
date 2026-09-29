@@ -233,7 +233,7 @@ export function ToggleRow({ label, detail, value, onValueChange, disabled }: Tog
         value={value}
         onValueChange={onValueChange}
         disabled={disabled}
-        trackColor={{ true: theme.color.accent, false: theme.dark ? "#48484a" : "#e9e9eb" }}
+        trackColor={{ true: theme.color.success, false: theme.dark ? "#48484a" : "#e9e9eb" }}
       />
     </View>
   );

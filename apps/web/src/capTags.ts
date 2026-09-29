@@ -41,13 +41,3 @@ export function contextTag(contextWindow?: number): CapTag | undefined {
     title: `${contextWindow.toLocaleString()} token context window`,
   };
 }
-
-/** Full capability detail, including what is not chipped, for tooltips. */
-export function capSummary(model: ModelInfo): string {
-  const parts = capTags(model.capabilities).map((t) => t.label);
-  if (model.capabilities.reasoning) parts.push("reasoning");
-  if (model.capabilities.reasoningEffort) parts.push("effort");
-  const ctx = contextTag(model.contextWindow);
-  if (ctx) parts.push(`${ctx.label} context`);
-  return parts.length > 0 ? parts.join(" · ") : "no capabilities reported";
-}

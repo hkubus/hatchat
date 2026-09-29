@@ -259,7 +259,7 @@ function Todos({ todos }: { todos: ReturnType<typeof todosOf> }) {
             <Icon
               name={done ? "checkmark.circle.fill" : active ? "arrow.right.circle.fill" : "circle"}
               size={15}
-              color={done ? theme.color.success : active ? theme.color.accent : theme.color.textFaint}
+              color={done ? theme.color.success : active ? theme.color.text : theme.color.textFaint}
               style={styles.todoMark}
             />
             <Text
