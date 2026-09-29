@@ -8,6 +8,7 @@ import type {
   Logger,
   Part,
   Provider,
+  ProviderCapabilities,
   Tool,
   ToolPolicy,
   Usage,
@@ -137,8 +138,57 @@ test("loop guard stops repeated identical tool calls", async () => {
   const last = results.at(-1);
   assert.equal(last?.isError, true);
   assert.match(last?.parts[0]?.text ?? "", /Loop guard/);
-  // 3 executions then the guard trips on the 4th call.
-  assert.equal(counter.calls, 4);
+  // 3 executions then the guard trips on the 4th call, plus the closing
+  // no-tools call that lets the turn end with prose instead of a tool result.
+  assert.equal(counter.calls, 5);
+});
+
+/** Requests a fresh tool call while tools are offered, then writes prose. */
+function toolSpenderProvider(): Provider {
+  let n = 0;
+  return {
+    id: "spend-tools",
+    label: "spend-tools",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true }),
+    listModels: async () => [],
+    async *chat(req) {
+      if (req.tools && req.tools.length > 0) {
+        n += 1;
+        yield { type: "toolcall", call: { id: newId("call"), name: "loop_tool", args: { x: n } } };
+        yield { type: "done", finishReason: "tool_calls" as const };
+        return;
+      }
+      yield { type: "text.delta", text: "final answer" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+}
+
+test("closes with an answer when the tool-iteration budget runs out", async () => {
+  const persisted: ChatMessage[] = [];
+  const events = await runAgent(
+    toolSpenderProvider(),
+    { maxIterations: 2 },
+    undefined,
+    (_sessionId, message) => {
+      persisted.push(message);
+    },
+  );
+
+  const warning = events.find((e) => e.type === "warning") as { message: string } | undefined;
+  assert.match(warning?.message ?? "", /Tool-call limit/);
+  assert.equal(events.some((e) => e.type === "error"), false);
+
+  const toolResults = events.filter((e) => e.type === "tool.result");
+  assert.equal(toolResults.length, 2);
+
+  const assistants = persisted.filter((m) => m.role === "assistant");
+  const finalText = assistants
+    .at(-1)
+    ?.parts.filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+    .map((p) => p.text)
+    .join("");
+  assert.equal(finalText, "final answer");
 });
 
 test("auto policy executes without asking", async () => {
@@ -223,6 +273,8 @@ function capturingProvider(sink: { messages?: ChatMessage[] }, vision: boolean):
 function agentWith(
   provider: Provider,
   resolveImage?: (id: string) => Promise<{ data: string; mime: string } | undefined>,
+  systemPrompt?: string,
+  onMessage?: (sessionId: string, message: ChatMessage) => void,
 ) {
   const providers = new ProviderRegistry();
   providers.register(provider);
@@ -235,6 +287,8 @@ function agentWith(
     audit: { record() {} },
     logger,
     resolveImage,
+    systemPrompt,
+    onMessage,
   });
 }
 
@@ -324,4 +378,74 @@ test("usage is still relayed as a stream event", async () => {
     type: "usage",
     usage: { inputTokens: 5, outputTokens: 1 },
   });
+});
+
+function systemCapturingProvider(
+  sink: { messages?: ChatMessage[] },
+  systemPrompt: ProviderCapabilities["systemPrompt"],
+): Provider {
+  return {
+    id: "cap",
+    label: "cap",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: false, systemPrompt }),
+    listModels: async () => [],
+    async *chat(req) {
+      sink.messages = req.messages;
+      yield { type: "text.delta", text: "ok" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+}
+
+test("prepends the system prompt as a native system message", async () => {
+  const sink: { messages?: ChatMessage[] } = {};
+  const agent = agentWith(systemCapturingProvider(sink, "native"), undefined, "BASE PROMPT");
+  await drain(agent, [{ type: "text", text: "hi" }]);
+
+  const system = sink.messages?.[0];
+  assert.equal(system?.role, "system");
+  assert.match((system?.parts[0] as { text: string }).text, /BASE PROMPT/);
+  assert.match((system?.parts[0] as { text: string }).text, /Current date: \d{4}-\d{2}-\d{2}/);
+  assert.equal(sink.messages?.[1]?.role, "user");
+});
+
+test("merges the system prompt into the first user message when unsupported natively", async () => {
+  const sink: { messages?: ChatMessage[] } = {};
+  const agent = agentWith(
+    systemCapturingProvider(sink, "merge-first-user"),
+    undefined,
+    "BASE PROMPT",
+  );
+  await drain(agent, [{ type: "text", text: "hi" }]);
+
+  assert.equal(sink.messages?.some((m) => m.role === "system"), false);
+  const firstUser = sink.messages?.[0];
+  assert.equal(firstUser?.role, "user");
+  assert.match((firstUser?.parts[0] as { text: string }).text, /BASE PROMPT/);
+});
+
+test("omits the system prompt for providers that refuse one", async () => {
+  const sink: { messages?: ChatMessage[] } = {};
+  const agent = agentWith(systemCapturingProvider(sink, "none"), undefined, "BASE PROMPT");
+  await drain(agent, [{ type: "text", text: "hi" }]);
+
+  assert.equal(sink.messages?.some((m) => m.role === "system"), false);
+  assert.equal(
+    sink.messages?.some((m) => m.parts.some((p) => p.type === "text" && p.text.includes("BASE PROMPT"))),
+    false,
+  );
+});
+
+test("does not persist the system prompt to history", async () => {
+  const sink: { messages?: ChatMessage[] } = {};
+  const persisted: ChatMessage[] = [];
+  const agent = agentWith(
+    systemCapturingProvider(sink, "native"),
+    undefined,
+    "BASE PROMPT",
+    (_sessionId, message) => persisted.push(message),
+  );
+  await drain(agent, [{ type: "text", text: "hi" }]);
+
+  assert.equal(persisted.some((m) => m.role === "system"), false);
 });

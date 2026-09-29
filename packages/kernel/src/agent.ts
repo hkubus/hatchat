@@ -9,6 +9,7 @@ import type {
   KernelEvent,
   Logger,
   Part,
+  Provider,
   ProviderCapabilities,
   ReasoningEffort,
   SecretStore,
@@ -43,6 +44,12 @@ export interface KernelDeps {
   onMessage?(sessionId: string, message: ChatMessage): void;
   /** Resolve an attachment id to base64 data, for vision models. */
   resolveImage?(attachmentId: string): Promise<{ data: string; mime: string } | undefined>;
+  /**
+   * Base system prompt prepended to every turn. Kept out of stored history (it
+   * is derived each turn) and merged into the first user message for providers
+   * that do not support a native system role.
+   */
+  systemPrompt?: string;
   maxToolIterations?: number;
   maxToolResultChars?: number;
 }
@@ -60,6 +67,21 @@ interface ToolCallRecord {
  */
 export class Agent {
   constructor(private readonly deps: KernelDeps) {}
+  private readonly hostCache = new Map<string, Promise<ExecutionHost>>();
+
+  private resolveHostCached(sessionId: string): Promise<ExecutionHost> {
+    // One workspace.ensure per turn instead of one per tool call.
+    let cached = this.hostCache.get(sessionId);
+    if (!cached) {
+      cached = this.deps.resolveHost(sessionId);
+      this.hostCache.set(sessionId, cached);
+      // Drop on failure so the next call retries; drop after the turn
+      // via clearHostCache? Kept per Agent instance (per server) — entries
+      // are cheap (a channel + workspace) and keyed by session.
+      cached.catch(() => this.hostCache.delete(sessionId));
+    }
+    return cached;
+  }
 
   async *run(input: AgentTurnInput): AsyncGenerator<KernelEvent> {
     const turnId = newId("turn");
@@ -90,6 +112,9 @@ export class Agent {
 
     const { provider, model } = this.deps.providers.resolve(input.model);
     const caps = provider.capabilities(model);
+    if (this.deps.systemPrompt?.trim()) {
+      applySystemPrompt(messages, this.deps.systemPrompt, caps);
+    }
     const policy: ToolPolicy = input.toolPolicy ?? {
       ...DEFAULT_TOOL_POLICY,
       maxIterations: this.deps.maxToolIterations ?? DEFAULT_TOOL_POLICY.maxIterations,
@@ -97,6 +122,11 @@ export class Agent {
     const callCounts = new Map<string, number>();
     let failureStreak = 0;
     let guardTripped = false;
+    // How the loop actually ended. A model can spend its whole tool budget and
+    // never write an answer, leaving the turn dangling on a tool result; both
+    // flags let the closing step below kick in.
+    let endedNaturally = false;
+    let endedOnError = false;
 
     for (let iteration = 0; iteration < policy.maxIterations; iteration++) {
       const assistantId = newId("msg");
@@ -178,6 +208,8 @@ export class Agent {
       yield { type: "message.done", messageId: assistantId, finishReason: finish };
 
       if (finish === "error" || calls.length === 0) {
+        endedOnError = finish === "error";
+        endedNaturally = finish !== "error";
         break;
       }
 
@@ -228,7 +260,113 @@ export class Agent {
       if (guardTripped) break;
     }
 
+    if (!endedNaturally && !endedOnError && caps.toolCalls) {
+      yield* this.closeWithAnswer(
+        input,
+        provider,
+        model,
+        caps,
+        messages,
+        guardTripped ? "guard" : "iterations",
+      );
+    }
+
     yield { type: "turn.done", turnId };
+  }
+
+  /**
+   * The model ran out of tool budget (or tripped a loop guard) without ever
+   * writing an answer, so the turn would otherwise end on a bare tool result.
+   * Ask once more with tools withheld: the model can only produce prose, and
+   * the turn always closes with a summary of what was gathered.
+   */
+  private async *closeWithAnswer(
+    input: AgentTurnInput,
+    provider: Provider,
+    model: string,
+    caps: ProviderCapabilities,
+    messages: ChatMessage[],
+    reason: "iterations" | "guard",
+  ): AsyncGenerator<KernelEvent> {
+    yield {
+      type: "warning",
+      message:
+        reason === "guard"
+          ? "Tool loop guard tripped; asking the model to answer with what it has."
+          : "Tool-call limit reached for this turn; asking the model to answer with what it has.",
+    };
+
+    const assistantId = newId("msg");
+    yield { type: "message.start", messageId: assistantId, role: "assistant" };
+
+    // The nudge is transient: it shapes this one call but is not persisted.
+    const nudge: ChatMessage = {
+      id: newId("msg"),
+      role: "user",
+      parts: [
+        {
+          type: "text",
+          text:
+            "You have reached the tool-call limit for this turn. Do not call any more tools. " +
+            "Answer my last request now using the information you already have, and say briefly " +
+            "what you could not determine.",
+        },
+      ],
+      createdAt: Date.now(),
+    };
+    const request: ChatRequest = {
+      model,
+      messages: toProviderMessages([...messages, nudge], caps),
+      reasoningEffort:
+        input.reasoningEffort && input.reasoningEffort !== "off" && caps.reasoningEffort
+          ? input.reasoningEffort
+          : undefined,
+    };
+
+    let text = "";
+    let reasoning = "";
+    let usage: Usage | undefined;
+    try {
+      for await (const event of provider.chat(request, input.signal)) {
+        switch (event.type) {
+          case "text.delta":
+            text += event.text;
+            yield { type: "text.delta", messageId: assistantId, text: event.text };
+            break;
+          case "reasoning.delta":
+            reasoning += event.text;
+            yield { type: "reasoning.delta", messageId: assistantId, text: event.text };
+            break;
+          case "usage":
+            usage = addUsage(usage, event.usage);
+            yield { type: "usage", usage: event.usage };
+            break;
+          case "error":
+            yield { type: "error", error: event.error };
+            break;
+          default:
+            break;
+        }
+      }
+    } catch (error) {
+      this.deps.logger.error("closing answer failed", normalizeError(error, "provider_error"));
+    }
+
+    const parts: Part[] = [];
+    if (reasoning) parts.push({ type: "reasoning", text: reasoning });
+    if (text) parts.push({ type: "text", text });
+    if (parts.length > 0) {
+      const assistant: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        parts,
+        createdAt: Date.now(),
+        meta: { provider: provider.id, model, ...(usage ? { usage } : {}) },
+      };
+      messages.push(assistant);
+      this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
+    }
+    yield { type: "message.done", messageId: assistantId, finishReason: "stop" };
   }
 
   private async resolveAttachmentImages(messages: ChatMessage[]): Promise<void> {
@@ -306,7 +444,10 @@ export class Agent {
     }
 
     try {
-      const host = await this.deps.resolveHost(sessionId);
+      // NOTE: approval mode `auto` is intentionally preserved — this host is
+      // still gated by per-tool requiresApproval + loop guards when callers
+      // choose `ask`/`allowlist`/`deny` per session.
+      const host = await this.resolveHostCached(sessionId);
       const ctx: ToolContext = {
         sessionId,
         host,
@@ -329,6 +470,35 @@ export class Agent {
       };
     }
   }
+}
+
+/**
+ * Insert the base system prompt without persisting it. Providers that lack a
+ * native system role get it merged ahead of the first user message; providers
+ * that refuse a system prompt entirely are left alone.
+ */
+function applySystemPrompt(
+  messages: ChatMessage[],
+  prompt: string,
+  caps: ProviderCapabilities,
+): void {
+  if (caps.systemPrompt === "none") return;
+  const text = `${prompt}\n\nCurrent date: ${new Date().toISOString().slice(0, 10)} (UTC).`;
+
+  if (caps.systemPrompt === "merge-first-user") {
+    const firstUser = messages.find((message) => message.role === "user");
+    if (firstUser) {
+      firstUser.parts = [{ type: "text", text }, ...firstUser.parts];
+      return;
+    }
+  }
+
+  messages.unshift({
+    id: newId("msg"),
+    role: "system",
+    parts: [{ type: "text", text }],
+    createdAt: Date.now(),
+  });
 }
 
 function toProviderMessages(

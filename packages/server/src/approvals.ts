@@ -12,7 +12,7 @@ type TurnEmitter = (sessionId: string, event: KernelEvent) => void;
  * the active turn stream and resolves when the client POSTs a decision.
  */
 export class ApprovalManager implements ApprovalBroker {
-  private readonly pending = new Map<string, (decision: ApprovalDecision) => void>();
+  private readonly pending = new Map<string, { sessionId: string; finish: (decision: ApprovalDecision) => void }>();
 
   constructor(
     private readonly emitTurnEvent: TurnEmitter,
@@ -58,14 +58,17 @@ export class ApprovalManager implements ApprovalBroker {
         return;
       }
       signal.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(req.callId, finish);
+      this.pending.set(req.callId, { sessionId: req.sessionId, finish });
     });
   }
 
-  resolve(callId: string, decision: ApprovalDecision): boolean {
-    const finish = this.pending.get(callId);
-    if (!finish) return false;
-    finish(decision);
+  resolve(callId: string, decision: ApprovalDecision, sessionId?: string): boolean {
+    const entry = this.pending.get(callId);
+    if (!entry) return false;
+    // Bind approvals to the session that requested them so one tab can't
+    // approve another conversation's tool call by guessing the call id.
+    if (sessionId && entry.sessionId !== sessionId) return false;
+    entry.finish(decision);
     return true;
   }
 }

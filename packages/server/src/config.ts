@@ -1,4 +1,5 @@
 import { hashPassword } from "@hat/auth";
+import { defaultSystemPrompt } from "./prompt.js";
 
 /**
  * Native shells (Tauri desktop, mobile webviews) serve the UI from their own
@@ -41,6 +42,8 @@ export interface ServerConfig {
   pluginsDir: string;
   appTitle: string;
   appUrl?: string;
+  /** Base system prompt prepended to every turn. */
+  systemPrompt: string;
   s3?: S3Config;
   authPasswordHash?: string;
   cookieSecure: boolean;
@@ -49,6 +52,10 @@ export interface ServerConfig {
   corsOrigins: string[];
   /** SSE keepalive comment interval; 0 disables keepalives. */
   sseKeepaliveMs: number;
+  /** Model used for background title generation (defaults to the session model). */
+  titleModel?: string;
+  /** Set HAT_ENABLE_EXTERNAL_PLUGINS=false to disable loading ./plugins. */
+  enableExternalPlugins: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -86,16 +93,23 @@ function loadS3(): S3Config | undefined {
   const accessKeyId = process.env.HAT_S3_ACCESS_KEY_ID;
   const secretAccessKey = process.env.HAT_S3_SECRET_ACCESS_KEY;
   if (!bucket || !accessKeyId || !secretAccessKey) return undefined;
+  // Presigned URLs are bearer credentials: clamp to AWS max (7d), default 15m.
+  const rawExpires = envInt("HAT_S3_URL_EXPIRES", 900);
+  const urlExpiresSeconds = Math.min(604800, Math.max(60, rawExpires));
+  const endpoint = process.env.HAT_S3_ENDPOINT || undefined;
+  if (endpoint && !/^https?:\/\//.test(endpoint)) {
+    throw new Error("HAT_S3_ENDPOINT must be an http(s) URL");
+  }
   return {
     bucket,
     region: envStr("HAT_S3_REGION", "us-east-1"),
-    endpoint: process.env.HAT_S3_ENDPOINT || undefined,
+    endpoint,
     prefix: process.env.HAT_S3_PREFIX || undefined,
     pathStyle: envBool("HAT_S3_PATH_STYLE", true),
     accessKeyId,
     secretAccessKey,
     sessionToken: process.env.HAT_S3_SESSION_TOKEN || undefined,
-    urlExpiresSeconds: envInt("HAT_S3_URL_EXPIRES", 3600),
+    urlExpiresSeconds,
   };
 }
 
@@ -104,24 +118,38 @@ export function loadConfig(): ServerConfig {
     process.env.HAT_AUTH_PASSWORD_HASH ||
     (process.env.HAT_AUTH_PASSWORD ? hashPassword(process.env.HAT_AUTH_PASSWORD) : undefined);
 
+  const appTitle = envStr("HAT_APP_TITLE", "hat");
+
+  const enrollToken = envStr("HAT_ENROLL_TOKEN", "dev-enroll-token");
+  if (enrollToken === "dev-enroll-token") {
+    console.warn(
+      "[hat] HAT_ENROLL_TOKEN is the dev default; set a random token before exposing the server",
+    );
+  }
+  // Shorter default (24h vs 7d) limits the blast radius of a stolen cookie.
+  // Approval mode default stays `auto` (see Store) — this only bounds sessions.
+
   return {
     port: envInt("HAT_PORT", 8787),
     host: envStr("HAT_HOST", "127.0.0.1"),
     authToken: process.env.HAT_AUTH_TOKEN || undefined,
-    enrollToken: envStr("HAT_ENROLL_TOKEN", "dev-enroll-token"),
-    maxToolIterations: envInt("HAT_MAX_TOOL_ITERATIONS", 5),
+    enrollToken,
+    maxToolIterations: envInt("HAT_MAX_TOOL_ITERATIONS", 100),
     workspaceHint: envStr("HAT_WORKSPACE_ROOT", "./.hat/workspaces"),
     dbPath: envStr("HAT_DB_PATH", "./.hat/hat.db"),
     masterKeyPath: envStr("HAT_MASTER_KEY_FILE", "./.hat/master.key"),
     uploadDir: envStr("HAT_UPLOAD_DIR", "./.hat/uploads"),
     pluginsDir: envStr("HAT_PLUGINS_DIR", "./plugins"),
-    appTitle: envStr("HAT_APP_TITLE", "hat"),
+    appTitle,
     appUrl: process.env.HAT_APP_URL || undefined,
+    systemPrompt: envStr("HAT_SYSTEM_PROMPT", defaultSystemPrompt(appTitle)),
     s3: loadS3(),
     authPasswordHash: passwordHash,
     cookieSecure: envBool("HAT_COOKIE_SECURE", false),
-    sessionTtlMs: envInt("HAT_SESSION_TTL_HOURS", 168) * 3_600_000,
+    sessionTtlMs: envInt("HAT_SESSION_TTL_HOURS", 24) * 3_600_000,
     corsOrigins: envList("HAT_CORS_ORIGINS", DEFAULT_CORS_ORIGINS),
     sseKeepaliveMs: envInt("HAT_SSE_KEEPALIVE_MS", 1_000),
+    titleModel: process.env.HAT_TITLE_MODEL || undefined,
+    enableExternalPlugins: envBool("HAT_ENABLE_EXTERNAL_PLUGINS", true),
   };
 }

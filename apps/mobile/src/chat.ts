@@ -56,6 +56,49 @@ export function emptyAssistant(id: string): UiMessage {
   return { id, role: "assistant", text: "", reasoning: "", tools: [], images: [], streaming: true };
 }
 
+/**
+ * Replace the message with `messageId`, or the newest one when the id is
+ * unknown.
+ *
+ * The fallback matters: `tool.approval` and `tool.result` carry no message id,
+ * and a delta for a message that has already scrolled out of the in-flight list
+ * should still land somewhere sensible rather than being dropped.
+ */
+function patchMessage(
+  list: UiMessage[],
+  messageId: string | undefined,
+  fn: (m: UiMessage) => UiMessage,
+): UiMessage[] {
+  const known = messageId ? list.findIndex((m) => m.id === messageId) : -1;
+  const index = known === -1 ? list.length - 1 : known;
+  if (index < 0) return list;
+  const next = [...list];
+  next[index] = fn(next[index]);
+  return next;
+}
+
+/**
+ * Patch a tool by `callId`, searching newest message first. The call id is the
+ * only handle: the approval and result events do not say which message they
+ * belong to, and a tool-using turn spans several.
+ */
+function patchTool(
+  list: UiMessage[],
+  callId: string,
+  fn: (t: UiTool) => UiTool,
+): UiMessage[] {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const index = list[i].tools.findIndex((t) => t.callId === callId);
+    if (index === -1) continue;
+    const tools = [...list[i].tools];
+    tools[index] = fn(tools[index]);
+    const next = [...list];
+    next[i] = { ...next[i], tools };
+    return next;
+  }
+  return list;
+}
+
 function textOf(parts: Part[]): string {
   return parts
     .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
@@ -162,11 +205,12 @@ export type ChatEffect =
   | { kind: "none" }
   | { kind: "reset-usage" }
   | { kind: "start-message"; id: string }
-  | { kind: "append-text"; text: string }
-  | { kind: "append-reasoning"; text: string }
-  | { kind: "tool-call"; callId: string; name: string; args: unknown }
+  | { kind: "append-text"; messageId: string | undefined; text: string }
+  | { kind: "append-reasoning"; messageId: string | undefined; text: string }
+  | { kind: "tool-call"; messageId: string | undefined; callId: string; name: string; args: unknown }
   | { kind: "tool-approval"; callId: string; status: "requested" | "approved" | "denied" }
   | { kind: "tool-result"; callId: string; result: string; isError: boolean }
+  | { kind: "session-title"; sessionId: string; title: string }
   | { kind: "error"; message: string }
   | { kind: "warning"; message: string };
 
@@ -175,10 +219,11 @@ export type ChatEffect =
  * format to UI intent can be asserted directly.
  *
  * Every turn event is a `KernelEvent` under the single SSE name `kernel`, so
- * the client discriminates on `type`. There is exactly one `message.start` per
- * tool iteration, not per turn: a multi-iteration turn restarts the assistant
- * message, and the earlier tool-only iterations are dropped from the live view
- * (they are not lost — the refresh after the turn replays the stored path).
+ * the client discriminates on `type`.
+ *
+ * There is one `message.start` per *model iteration*, not per turn: a turn that
+ * calls tools emits several, and each is a separate assistant message on screen.
+ * That is why the in-flight state is a list.
  */
 export function readEvent(event: KernelEvent): ChatEffect {
   switch (event.type) {
@@ -187,15 +232,28 @@ export function readEvent(event: KernelEvent): ChatEffect {
     case "message.start":
       return { kind: "start-message", id: event.messageId };
     case "text.delta":
-      return { kind: "append-text", text: event.text };
+      return { kind: "append-text", messageId: event.messageId, text: event.text };
     case "reasoning.delta":
-      return { kind: "append-reasoning", text: event.text };
+      return { kind: "append-reasoning", messageId: event.messageId, text: event.text };
     case "tool.call":
-      return { kind: "tool-call", callId: event.callId, name: event.name, args: event.args };
+      return {
+        kind: "tool-call",
+        messageId: event.messageId,
+        callId: event.callId,
+        name: event.name,
+        args: event.args,
+      };
     case "tool.approval":
       return { kind: "tool-approval", callId: event.callId, status: event.status };
     case "tool.result":
-      return { kind: "tool-result", callId: event.callId, result: textOf(event.parts), isError: event.isError };
+      return {
+        kind: "tool-result",
+        callId: event.callId,
+        result: textOf(event.parts),
+        isError: event.isError,
+      };
+    case "session.title":
+      return { kind: "session-title", sessionId: event.sessionId, title: event.title };
     case "error":
       return { kind: "error", message: event.error.message };
     case "warning":
@@ -208,56 +266,49 @@ export function readEvent(event: KernelEvent): ChatEffect {
   }
 }
 
-/** Apply one effect to the in-flight assistant message. */
-export function applyEffect(
-  streaming: UiMessage | null,
-  effect: ChatEffect,
-): UiMessage | null {
+/**
+ * Apply one effect to the list of in-flight messages.
+ *
+ * The list is the whole reason this is not a single-message model: a turn that
+ * calls tools produces an assistant message per iteration, and the earlier ones
+ * hold the tool calls the user needs to see and approve.
+ */
+export function applyEffect(list: UiMessage[], effect: ChatEffect): UiMessage[] {
   switch (effect.kind) {
     case "start-message":
-      return emptyAssistant(effect.id);
+      return [...list, emptyAssistant(effect.id)];
     case "append-text":
-      return streaming ? { ...streaming, text: streaming.text + effect.text } : streaming;
+      return patchMessage(list, effect.messageId, (m) => ({ ...m, text: m.text + effect.text }));
     case "append-reasoning":
-      return streaming ? { ...streaming, reasoning: streaming.reasoning + effect.text } : streaming;
+      return patchMessage(list, effect.messageId, (m) => ({
+        ...m,
+        reasoning: m.reasoning + effect.text,
+      }));
     case "tool-call":
-      return streaming
-        ? {
-            ...streaming,
-            tools: [
-              ...streaming.tools,
-              {
-                callId: effect.callId,
-                name: effect.name,
-                args: effect.args,
-                approval: null,
-                running: true,
-              },
-            ],
-          }
-        : streaming;
+      return patchMessage(list, effect.messageId, (m) => ({
+        ...m,
+        tools: [
+          ...m.tools,
+          {
+            callId: effect.callId,
+            name: effect.name,
+            args: effect.args,
+            approval: null,
+            running: true,
+          },
+        ],
+      }));
     case "tool-approval":
-      return streaming
-        ? {
-            ...streaming,
-            tools: streaming.tools.map((t) =>
-              t.callId === effect.callId ? { ...t, approval: effect.status } : t,
-            ),
-          }
-        : streaming;
+      return patchTool(list, effect.callId, (t) => ({ ...t, approval: effect.status }));
     case "tool-result":
-      return streaming
-        ? {
-            ...streaming,
-            tools: streaming.tools.map((t) =>
-              t.callId === effect.callId
-                ? { ...t, running: false, isError: effect.isError, result: effect.result }
-                : t,
-            ),
-          }
-        : streaming;
+      return patchTool(list, effect.callId, (t) => ({
+        ...t,
+        running: false,
+        isError: effect.isError,
+        result: effect.result,
+      }));
     default:
-      return streaming;
+      return list;
   }
 }
 

@@ -34,16 +34,21 @@ import { createOpenRouterPlugin } from "@hat/provider-openrouter";
 import type { SessionRecord } from "@hat/store-sqlite";
 import { Store } from "@hat/store-sqlite";
 import { createShellPlugin } from "@hat/tool-shell";
+import { createBrowserPlugin } from "@hat/tool-browser";
+import { createWebSearchPlugin } from "@hat/tool-websearch";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
+import crypto from "node:crypto";
 import { ApprovalManager } from "./approvals.js";
 import type { ServerConfig } from "./config.js";
 import { createFakePlugin } from "./fake-provider.js";
 import { RunnerRegistry } from "./link.js";
 import { createAuditLog, createLogger } from "./logger.js";
 import { KEEPALIVE, kernelStream } from "./sse.js";
+import { generateTitle } from "./title.js";
+import { TurnHub, type Turn } from "./turns.js";
 import { loadExternalPlugins } from "./plugin-loader.js";
 
 export interface ServerRuntime {
@@ -74,7 +79,48 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   const providers = new ProviderRegistry();
   const tools = new ToolRegistry();
-  const registry = new RunnerRegistry(logger, config.enrollToken);
+
+  /**
+   * stdio MCP servers live on the runner, so the plugin is wired when a runner
+   * is present. A runner joining (re)spawns them; one leaving does *not*
+   * unregister the tools, because that would pull them out of the model's tool
+   * list mid-turn — the plugin reports the outage per call instead.
+   *
+   * Runners flap (reconnecting on every command), and PluginHost activation is
+   * not reentrant, so the work is chained rather than fired concurrently.
+   */
+  const runnerAwarePlugins = ["mcp"];
+  let runnerSync: Promise<void> = Promise.resolve();
+  const syncRunnerPlugins = (): void => {
+    runnerSync = runnerSync
+      .then(async () => {
+        const available = registry.list().length > 0;
+        for (const id of runnerAwarePlugins) {
+          const descriptor = pluginHost.get(id);
+          if (!descriptor?.enabled) continue;
+          if (available) {
+            // Always cycle: an already-active plugin is holding stdio
+            // processes that died with the previous runner.
+            logger.info(`runner available; (re)connecting plugin ${id}`);
+            await pluginHost.deactivate(id);
+            await pluginHost.activate(id);
+          } else {
+            continue;
+          }
+          const after = pluginHost.get(id);
+          logger.info(
+            `plugin ${id}: ${after?.status}${after?.error ? ` (${after.error})` : ""}`,
+          );
+        }
+      })
+      .catch((error) => {
+        logger.error("runner plugin sync failed", normalizeError(error, "runner_sync_failed"));
+      });
+  };
+
+  const registry = new RunnerRegistry(logger, config.enrollToken, () => {
+    syncRunnerPlugins();
+  });
 
   const processHost: ProcessHost = {
     async spawn(request: SpawnRequest) {
@@ -90,6 +136,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     secrets: store,
     logger,
     processHost,
+    runnerAvailable: () => registry.list().length > 0,
     persistence: {
       get: (id) => store.getPluginState(id),
       set: (id, state) => store.setPluginState(id, state),
@@ -101,11 +148,18 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   );
   pluginHost.register(createDeepSeekPlugin());
   pluginHost.register(createShellPlugin());
+  pluginHost.register(createWebSearchPlugin());
+  pluginHost.register(createBrowserPlugin());
   pluginHost.register(createFakePlugin());
   pluginHost.register(createMcpPlugin());
 
-  for (const plugin of await loadExternalPlugins(config.pluginsDir, logger)) {
+  for (const plugin of config.enableExternalPlugins
+    ? await loadExternalPlugins(config.pluginsDir, logger)
+    : []) {
     pluginHost.register(plugin, "external");
+  }
+  if (!config.enableExternalPlugins) {
+    logger.info("external plugins disabled (HAT_ENABLE_EXTERNAL_PLUGINS=false)");
   }
 
   await pluginHost.activateAll();
@@ -115,9 +169,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     }
   }
 
-  const activeTurns = new Map<string, (event: KernelEvent) => void>();
+  const turns = new TurnHub();
   const approvals = new ApprovalManager((sessionId, event) => {
-    activeTurns.get(sessionId)?.(event);
+    turns.emit(sessionId, event);
   });
 
   const resolveHost = async (sessionId: string): Promise<ExecutionHost> => {
@@ -139,6 +193,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     secrets: store,
     audit,
     logger,
+    systemPrompt: config.systemPrompt,
     maxToolIterations: config.maxToolIterations,
     onMessage: (sessionId, message) => store.appendMessage(sessionId, message),
     resolveImage: async (attachmentId) => {
@@ -150,6 +205,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   });
 
   const app = new Hono();
+
+  // Baseline security headers for all responses.
+  app.use("*", async (c, next) => {
+    await next();
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("X-Frame-Options", "DENY");
+    // Only send HSTS when cookies are Secure (i.e. serving over HTTPS).
+    if (config.cookieSecure) c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  });
 
   // Native shells (desktop/mobile) load the UI from their own asset origin and
   // authenticate with a bearer token, so their requests are cross-origin.
@@ -177,10 +242,28 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     maxAge: sessionTtlSeconds,
   };
   const loginLimiter = new RateLimiter(10, 15 * 60_000);
+  const turnLimiter = new RateLimiter(60, 60_000);
+  const uploadLimiter = new RateLimiter(30, 60_000);
+
+  function clientIp(c: Context): string {
+    // Prefer the last forwarded entry (closest proxy) and fall back to direct.
+    // Full proxy-trust needs explicit config; this at least stops trivial
+    // header-rotation bypasses from resetting the login bucket alone.
+    const forwarded = c.req.header("x-forwarded-for");
+    if (forwarded) {
+      const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
+      if (parts.length > 0) return parts[parts.length - 1];
+    }
+    return c.req.header("x-real-ip")?.trim() || "local";
+  }
 
   const bearerAuthed = (c: Context): boolean => {
     const header = c.req.header("authorization");
-    return Boolean(config.authToken && header === `Bearer ${config.authToken}`);
+    if (!config.authToken || !header) return false;
+    const expected = `Bearer ${config.authToken}`;
+    const a = Buffer.from(header);
+    const b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
   };
 
   const isAuthenticated = (c: Context): boolean => {
@@ -203,7 +286,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!config.authPasswordHash) {
       return c.json({ error: "password auth is not configured" }, 400);
     }
-    const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "local";
+    const ip = clientIp(c);
     if (!loginLimiter.allow(ip)) {
       return c.json({ error: "too many attempts; try again later" }, 429);
     }
@@ -238,7 +321,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   app.use("/api/*", async (c, next) => {
     const path = c.req.path;
-    if (path.startsWith("/api/auth/")) return next();
+    // Login + status stay unauthenticated; logout requires session + CSRF
+    // so a cross-site form can't log the user out.
+    if (path === "/api/auth/login" || path === "/api/auth/status") return next();
     if (!authRequired) return next();
     if (bearerAuthed(c)) return next();
 
@@ -275,67 +360,108 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     };
   }
 
-  const streamTurn = (c: Context, options: TurnOptions): Response =>
-    streamSSE(c, async (stream) => {
-      const session = store.getSession(options.sessionId);
-      const queue = new AsyncQueue<KernelEvent>();
-      const controller = new AbortController();
-      activeTurns.set(options.sessionId, (event) => queue.push(event));
-      stream.onAbort(() => {
-        controller.abort();
-        activeTurns.delete(options.sessionId);
-      });
+  /**
+   * Start a turn and return it. The producer is intentionally decoupled from
+   * the HTTP request: closing the connection (refresh, switching chats) only
+   * unsubscribes, it does not cancel the model. Use `cancelTurn` for that.
+   */
+  const runTurn = (options: TurnOptions): Turn => {
+    const session = store.getSession(options.sessionId);
+    const turn = turns.start(options.sessionId);
+    const model = session?.model ?? "fake/fake-agent";
 
-      // Capability check: warn when the model can't do what the conversation
-      // needs (e.g. vision on an image-only turn). The model is never swapped
-      // out from under the user; picking a different one is their decision.
-      const model = session?.model ?? "fake/fake-agent";
-      if (session) {
-        const needs = inferNeeds(options.history);
-        const caps = capabilitiesFor(model);
-        const unmet = caps ? unmetNeeds(caps, needs) : [];
-        if (unmet.length > 0) {
-          queue.push({
-            type: "warning",
-            message: `The selected model does not support ${unmet.join(", ")}. Choose another model.`,
-          });
-        }
+    // Capability check: warn when the model can't do what the conversation
+    // needs (e.g. vision on an image-only turn). The model is never swapped
+    // out from under the user; picking a different one is their decision.
+    if (session) {
+      const needs = inferNeeds(options.history);
+      const caps = capabilitiesFor(model);
+      const unmet = caps ? unmetNeeds(caps, needs) : [];
+      if (unmet.length > 0) {
+        turn.push({
+          type: "warning",
+          message: `The selected model does not support ${unmet.join(", ")}. Choose another model.`,
+        });
       }
+    }
 
-      const producer = (async () => {
-        try {
-          for await (const event of agent.run({
-            sessionId: options.sessionId,
-            history: options.history,
-            model,
-            userText: options.userText,
-            userParts: options.userParts,
-            signal: controller.signal,
-            toolPolicy: session ? policyFor(session) : undefined,
-            reasoningEffort: session?.reasoningEffort,
-          })) {
-            queue.push(event);
-          }
-        } catch (error) {
-          queue.push({ type: "error", error: normalizeError(error, "turn_error") });
-        } finally {
-          activeTurns.delete(options.sessionId);
-          queue.end();
+    // Title generation runs alongside the turn rather than after it, so the
+    // extra round-trip is usually already paid for by the time the turn
+    // finishes. Only the first user message is worth naming, and only while
+    // the title is still the derived placeholder. It never gates turn.done:
+    // a slow titling model must not hold the stream open.
+    const titleModel = config.titleModel ?? model;
+    const titling =
+      session && session.titleSource === "derived" && options.userText?.trim()
+        ? generateTitle({ providers, model: titleModel, subject: options.userText, logger })
+            .then((title) => {
+              if (title && store.setGeneratedTitle(options.sessionId, title)) {
+                turn.push({ type: "session.title", sessionId: options.sessionId, title });
+              }
+            })
+            .catch(() => undefined)
+        : undefined;
+
+    void (async () => {
+      try {
+        for await (const event of agent.run({
+          sessionId: options.sessionId,
+          history: options.history,
+          model,
+          userText: options.userText,
+          userParts: options.userParts,
+          signal: turn.signal,
+          toolPolicy: session ? policyFor(session) : undefined,
+          reasoningEffort: session?.reasoningEffort,
+        })) {
+          turn.push(event);
         }
-      })();
+      } catch (error) {
+        turn.push({ type: "error", error: normalizeError(error, "turn_error") });
+      } finally {
+        turns.finish(turn);
+      }
+    })();
+
+    return turn;
+  };
+
+  /** Stream one turn to one client. Disconnecting leaves the turn running. */
+  const serveTurn = (c: Context, turn: Turn): Response =>
+    streamSSE(c, async (stream) => {
+      const queue = new AsyncQueue<KernelEvent>();
+      let live = true;
+      const unsubscribe = turn.subscribe({
+        onEvent: (event) => queue.push(event),
+        onEnd: () => queue.end(),
+      });
+      stream.onAbort(() => {
+        live = false;
+        unsubscribe();
+        queue.end();
+      });
 
       try {
         for await (const item of kernelStream(queue, config.sseKeepaliveMs)) {
-          if (item === KEEPALIVE) {
-            await stream.write(": keepalive\n\n");
-            continue;
+          if (!live) break;
+          try {
+            if (item === KEEPALIVE) {
+              await stream.write(": keepalive\n\n");
+            } else {
+              await stream.writeSSE({ event: "kernel", data: JSON.stringify(item) });
+            }
+          } catch {
+            live = false;
+            break;
           }
-          await stream.writeSSE({ event: "kernel", data: JSON.stringify(item) });
         }
       } finally {
-        await producer;
+        unsubscribe();
       }
     });
+
+  const streamTurn = (c: Context, options: TurnOptions): Response =>
+    serveTurn(c, runTurn(options));
 
   const pathOf = (sessionId: string) => store.getPath(sessionId);
 
@@ -365,7 +491,17 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- attachments --------------------------------------------------------
 
+  const ALLOWED_UPLOAD_MIME = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+  ]);
+
   app.post("/api/attachments", async (c) => {
+    if (!uploadLimiter.allow(clientIp(c))) {
+      return c.json({ error: "too many uploads; try again later" }, 429);
+    }
     const form = await c.req.formData().catch(() => null);
     if (!form) return c.json({ error: "expected multipart/form-data" }, 400);
     const file = form.get("file");
@@ -374,6 +510,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
     const buffer = Buffer.from(await file.arrayBuffer());
     const mime = file.type || "application/octet-stream";
+    if (!ALLOWED_UPLOAD_MIME.has(mime)) {
+      return c.json({ error: "only PNG, JPEG, GIF, WebP images are supported" }, 415);
+    }
     const record = await store.putAttachment(buffer, mime);
     const storeUrl = await store.attachmentUrl(record.id);
     return c.json({
@@ -389,6 +528,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.body(new Uint8Array(data), 200, {
       "content-type": record.mime,
       "cache-control": "public, max-age=31536000, immutable",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "sandbox",
     });
   });
 
@@ -539,6 +680,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   app.post("/api/sessions/:id/turn", async (c) => {
     const session = store.getSession(c.req.param("id"));
     if (!session) return c.json({ error: "not found" }, 404);
+    if (!turnLimiter.allow(`${clientIp(c)}:${session.id}`)) {
+      return c.json({ error: "too many turns; slow down" }, 429);
+    }
     let body: { text?: string; model?: string; attachmentIds?: unknown } = {};
     try {
       body = await c.req.json();
@@ -623,6 +767,26 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     });
   });
 
+  /**
+   * Follow the turn already running for a session, replaying its pending tail.
+   * 204 when nothing is running, so the client can call it unconditionally on
+   * opening or restoring a conversation.
+   */
+  app.get("/api/sessions/:id/stream", (c) => {
+    const session = store.getSession(c.req.param("id"));
+    if (!session) return c.json({ error: "not found" }, 404);
+    const turn = turns.get(session.id);
+    if (!turn || turn.done) return c.body(null, 204);
+    return serveTurn(c, turn);
+  });
+
+  /** Explicitly cancel the running turn (the Stop button). */
+  app.post("/api/sessions/:id/turn/cancel", (c) => {
+    const turn = turns.get(c.req.param("id"));
+    turn?.abort.abort();
+    return c.json({ ok: Boolean(turn) });
+  });
+
   /** Switch which sibling branch is active. */
   app.post("/api/sessions/:id/select", async (c) => {
     const session = store.getSession(c.req.param("id"));
@@ -643,7 +807,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   // ---- approvals ----------------------------------------------------------
 
   app.post("/api/approvals/:callId", async (c) => {
-    let body: { decision?: ApprovalDecision } = {};
+    let body: { decision?: ApprovalDecision; sessionId?: string } = {};
     try {
       body = await c.req.json();
     } catch {
@@ -653,7 +817,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (decision !== "approve" && decision !== "deny" && decision !== "approve_always") {
       return c.json({ error: "invalid decision" }, 400);
     }
-    const ok = approvals.resolve(c.req.param("callId"), decision);
+    const ok = approvals.resolve(c.req.param("callId"), decision, body.sessionId);
     return c.json({ ok });
   });
 

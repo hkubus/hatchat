@@ -6,7 +6,7 @@
  * transcript is unusable — you would be re-focusing it after every reply.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -21,6 +21,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
 import { usageTotal } from "@hat/core";
+import { isAcceptedImageType } from "../api";
 import { capSummary, capTags } from "../capTags";
 import { useTheme } from "../theme";
 import { formatTokens, usageDetail } from "../tokens";
@@ -44,9 +45,13 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
 
-  // The streaming message is appended after the stored ones, so the list needs
-  // one extra row for it.
-  const data = chat.streaming ? [...chat.messages, chat.streaming] : chat.messages;
+  // In-flight messages sit after the stored ones. There is more than one when
+  // the turn called tools: the model emits a separate assistant message per
+  // iteration, and each holds the tool calls made in it.
+  const data = useMemo(
+    () => [...chat.messages, ...chat.inFlight],
+    [chat.messages, chat.inFlight],
+  );
 
   const scrollToEnd = useCallback(() => {
     listRef.current?.scrollToEnd({ animated: true });
@@ -56,7 +61,7 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
     // Follow the stream only while the reader is already at the bottom, so
     // scrolling up to re-read something is not fought by every delta.
     if (stickToBottom.current) listRef.current?.scrollToEnd({ animated: false });
-  }, [chat.messages, chat.streaming]);
+  }, [chat.messages, chat.inFlight]);
 
   const onScroll = useCallback((event: { nativeEvent: { contentOffset: { y: number }; contentSize: { height: number }; layoutMeasurement: { height: number } } }) => {
     const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
@@ -78,19 +83,37 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
         quality: 0.9,
       });
       if (result.canceled) return;
-      setAttachments((prev) => [
-        ...prev,
-        ...result.assets.map((asset) => ({
-          uri: asset.uri,
-          name: asset.fileName ?? `image-${Date.now()}.jpg`,
-          type: asset.mimeType ?? "image/jpeg",
-          previewUri: asset.uri,
-        })),
-      ]);
+
+      // Most camera-roll photos on iOS come back as HEIC, which the server
+      // rejects: it reads dimensions from the file header and only parses
+      // PNG/JPEG/GIF/WebP. Saying so here, before the upload, is far kinder than
+      // a 415 after the user has composed a message.
+      const rejected = result.assets.filter((a) => !isAcceptedImageType(a.mimeType));
+      const usable = result.assets.filter((a) => isAcceptedImageType(a.mimeType));
+
+      if (rejected.length > 0) {
+        chat.reportError(
+          rejected.length === result.assets.length
+            ? `The server only accepts PNG, JPEG, GIF, and WebP. ${rejected.length === 1 ? "That image is" : "Those images are"} a format it cannot read — re-share as JPEG from the Photos app.`
+            : `Skipped ${rejected.length} image${rejected.length === 1 ? "" : "s"} in an unsupported format. The server accepts PNG, JPEG, GIF, and WebP.`,
+        );
+      }
+
+      if (usable.length > 0) {
+        setAttachments((prev) => [
+          ...prev,
+          ...usable.map((asset) => ({
+            uri: asset.uri,
+            name: asset.fileName ?? `image-${Date.now()}.jpg`,
+            type: asset.mimeType ?? "image/jpeg",
+            previewUri: asset.uri,
+          })),
+        ]);
+      }
     } finally {
       setPicking(false);
     }
-  }, []);
+  }, [chat.reportError]);
 
   const submit = useCallback(async () => {
     const body = text.trim();

@@ -137,7 +137,10 @@ export interface MessageRowProps {
   streaming: boolean;
   onRegenerate: (messageId: string) => void;
   onEdit: (messageId: string) => void;
-  /** Called with the sibling id to switch to, resolved from the row's branch. */
+  /**
+   * Called with the sibling id to switch to. The id is resolved by the caller
+   * from the row's own branch data, since the row only knows the index.
+   */
   onSwitchBranch: (siblingId: string) => void;
   onDecide: (callId: string, decision: "approve" | "deny") => void;
   busy: boolean;

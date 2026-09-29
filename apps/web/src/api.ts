@@ -319,33 +319,26 @@ export async function deleteSession(id: string): Promise<void> {
 export async function resolveApproval(
   callId: string,
   decision: "approve" | "deny" | "approve_always",
+  sessionId?: string,
 ): Promise<void> {
-  await authFetch(`/api/approvals/${encodeURIComponent(callId)}`, {
+  const res = await authFetch(`/api/approvals/${encodeURIComponent(callId)}`, {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify({ decision, sessionId }),
   });
+  if (!res.ok) throw new HttpError(res.status, `/api/approvals/${callId}`);
 }
 
 /**
- * Consume a kernel SSE endpoint. Aborting `signal` tears the request down from
- * the client side; the server turns that into a real `AbortController.abort()`
- * for the turn, so a runaway generation or a hung tool stops promptly instead
- * of only being hidden.
+ * Consume a kernel SSE response. Aborting `signal` tears the request down from
+ * the client side; the server keeps the turn running, so aborting only detaches
+ * this viewer (cancelling a turn is a separate, explicit request).
  */
-async function postSSE(
-  url: string,
-  body: unknown,
+async function readSSE(
+  res: Response,
   onEvent: (event: KernelEvent) => void,
-  signal?: AbortSignal,
 ): Promise<void> {
-  const res = await authFetch(url, {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new HttpError(res.status, url);
+  if (!res.ok || !res.body) throw new HttpError(res.status, res.url);
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -373,6 +366,48 @@ async function postSSE(
     // Also runs on abort, which errors the pending read and releases the socket.
     await reader.cancel().catch(() => undefined);
   }
+}
+
+async function postSSE(
+  url: string,
+  body: unknown,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await authFetch(url, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(body),
+    signal,
+  });
+  return readSSE(res, onEvent);
+}
+
+/**
+ * Follow a turn already running for a session — used on refresh and when
+ * switching back to a conversation. Resolves `false` when nothing is running
+ * (HTTP 204), otherwise streams until the turn ends.
+ */
+export async function followTurn(
+  sessionId: string,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const res = await authFetch(`/api/sessions/${encodeURIComponent(sessionId)}/stream`, {
+    headers: { accept: "text/event-stream" },
+    signal,
+  });
+  if (res.status === 204) return false;
+  await readSSE(res, onEvent);
+  return true;
+}
+
+/** Explicitly cancel the running turn for a session (the Stop button). */
+export async function cancelTurn(sessionId: string): Promise<void> {
+  await authFetch(`/api/sessions/${encodeURIComponent(sessionId)}/turn/cancel`, {
+    method: "POST",
+    headers: jsonHeaders(),
+  });
 }
 
 export function sendTurn(

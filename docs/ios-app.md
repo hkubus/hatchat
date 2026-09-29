@@ -142,12 +142,30 @@ invariants from the web client are load-bearing and preserved:
   stored usage into `messages`. Clearing it earlier counts the same tokens
   twice.
 - **A turn always ends in a refresh.** The streamed view is an optimistic
-  projection; the server's path is the truth. That is what makes abort,
-  mid-turn failure, and multi-iteration tool loops land somewhere correct.
+  projection; the server's path is the truth. Streamed messages are promoted
+  into `messages` *before* the refetch, so the refetch is a reconciliation that
+  cannot blank the last deltas — and if it fails outright, what streamed in
+  stays on screen.
 
-`message.start` fires once per *tool iteration*, not once per turn, so a
-multi-iteration turn restarts the assistant message. The earlier tool-only
-iterations are dropped from the live view and recovered by the refresh.
+`message.start` fires once per *model iteration*, not once per turn, so the
+in-flight state is a **list**. A turn that calls tools produces several
+assistant messages and each keeps the tool cards for the calls made in it.
+
+### Turns outlive their connection
+
+The server lets a turn keep running when the client disconnects, so the client
+has to distinguish two different things that used to be the same request:
+
+- **Stop** posts `/turn/cancel`, then drops the socket. Aborting alone would
+  just stop the updates while the model kept generating and billing with nobody
+  watching.
+- **Leaving** (switching conversations, backgrounding) only detaches. The turn
+  carries on, and coming back reattaches via `GET /stream`.
+
+This is what makes the app survive iOS. The system suspends backgrounded apps
+freely, so on a phone a turn outliving its connection is the common case rather
+than the exception — the app reattaches on boot, on opening a conversation, and
+on returning to the foreground (`AppState`).
 
 ### Attachments
 
@@ -155,6 +173,13 @@ iterations are dropped from the live view and recovered by the refresh.
 attachments are downloaded as data URLs and handed to `<Image>` directly. The
 server caps uploads at 25 MiB, and `fetchAttachmentBase64` encodes in 8 KB
 chunks to stay under Hermes' `String.fromCharCode` argument limit.
+
+The server only accepts **PNG, JPEG, GIF, and WebP** — it reads image dimensions
+from the file header with no native image dependency, so an unrecognised format
+comes back as a 415 rather than being stored unreadable. That matters on iOS
+specifically: `expo-image-picker` returns HEIC for most camera-roll photos. The
+picker filters against `isAcceptedImageType` and says so before the upload,
+rather than failing with a 415 after the user has composed a message.
 
 ## Liquid Glass
 
@@ -228,12 +253,21 @@ for that, terminate TLS in front of the server (Caddy, Traefik, or a Tailscale
 HTTPS certificate) rather than adding `NSAllowsArbitraryLoads`, which disables
 the protection app-wide.
 
-## Not done
+## Known gaps
 
-- Push notifications (needs a paid team).
-- Offline / queued turns. A turn needs a live stream; there is no retry.
-- Expo Router with native tabs (see the tab bar note above).
-- Syntax highlighting in the transcript. `highlight.js` is ~1 MB of grammars,
-  which is not worth the bundle on a phone; fenced blocks get a monospace
-  surface instead.
-- Android and web are configured but unverified; only iOS was built.
+- **Push notifications** (needs a paid team) — so a turn that finishes while the
+  app is suspended is noticed only on next foreground, not as a notification.
+- **Offline / queued turns.** A turn needs a live stream, and the app has no
+  retry: a send that fails on a dead connection surfaces as an error rather than
+  being queued.
+- **Expo Router with native tabs**, for the system Liquid Glass tab bar (see
+  above). The JS tab bar wraps the native module, so it is translucent, but it
+  is not the system control.
+- **Syntax highlighting** in the transcript. `highlight.js` is ~1 MB of
+  grammars, which is not worth the bundle on a phone; fenced blocks get a
+  monospace surface instead.
+- **Android and web** are configured but unverified; only iOS was bundled.
+- **No device has run this.** Everything here has been typechecked, unit-tested,
+  and bundled, and the server contract is verified against `packages/server`
+  by hand — but no simulator or hardware pass has been done, so the Liquid Glass
+  path in particular is compile-time-guarded and unexercised.

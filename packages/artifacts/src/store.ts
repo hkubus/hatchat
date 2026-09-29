@@ -14,6 +14,14 @@ export interface ArtifactStore {
   url(key: string): Promise<string | undefined>;
 }
 
+function assertKey(key: string): void {
+  // Keys are internal (content hashes); reject traversal/separators so
+  // path.join can't escape the store dir if a caller ever passes user input.
+  if (!key || key.includes("..") || key.includes("/") || key.includes("\\") || key.includes("\0")) {
+    throw new Error(`invalid artifact key`);
+  }
+}
+
 export class LocalArtifactStore implements ArtifactStore {
   readonly kind = "local" as const;
 
@@ -22,10 +30,12 @@ export class LocalArtifactStore implements ArtifactStore {
   }
 
   async put(key: string, data: Buffer, _contentType: string): Promise<void> {
+    assertKey(key);
     fs.writeFileSync(path.join(this.dir, key), data);
   }
 
   async get(key: string): Promise<Buffer | undefined> {
+    assertKey(key);
     const file = path.join(this.dir, key);
     return fs.existsSync(file) ? fs.readFileSync(file) : undefined;
   }
@@ -55,9 +65,14 @@ export class S3ArtifactStore implements ArtifactStore {
   constructor(private readonly options: S3StoreOptions) {
     this.endpoint =
       options.endpoint?.replace(/\/$/, "") ?? `https://s3.${options.region}.amazonaws.com`;
+    if (!this.endpoint.startsWith("https://") && !this.endpoint.startsWith("http://localhost")) {
+      throw new Error("S3 endpoint must be https (http allowed only for localhost testing)");
+    }
     this.pathStyle = options.pathStyle ?? true;
     this.prefix = options.prefix?.replace(/\/$/, "") ?? "";
-    this.urlExpires = options.urlExpiresSeconds ?? 3600;
+    // Clamp: presigned URLs are bearer creds, AWS max is 7 days.
+    const requested = options.urlExpiresSeconds ?? 900;
+    this.urlExpires = Math.min(604800, Math.max(60, requested));
     this.fetchImpl = options.fetch ?? globalThis.fetch;
   }
 

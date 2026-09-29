@@ -10,7 +10,7 @@
       "outputs": ["dist/**"]
     },
     "test": {
-      "cache": false,
+      "inputs": ["src/**/*.ts", "package.json"],
       "outputs": []
     },
     "dev": {

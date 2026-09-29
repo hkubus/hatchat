@@ -31,12 +31,18 @@ export function decryptSecret(record: EncryptedSecret, key: Buffer): string {
   ]).toString("utf8");
 }
 
-/** Accept a 64-char hex key, a base64 32-byte key, or derive from a passphrase. */
+/** Accept a 64-char hex key or a base64 32-byte key. Weak passphrases are rejected. */
 export function parseKey(raw: string): Buffer {
   const trimmed = raw.trim();
   if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return Buffer.from(trimmed, "hex");
   const decoded = Buffer.from(trimmed, "base64");
-  if (decoded.length === KEY_BYTES) return decoded;
+  if (decoded.length === KEY_BYTES && trimmed.length >= 40) return decoded;
+  if (trimmed.length < 8) {
+    throw new Error(
+      "HAT_MASTER_KEY too weak: use 64-char hex or base64 32-byte key (generate with `openssl rand -hex 32`)",
+    );
+  }
+  console.warn("[hat] HAT_MASTER_KEY is a passphrase, deriving via sha256 — prefer a 64-char hex key");
   return crypto.createHash("sha256").update(trimmed).digest();
 }
 

@@ -139,15 +139,19 @@ test("readEvent maps every event the turn stream emits", () => {
     ],
     [
       { type: "text.delta", messageId: "m1", text: "hi" },
-      { kind: "append-text", text: "hi" },
+      { kind: "append-text", messageId: "m1", text: "hi" },
     ],
     [
       { type: "reasoning.delta", messageId: "m1", text: "why" },
-      { kind: "append-reasoning", text: "why" },
+      { kind: "append-reasoning", messageId: "m1", text: "why" },
     ],
     [
       { type: "tool.call", messageId: "m1", callId: "c1", name: "shell_exec", args: { command: "ls" } },
-      { kind: "tool-call", callId: "c1", name: "shell_exec", args: { command: "ls" } },
+      { kind: "tool-call", messageId: "m1", callId: "c1", name: "shell_exec", args: { command: "ls" } },
+    ],
+    [
+      { type: "session.title", sessionId: "sess_1", title: "Fix the parser" },
+      { kind: "session-title", sessionId: "sess_1", title: "Fix the parser" },
     ],
     [
       { type: "tool.approval", callId: "c1", status: "requested" },
@@ -177,19 +181,27 @@ test("readEvent treats the non-visual events as no-ops", () => {
 });
 
 test("a full turn folds into one assistant message", () => {
-  let streaming: UiMessage | null = emptyAssistant("m1");
+  let inFlight: UiMessage[] = [];
   const events: KernelEvent[] = [
+    { type: "message.start", messageId: "m1", role: "assistant" },
     { type: "text.delta", messageId: "m1", text: "Hello" },
     { type: "text.delta", messageId: "m1", text: " world" },
-    { type: "tool.call", messageId: "m1", callId: "c1", name: "shell_exec", args: { command: "ls" } },
+    {
+      type: "tool.call",
+      messageId: "m1",
+      callId: "c1",
+      name: "shell_exec",
+      args: { command: "ls" },
+    },
     { type: "tool.approval", callId: "c1", status: "requested" },
     { type: "tool.result", callId: "c1", name: "shell_exec", parts: [text("a.txt")], isError: false },
     { type: "message.done", messageId: "m1", finishReason: "tool_calls" },
   ];
-  for (const event of events) streaming = applyEffect(streaming, readEvent(event));
+  for (const event of events) inFlight = applyEffect(inFlight, readEvent(event));
 
-  assert.equal(streaming?.text, "Hello world");
-  assert.deepEqual(streaming?.tools, [
+  assert.equal(inFlight.length, 1);
+  assert.equal(inFlight[0].text, "Hello world");
+  assert.deepEqual(inFlight[0].tools, [
     {
       callId: "c1",
       name: "shell_exec",
@@ -202,38 +214,86 @@ test("a full turn folds into one assistant message", () => {
   ]);
 });
 
-test("a second tool iteration replaces the live message", () => {
-  // The agent emits message.start once per iteration, so an earlier
-  // tool-only message is superseded rather than appended to.
-  let streaming: UiMessage | null = emptyAssistant("m1");
-  streaming = applyEffect(streaming, {
-    kind: "tool-call",
-    callId: "c1",
-    name: "shell_exec",
-    args: {},
-  });
-  streaming = applyEffect(streaming, { kind: "start-message", id: "m2" });
-  streaming = applyEffect(streaming, { kind: "append-text", text: "done" });
+test("a tool-using turn keeps every iteration's message on screen", () => {
+  // The agent emits message.start once per *model iteration*, not once per
+  // turn. Each is a distinct assistant message holding the tool calls made in
+  // it, so the earlier ones must survive — they are the only record of what
+  // ran while the model was still working.
+  let inFlight: UiMessage[] = [];
+  const events: KernelEvent[] = [
+    { type: "message.start", messageId: "m1", role: "assistant" },
+    { type: "tool.call", messageId: "m1", callId: "c1", name: "shell_exec", args: {} },
+    { type: "tool.result", callId: "c1", name: "shell_exec", parts: [text("a")], isError: false },
+    { type: "message.done", messageId: "m1", finishReason: "tool_calls" },
+    // Second iteration: the model sees the result and answers.
+    { type: "message.start", messageId: "m2", role: "assistant" },
+    { type: "text.delta", messageId: "m2", text: "found a" },
+    { type: "message.done", messageId: "m2", finishReason: "stop" },
+  ];
+  for (const event of events) inFlight = applyEffect(inFlight, readEvent(event));
 
-  assert.equal(streaming?.id, "m2");
-  assert.equal(streaming?.text, "done");
-  assert.deepEqual(streaming?.tools, [], "the superseded iteration's tools are dropped");
+  assert.deepEqual(
+    inFlight.map((m) => m.id),
+    ["m1", "m2"],
+  );
+  assert.equal(inFlight[0].tools[0].result, "a", "the first iteration's tool is still shown");
+  assert.equal(inFlight[1].text, "found a");
+  assert.deepEqual(inFlight[1].tools, [], "tool cards stay with the message that made them");
 });
 
-test("deltas before any message.start are ignored rather than crashing", () => {
-  assert.equal(applyEffect(null, { kind: "append-text", text: "x" }), null);
-  assert.equal(applyEffect(null, { kind: "tool-call", callId: "c", name: "n", args: {} }), null);
+test("tool events with no message id attach to the message that called them", () => {
+  // tool.approval and tool.result carry no messageId, so the callId is the only
+  // handle — and a call must never leak onto a later iteration's card.
+  let inFlight: UiMessage[] = [];
+  const events: KernelEvent[] = [
+    { type: "message.start", messageId: "m1", role: "assistant" },
+    { type: "tool.call", messageId: "m1", callId: "c1", name: "shell_exec", args: {} },
+    { type: "message.start", messageId: "m2", role: "assistant" },
+    { type: "tool.call", messageId: "m2", callId: "c2", name: "shell_exec", args: {} },
+  ];
+  for (const event of events) inFlight = applyEffect(inFlight, readEvent(event));
+
+  inFlight = applyEffect(inFlight, readEvent({ type: "tool.result", callId: "c1", name: "shell_exec", parts: [text("only c1")], isError: false }));
+
+  assert.equal(inFlight[0].tools[0].result, "only c1");
+  assert.equal(inFlight[0].tools[0].running, false);
+  assert.equal(inFlight[1].tools[0].result, undefined, "c2 is untouched");
+  assert.equal(inFlight[1].tools[0].running, true);
+});
+
+test("a delta for an unknown message id lands on the newest one", () => {
+  // Better than dropping the text: a reattached stream can replay a tail that
+  // starts mid-message, with no message.start in sight.
+  let inFlight: UiMessage[] = [emptyAssistant("m1")];
+  inFlight = applyEffect(inFlight, { kind: "append-text", messageId: "m_unknown", text: "tail" });
+  assert.equal(inFlight[0].text, "tail");
+});
+
+test("events before any message.start are ignored rather than crashing", () => {
+  assert.deepEqual(applyEffect([], { kind: "append-text", messageId: "m1", text: "x" }), []);
+  assert.deepEqual(
+    applyEffect([], { kind: "tool-call", messageId: "m1", callId: "c", name: "n", args: {} }),
+    [],
+  );
+  assert.deepEqual(applyEffect([], { kind: "append-text", messageId: "m1", text: "x" }), []);
 });
 
 test("an approval for an unknown callId leaves the cards alone", () => {
-  let streaming: UiMessage | null = emptyAssistant("m1");
-  streaming = applyEffect(streaming, { kind: "tool-call", callId: "c1", name: "n", args: {} });
-  streaming = applyEffect(streaming, {
-    kind: "tool-approval",
-    callId: "other",
-    status: "approved",
-  });
-  assert.equal(streaming?.tools[0].approval, null);
+  let inFlight: UiMessage[] = [];
+  const events: KernelEvent[] = [
+    { type: "message.start", messageId: "m1", role: "assistant" },
+    { type: "tool.call", messageId: "m1", callId: "c1", name: "n", args: {} },
+  ];
+  for (const event of events) inFlight = applyEffect(inFlight, readEvent(event));
+  inFlight = applyEffect(inFlight, { kind: "tool-approval", callId: "other", status: "approved" });
+  assert.equal(inFlight[0].tools[0].approval, null);
+});
+
+test("session.title is surfaced so a new conversation names itself live", () => {
+  assert.deepEqual(
+    readEvent({ type: "session.title", sessionId: "sess_1", title: "Fix the parser" }),
+    { kind: "session-title", sessionId: "sess_1", title: "Fix the parser" },
+  );
 });
 
 // --- toolSummary -----------------------------------------------------------

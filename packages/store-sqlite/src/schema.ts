@@ -4,9 +4,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   title TEXT NOT NULL,
   model TEXT NOT NULL,
   active_leaf_id TEXT,
-  approval_mode TEXT NOT NULL DEFAULT 'ask',
+  approval_mode TEXT NOT NULL DEFAULT 'auto',
   allowed_tools TEXT NOT NULL DEFAULT '[]',
-  reasoning_effort TEXT NOT NULL DEFAULT 'off',
+  reasoning_effort TEXT NOT NULL DEFAULT 'low',
+  title_source TEXT NOT NULL DEFAULT 'derived',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

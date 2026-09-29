@@ -58,6 +58,13 @@ export type ApprovalMode = "ask" | "auto" | "allowlist" | "deny";
 export interface SessionRecord {
   id: string;
   title: string;
+  /**
+   * Who owns the title. `derived` is the truncated first user message and the
+   * server will overwrite it with a generated one; `user` and `model` are
+   * final. Not needed to render anything — kept so a rename knows whether it
+   * can be undone by a generated title.
+   */
+  titleSource?: "derived" | "user" | "model";
   model: string;
   activeLeafId: string | null;
   approvalMode: ApprovalMode;
@@ -297,11 +304,39 @@ export type ApprovalDecision = "approve" | "approve_always" | "deny";
 export async function resolveApproval(
   callId: string,
   decision: ApprovalDecision,
+  sessionId: string,
 ): Promise<void> {
-  await sendJson(`/api/approvals/${encodeURIComponent(callId)}`, "POST", { decision });
+  const res = await authFetch(`/api/approvals/${encodeURIComponent(callId)}`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    // The server binds an approval to the session that asked for it, so a
+    // stale card cannot approve another conversation's call by guessing the id.
+    body: JSON.stringify({ decision, sessionId }),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/approvals/${callId}`);
 }
 
 // --- Attachments -----------------------------------------------------------
+
+/**
+ * The image types the server accepts. It reads dimensions from the file header
+ * with no native image dependency, so it only accepts what it can parse — and
+ * an unrecognised type comes back as a 415 rather than being stored unreadable.
+ *
+ * This matters on iOS specifically: `expo-image-picker` hands back HEIC for
+ * most camera-roll photos, which is not on this list.
+ */
+export const ACCEPTED_IMAGE_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+] as const;
+
+/** True when the server will take this type. */
+export function isAcceptedImageType(type: string | undefined): boolean {
+  return ACCEPTED_IMAGE_TYPES.includes((type ?? "") as (typeof ACCEPTED_IMAGE_TYPES)[number]);
+}
 
 /**
  * Upload an image picked on-device. The server reads the bytes, dedupes them by
@@ -316,10 +351,18 @@ export async function uploadAttachment(file: {
   name: string;
   type: string;
 }): Promise<AttachmentRecord> {
+  if (!isAcceptedImageType(file.type)) {
+    // Caught here rather than as a 415 round trip, so the message can say what
+    // to do about it.
+    throw new Error(
+      `${file.name} is ${file.type || "an unrecognised type"}. The server accepts PNG, JPEG, GIF, and WebP — re-share the photo as JPEG.`,
+    );
+  }
   const form = new FormData();
   form.append("file", file as unknown as Blob);
   const res = await authFetch("/api/attachments", { method: "POST", body: form });
-  if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+  if (res.status === 415) throw new Error("The server rejected that image format.");
+  if (!res.ok) throw new HttpError(res.status, "/api/attachments");
   return (await res.json()).attachment as AttachmentRecord;
 }
 
@@ -352,29 +395,21 @@ function base64FromBytes(bytes: Uint8Array): string {
 // --- Streaming turns -------------------------------------------------------
 
 /**
- * Consume a kernel SSE endpoint.
+ * Consume a kernel SSE response.
  *
  * `expo/fetch` is imported lazily and through a namespace so that a future
  * export without streaming support fails one call site rather than the whole
- * bundle. Aborting `signal` tears the request down from the client side; the
- * server turns that into a real `AbortController.abort()` for the turn, so a
- * runaway generation or a hung tool stops promptly instead of only being hidden.
+ * bundle.
+ *
+ * Aborting `signal` closes the socket, but it does **not** stop the turn: a
+ * turn outlives any one request so it survives a reload or a dropped
+ * connection. Cancelling is a separate, explicit request — see `cancelTurn`.
  */
-async function postSSE(
-  path: string,
-  body: unknown,
+async function readSSE(
+  res: Response,
   onEvent: (event: KernelEvent) => void,
-  signal?: AbortSignal,
 ): Promise<void> {
-  const { fetch: expoFetch } = await import("expo/fetch");
-  const url = await apiUrl(path);
-  const res = await expoFetch(url, {
-    method: "POST",
-    headers: { ...jsonHeaders(), ...(await bearerHeaders()) },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new HttpError(res.status, url);
+  if (!res.ok || !res.body) throw new HttpError(res.status, res.url);
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -402,6 +437,58 @@ async function postSSE(
     // Also runs on abort, which errors the pending read and releases the socket.
     await reader.cancel().catch(() => undefined);
   }
+}
+
+async function postSSE(
+  path: string,
+  body: unknown,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { fetch: expoFetch } = await import("expo/fetch");
+  const url = await apiUrl(path);
+  const res = await expoFetch(url, {
+    method: "POST",
+    headers: { ...jsonHeaders(), ...(await bearerHeaders()) },
+    body: JSON.stringify(body),
+    signal,
+  });
+  return readSSE(res, onEvent);
+}
+
+/**
+ * Follow a turn already running for a session.
+ *
+ * This is what makes the app survive being backgrounded: iOS suspends timers
+ * and can kill the process while the model is mid-answer, and the turn keeps
+ * running on the server either way. Coming back and reattaching is the
+ * difference between picking the answer up and losing it.
+ *
+ * Resolves `false` when the session is idle (the server answers 204).
+ */
+export async function followTurn(
+  sessionId: string,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const { fetch: expoFetch } = await import("expo/fetch");
+  const url = await apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/stream`);
+  const res = await expoFetch(url, {
+    headers: { accept: "text/event-stream", ...(await bearerHeaders()) },
+    signal,
+  });
+  if (res.status === 204) return false;
+  await readSSE(res, onEvent);
+  return true;
+}
+
+/**
+ * Actually stop a turn — the Stop button. Without this, aborting the request
+ * would only detach this viewer and the model would keep generating (and
+ * billing) with nobody watching.
+ */
+export async function cancelTurn(sessionId: string): Promise<void> {
+  await sendJson(`/api/sessions/${encodeURIComponent(sessionId)}/turn/cancel`, "POST");
 }
 
 export function sendTurn(

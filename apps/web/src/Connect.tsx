@@ -52,7 +52,7 @@ export default function Connect({
   return (
     <div className="login">
       <form className="login-card" onSubmit={(e) => void submit(e)}>
-        <div className="brand">hat</div>
+        <div className="brand">Hat</div>
         <p className="settings-hint">
           Connect to a hat server. Run <code>pnpm dev</code> on the machine that hosts it, then point
           this app at that address.

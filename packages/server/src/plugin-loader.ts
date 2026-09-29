@@ -7,6 +7,11 @@ import type { Logger, Plugin } from "@hat/core";
 export async function loadExternalPlugins(dir: string, logger: Logger): Promise<Plugin[]> {
   const absolute = path.resolve(dir);
   if (!fs.existsSync(absolute)) return [];
+  const stat = fs.statSync(absolute);
+  if (!stat.isDirectory()) {
+    logger.warn(`plugins dir ${absolute} is not a directory, skipping external plugins`);
+    return [];
+  }
 
   const entries = await fs.promises.readdir(absolute, { withFileTypes: true });
   const plugins: Plugin[] = [];
@@ -14,6 +19,12 @@ export async function loadExternalPlugins(dir: string, logger: Logger): Promise<
   for (const entry of entries) {
     if (!entry.isFile() || !/\.(mjs|js)$/.test(entry.name)) continue;
     const file = path.join(absolute, entry.name);
+    // Resolve symlinks and ensure the target stays inside the plugins dir.
+    const real = await fs.promises.realpath(file).catch(() => file);
+    if (!real.startsWith(absolute + path.sep) && real !== file) {
+      logger.warn(`plugin ${entry.name}: escapes plugins dir, skipping`);
+      continue;
+    }
     try {
       const mod = (await import(pathToFileURL(file).href)) as {
         default?: Plugin;

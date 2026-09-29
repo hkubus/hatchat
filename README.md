@@ -132,6 +132,109 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 
 `scripts/fake-mcp-server.mjs` is a minimal stdio server used by the smoke test.
 
+### Runner dependency
+
+A stdio server is spawned **on the runner**, so the `mcp` plugin cannot connect
+one at boot if no runner has dialed in yet. It is wired up automatically as
+runners come and go:
+
+- a runner joining (re)spawns the servers and registers their tools;
+- a runner leaving does **not** unregister the tools. The model has already been
+  handed the tool list, so pulling the tools mid-turn would answer a call with
+  `Unknown tool`. Instead the tool reports that no runner is connected, and
+  works again once one returns.
+
+Only the first arrival and the last departure trigger this, so a runner that
+reconnects under the same id does not churn the tool list.
+
+### Scout
+
+[Scout](../scout) ships its own stdio MCP server, so it needs no MCP work here —
+point the plugin at the built artifact and its 18 read tools appear as
+`mcp__scout__*`. The MCP server runs on the runner and talks to Scout's API over
+HTTP, so the runner needs to reach `scout.internal.gaycats.ovh`.
+
+```sh
+# Build the MCP server once in Scout's checkout (it is not committed).
+cd ../scout && npm run build          # -> dist-mcp/mcp.js
+```
+
+Settings → Plugins → MCP servers:
+
+```json
+[
+  {
+    "name": "scout",
+    "transport": "stdio",
+    "command": "node",
+    "args": ["/root/scout/dist-mcp/mcp.js"],
+    "env": { "SCOUT_API_URL": "http://scout.internal.gaycats.ovh" }
+  }
+]
+```
+
+- `dist-mcp/mcp.js` keeps its bare imports external, so it needs Scout's
+  `node_modules` next to it — it is not a standalone bundle. It also needs
+  Node ≥ 22.5, which is above hat's own `engines.node: ">=20"`.
+- Scout is read-only over MCP unless `SCOUT_MCP_ALLOW_WRITES` is set, which
+  additionally exposes 10 mutating tools. Hat ignores MCP's `readOnlyHint`, so
+  leaving that variable unset is the stronger control.
+- `scout://status` and `scout://dashboard` are MCP *resources*; hat's client
+  implements tools only, so they are not exposed.
+- `search_listings` and the scan tools perform real marketplace scans over the
+  network and can take a couple of minutes (Scout allows 120s per request).
+
+## Web search
+
+The `websearch` plugin adds a `web_search` tool (title, URL, snippet) backed by
+two keyless options, chosen in **Settings → Plugins → Web search**:
+
+- **duckduckgo** (default) — scrapes DuckDuckGo's HTML endpoint; no key or
+  account. It is best-effort, so markup changes can degrade or empty results.
+- **searxng** — set `searxngUrl` to a self-hosted instance with the `json`
+  output format enabled (`search.formats: [json]`).
+
+`maxResults` sets the default result count (the model can pass `limit` per call,
+max 20) and `requireApproval` gates each search (off by default — searches are
+read-only). The search request is made by the **server process** directly, like
+provider calls, so no key or query crosses the runner link.
+
+## System prompt
+
+Every turn is prefixed with a base system prompt that is never stored in
+history. The default (`packages/server/src/prompt.ts`) establishes that hat is a
+**general-purpose assistant** whose tools come from optional plugins — so the
+model does not mistake one connected integration (an MCP server, the shell, a
+search backend, …) for its identity or the point of the conversation. Override
+it verbatim with `HAT_SYSTEM_PROMPT`. Providers that cannot take a system role
+get it merged into the first user message instead.
+
+## Browser
+
+The `browser` plugin adds a `browser` tool backed by headless Chromium
+(Playwright, `playwright-core`). It runs on the **server**, not the runner, and
+keeps one page per conversation, closed after an idle timeout.
+
+| action | what it does | approval |
+|---|---|---|
+| `open` | navigate to `url`; return title, text, links | auto |
+| `read` | re-read the current page | auto |
+| `click` | click `selector` | ask |
+| `type` | fill `selector` with `text` | ask |
+| `press` | press `key` (optionally on `selector`) | ask |
+| `screenshot` | full-page PNG, returned as an image | auto |
+| `back` | history back | auto |
+| `close` | end the session | auto |
+
+`selector` is a Playwright selector, so CSS (`#id`, `button.submit`) and
+text/role selectors (`text=Sign in`, `role=button[name=Next]`) both work.
+
+Config (Settings → Plugins → Browser): `executablePath` (or `HAT_BROWSER_PATH`),
+`headless`, `maxTextChars`, `maxLinks`, `idleTimeoutMs`, `navigationTimeoutMs`,
+and `requireApproval` (override; default asks only for click/type/press). A
+Chromium build is required: the plugin uses the Playwright browser cache by
+default, or point `executablePath` at any Chromium/Chrome binary.
+
 ## Vision + attachments (M4)
 
 Attach images by button, paste, or drag-and-drop. Uploads are content-addressed
@@ -154,7 +257,10 @@ Each conversation has a **tool policy** (editable in the chat toolbar):
 
 Policies are persisted per session. The agent also has **loop guards**: it stops
 after N identical (name+args) calls and after N consecutive failures, so a model
-can't spin forever.
+can't spin forever. A turn is also capped at `HAT_MAX_TOOL_ITERATIONS`
+(default 100) tool steps; when the budget (or a guard) is hit, the agent makes one
+final call **with tools withheld** so the turn closes with a written answer
+instead of dangling on a tool result, and emits a `warning` explaining why.
 
 **Capability checks** compare the conversation's needs (vision from image
 parts, tool calls once tools are used) against the selected model. On a mismatch
@@ -177,7 +283,8 @@ plugin is disabled, errors, or is reconfigured.
 - **Secrets**: declare `requiresSecrets: ["OPENROUTER_API_KEY"]`; the plugin
   reads them through `ctx.secrets`. Values never leave the server.
 - **Built-in plugins**: `openrouter`, `deepseek` (providers), `shell` (the
-  `shell_exec` tool), `fake` (test provider).
+  `shell_exec` tool), `websearch` (the `web_search` tool), `browser` (the
+  `browser` tool), `mcp`, `fake` (test provider).
 
 ### External plugins
 
@@ -221,10 +328,17 @@ Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
 
 The browser keeps the open session in `localStorage` (`hat.session`) and
-reloads it on boot, so a refresh mid-conversation lands you back in it. While a
-turn streams, the send button becomes **Stop** (or `Esc`): it aborts the
-request, which the server turns into a real `AbortController.abort()` for the
-turn, so a runaway generation or a hung tool stops instead of only being hidden.
+reloads it on boot, so a refresh mid-conversation lands you back in it.
+
+**A turn outlives the connection.** Refreshing the tab or switching
+conversations closes the SSE stream but only *detaches* the viewer — the model
+keeps running on the server, messages keep persisting, and opening the session
+again reattaches to the live turn (`GET /api/sessions/:id/stream`, which
+replays the pending tail and then follows). The send button's **Stop** (or
+`Esc`) is a separate, explicit
+`POST /api/sessions/:id/turn/cancel` that really aborts the turn, so a runaway
+generation or a hung tool stops promptly instead of only being hidden.
+
 The view only follows the stream while you are already at the bottom — scroll
 up to read back without being yanked down on every delta.
 
@@ -284,6 +398,13 @@ subtle and cost real time to rediscover:
   server-side, so the app never touches `/api/auth/*` and needs no cookie jar.
   The token lives in the iOS keychain. React Native does not enforce CORS, so
   `HAT_CORS_ORIGINS` is not involved.
+- **A turn outlives its connection**, so the Stop button and "leave" are
+  different requests. Stop posts `POST /api/sessions/:id/turn/cancel` and then
+  drops the socket — closing the socket alone would stop the updates while the
+  model kept generating with nobody watching. Leaving only detaches, and the app
+  reattaches to a live turn (`GET /api/sessions/:id/stream`) on launch, on
+  opening a conversation, and when it returns to the foreground. This is what
+  makes it work on iOS, where the system suspends backgrounded apps freely.
 - **The SSE frame parser moved to `@hat/core`.** It is wire-format code that the
   web, desktop, and mobile clients all have to agree on, so it now sits next to
   the `KernelEvent` union it decodes rather than being copied per client.
@@ -301,6 +422,12 @@ EAS device builds need a paid Apple Developer account. For a free Apple ID,
 [`.github/workflows/ios-ipa.yml`](.github/workflows/ios-ipa.yml) builds an
 unsigned IPA on a GitHub macOS runner for SideStore to sign on-device (7-day
 expiry, 3 apps at a time).
+
+The tool-loop view keeps **one assistant message per model iteration**, because
+that is what the server emits: a turn that calls tools produces several
+`message.start` events and each holds the tool cards for the calls made in it.
+Approvals are resolved with the session id, which is what lets the server reject
+a decision aimed at another conversation.
 
 See [docs/ios-app.md](docs/ios-app.md) for the architecture, the state machine,
 and what is deliberately out of scope.

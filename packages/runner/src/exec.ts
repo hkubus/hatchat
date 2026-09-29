@@ -35,8 +35,15 @@ export function startJob(
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
     HOME: spec.cwd,
-    ...spec.env,
   };
+  // Allowlist caller env: never let the model override loader / runtime knobs.
+  if (spec.env) {
+    for (const [key, value] of Object.entries(spec.env)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      if (/^(LD_|DYLD_|NODE_OPTIONS|NODE_PATH|PATH|HOME|IFS)$/i.test(key)) continue;
+      env[key] = value;
+    }
+  }
 
   const plan = spawnPlan(spec.command, spec.cwd, sandbox);
   const child = spawn(plan.bin, plan.args, {

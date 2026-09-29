@@ -21,6 +21,8 @@ function launch(name: string, entry: string, env: Record<string, string>): void 
     cwd: process.cwd(),
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
+    // Own process group so shutdown can kill tsx *and* the node server it spawns.
+    detached: true,
   });
   child.stdout?.on("data", (d: Buffer) => process.stdout.write(`[${name}] ${d}`));
   child.stderr?.on("data", (d: Buffer) => process.stderr.write(`[${name}] ${d}`));
@@ -255,9 +257,19 @@ async function main(): Promise<void> {
     plugins0.plugins.find((p) => p.id === "openrouter")?.status === "needs-config",
   );
   check("shell plugin active", plugins0.plugins.find((p) => p.id === "shell")?.status === "active");
+  check(
+    "websearch plugin active",
+    plugins0.plugins.find((p) => p.id === "websearch")?.status === "active",
+  );
+  check(
+    "browser plugin active",
+    plugins0.plugins.find((p) => p.id === "browser")?.status === "active",
+  );
 
   const tools0 = await getJson<{ tools: string[] }>(`${BASE}/api/tools`);
   check("shell_exec tool registered by plugin", tools0.tools.includes("shell_exec"));
+  check("web_search tool registered by plugin", tools0.tools.includes("web_search"));
+  check("browser tool registered by plugin", tools0.tools.includes("browser"));
 
   await postJson(`${BASE}/api/plugins/shell/enable`, { enabled: false });
   const tools1 = await getJson<{ tools: string[] }>(`${BASE}/api/tools`);
@@ -384,7 +396,14 @@ const timeout = setTimeout(() => {
 
 function shutdown(): void {
   clearTimeout(timeout);
-  for (const child of children) child.kill("SIGKILL");
+  for (const child of children) {
+    if (!child.pid) continue;
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }
   setTimeout(() => process.exit(process.exitCode ?? 0), 200);
 }
 

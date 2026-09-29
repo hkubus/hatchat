@@ -11,6 +11,7 @@ export type KernelEvent =
   | { type: "tool.approval"; callId: string; status: "requested" | "approved" | "denied" }
   | { type: "tool.result"; callId: string; name: string; parts: Part[]; isError: boolean }
   | { type: "message.done"; messageId: string; finishReason: string }
+  | { type: "session.title"; sessionId: string; title: string }
   | { type: "usage"; usage: Usage }
   | { type: "warning"; message: string }
   | { type: "error"; error: NormalizedError }

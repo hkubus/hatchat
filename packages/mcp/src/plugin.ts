@@ -2,12 +2,30 @@ import type { Part, Plugin, Tool } from "@hat/core";
 import { z } from "zod";
 import { connectHttp, connectStdio, type McpClient, type McpTool } from "./mcp.js";
 
+export const mcpServerSchema = z.object({
+  name: z.string().min(1, "each MCP server needs a name"),
+  transport: z.enum(["stdio", "http"]).optional().default("stdio"),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  env: z.record(z.string()).optional(),
+  url: z.string().optional(),
+  token: z.string().optional(),
+});
+
+export type McpServerConfig = z.infer<typeof mcpServerSchema>;
+
 export const mcpConfigSchema = z.object({
   serversJson: z
     .string()
     .optional()
     .describe(
-      'JSON array of MCP servers, e.g. [{"name":"fs","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]. Use "transport":"http" with "url" for remote servers.',
+      'Legacy JSON array of MCP servers (kept for compatibility). Prefer "servers".',
+    ),
+  servers: z
+    .array(mcpServerSchema)
+    .optional()
+    .describe(
+      'MCP servers, e.g. [{"name":"fs","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]. Use "transport":"http" with "url" for remote servers.',
     ),
   requireApproval: z
     .boolean()
@@ -15,7 +33,9 @@ export const mcpConfigSchema = z.object({
     .describe("Require approval before running MCP tools (recommended)."),
 });
 
-interface ServerConfig {
+export type McpConfig = z.infer<typeof mcpConfigSchema>;
+
+export interface ServerConfig {
   name: string;
   transport?: "stdio" | "http";
   command?: string;
@@ -25,11 +45,58 @@ interface ServerConfig {
   token?: string;
 }
 
-function parseServers(json: string | undefined): ServerConfig[] {
+function normalizeServer(raw: unknown, index: number): ServerConfig {
+  const parsed = mcpServerSchema.safeParse(raw);
+  if (!parsed.success) {
+    const label =
+      typeof raw === "object" && raw !== null && "name" in raw && typeof (raw as { name: unknown }).name === "string" && (raw as { name: string }).name
+        ? `"${(raw as { name: string }).name}"`
+        : `#${index + 1}`;
+    throw new Error(
+      `MCP server ${label}: ${parsed.error.issues.map((i) => `${i.path.join(".") || "value"} ${i.message}`).join("; ")}`,
+    );
+  }
+  return parsed.data;
+}
+
+export function parseServers(
+  config: { serversJson?: string; servers?: unknown } | string | undefined,
+): ServerConfig[] {
+  const json = typeof config === "string" ? config : config?.serversJson;
+  const structured = typeof config === "object" ? config?.servers : undefined;
+
+  // Structured config wins when present; the legacy JSON string is the fallback
+  // so old clients (and the raw-JSON editor) keep working.
+  if (Array.isArray(structured)) {
+    return (structured as unknown[]).map((entry, i) => normalizeServer(entry, i));
+  }
+
   if (!json?.trim()) return [];
-  const parsed: unknown = JSON.parse(json);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error("serversJson is not valid JSON: expected an array of servers");
+  }
   if (!Array.isArray(parsed)) throw new Error("serversJson must be a JSON array");
-  return parsed as ServerConfig[];
+  return (parsed as unknown[]).map((entry, i) => normalizeServer(entry, i));
+}
+
+export function validateServers(servers: ServerConfig[]): void {
+  const seen = new Set<string>();
+  for (const server of servers) {
+    if (!server.name?.trim()) throw new Error("each MCP server needs a name");
+    if (seen.has(server.name)) throw new Error(`duplicate MCP server name: "${server.name}"`);
+    seen.add(server.name);
+    if ((server.transport ?? "stdio") === "http") {
+      if (!server.url?.trim()) throw new Error(`MCP server "${server.name}": url is required for http transport`);
+      if (!/^https?:\/\//i.test(server.url.trim())) {
+        throw new Error(`MCP server "${server.name}": url must start with http:// or https://`);
+      }
+    } else if (!server.command?.trim()) {
+      throw new Error(`MCP server "${server.name}": command is required for stdio transport`);
+    }
+  }
 }
 
 function sanitize(name: string): string {
@@ -61,6 +128,7 @@ function makeTool(
   tool: McpTool,
   client: McpClient,
   requireApproval: boolean,
+  isRunnerUp: () => boolean,
 ): Tool {
   return {
     name: `mcp__${sanitize(serverName)}__${sanitize(tool.name)}`,
@@ -68,6 +136,19 @@ function makeTool(
     parameters: tool.inputSchema ?? { type: "object", properties: {} },
     requiresApproval: requireApproval,
     async execute(args): Promise<Part[]> {
+      // The stdio process lives on the runner, so it dies with it. The tool
+      // stays registered on purpose: unregistering would make it disappear
+      // from the model's tool list mid-turn, and "Unknown tool" is a far worse
+      // answer than saying the runner is down.
+      if (!isRunnerUp()) {
+        return [
+          {
+            type: "text",
+            text: `MCP server "${serverName}" is unavailable: no runner is connected. ` +
+              `It will work again once a runner joins; try another tool meanwhile.`,
+          },
+        ];
+      }
       const result = await client.callTool(tool.name, args ?? {});
       return toParts(result);
     },
@@ -87,34 +168,43 @@ export function createMcpPlugin(): Plugin {
     configSchema: mcpConfigSchema,
 
     async activate(ctx) {
-      const config = ctx.getConfig<{ serversJson?: string; requireApproval?: boolean }>();
-      const servers = parseServers(config.serversJson);
+      const config = ctx.getConfig<{ serversJson?: string; servers?: unknown; requireApproval?: boolean }>();
+      const servers = parseServers(config);
+      validateServers(servers);
       const requireApproval = config.requireApproval ?? true;
+      const isRunnerUp = ctx.runnerAvailable ?? (() => Boolean(ctx.processHost));
 
       for (const server of servers) {
-        if (!server.name) throw new Error("each MCP server needs a name");
         let connection;
         if ((server.transport ?? "stdio") === "http") {
-          if (!server.url) throw new Error(`MCP server ${server.name}: url is required`);
-          connection = await connectHttp(server.url, server.token);
+          // validateServers guarantees url is present for http servers.
+          connection = await connectHttp(server.url ?? "", server.token);
         } else {
           if (!ctx.processHost) {
             throw new Error("No runner connected; stdio MCP servers need a runner.");
           }
-          if (!server.command) {
-            throw new Error(`MCP server ${server.name}: command is required`);
+          try {
+            connection = await connectStdio(ctx.processHost, {
+              // validateServers guarantees command is present for stdio servers.
+              command: server.command ?? "",
+              args: server.args,
+              env: server.env,
+            });
+          } catch (error) {
+            // The usual cause at boot is that no runner has dialed in yet. The
+            // server reactivates this plugin when one does, so say so instead
+            // of leaving a bare spawn failure in the plugin list.
+            throw new Error(
+              `MCP server ${server.name}: ${error instanceof Error ? error.message : String(error)} ` +
+                `(stdio servers run on the runner; this retries when one connects)`,
+            );
           }
-          connection = await connectStdio(ctx.processHost, {
-            command: server.command,
-            args: server.args,
-            env: server.env,
-          });
         }
 
         connections.set(server.name, { close: connection.close });
         const tools = await connection.client.listTools();
         for (const tool of tools) {
-          ctx.register.tool(makeTool(server.name, tool, connection.client, requireApproval));
+          ctx.register.tool(makeTool(server.name, tool, connection.client, requireApproval, isRunnerUp));
         }
         ctx.logger.info(`connected ${server.name}: ${tools.length} tool(s)`);
       }

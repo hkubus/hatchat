@@ -9,7 +9,10 @@ import {
   setPluginEnabled,
   setSecret,
 } from "./api";
-import { capTags } from "./capTags";
+import { capTags, contextTag } from "./capTags";
+import CreatorIcon from "./CreatorIcon";
+import { creatorName, creatorSlug } from "./creators";
+import McpConfigEditor from "./McpSettings";
 
 interface SettingsProps {
   models: ModelInfo[];
@@ -238,6 +241,7 @@ function PluginCard({
   const [config, setConfig] = useState<Record<string, unknown>>(() => ({ ...plugin.config }));
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [mcpValid, setMcpValid] = useState(true);
 
   useEffect(() => {
     setConfig({ ...plugin.config });
@@ -245,6 +249,7 @@ function PluginCard({
 
   const properties = plugin.configSchema?.properties ?? {};
   const hasConfig = Object.keys(properties).length > 0;
+  const isMcp = plugin.id === "mcp";
 
   async function toggle(enabled: boolean): Promise<void> {
     setBusy(true);
@@ -301,19 +306,35 @@ function PluginCard({
 
       {hasConfig && (
         <div className="cfg-form">
-          {Object.entries(properties).map(([key, schema]) => (
-            <ConfigField
-              key={key}
-              name={key}
-              schema={schema}
-              value={config[key]}
-              onChange={(value) => setConfig((prev) => ({ ...prev, [key]: value }))}
+          {isMcp ? (
+            <McpConfigEditor
+              config={config}
+              onChange={setConfig}
+              onValidityChange={setMcpValid}
             />
-          ))}
+          ) : (
+            Object.entries(properties).map(([key, schema]) => (
+              <ConfigField
+                key={key}
+                name={key}
+                schema={schema}
+                value={config[key]}
+                onChange={(value) => setConfig((prev) => ({ ...prev, [key]: value }))}
+              />
+            ))
+          )}
           <div className="cfg-actions">
-            <button className="ghost" onClick={() => void save()} disabled={busy}>
+            <button
+              className="ghost"
+              onClick={() => void save()}
+              disabled={busy || (isMcp && !mcpValid)}
+              title={isMcp && !mcpValid ? "Fix the highlighted server issues first" : undefined}
+            >
               Save config
             </button>
+            {isMcp && !mcpValid && (
+              <span className="settings-error">Fix the server issues above to save.</span>
+            )}
             {message && <span className="settings-msg">{message}</span>}
           </div>
         </div>
@@ -429,13 +450,19 @@ export default function Settings({
         <h2>Models ({models.length})</h2>
         {models.map((m) => (
           <div key={m.id} className="settings-row compact">
+            <CreatorIcon slug={creatorSlug(m)} name={creatorName(m)} size={14} />
             <span className="settings-name mono">{m.id}</span>
             <span className="caps">
-              {capTags(m.capabilities, m.contextWindow).map((tag) => (
-                <span className={`cap ${tag.key === "ctx" ? "muted" : ""}`} key={tag.key} title={tag.title}>
+              {capTags(m.capabilities).map((tag) => (
+                <span className="cap" key={tag.key} title={tag.title}>
                   {tag.label}
                 </span>
               ))}
+              {contextTag(m.contextWindow) && (
+                <span className="ctx-label" title={contextTag(m.contextWindow)!.title}>
+                  {contextTag(m.contextWindow)!.label}
+                </span>
+              )}
             </span>
           </div>
         ))}
