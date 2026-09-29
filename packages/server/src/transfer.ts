@@ -7,6 +7,28 @@ export type SessionExportFile = SessionExport & {
 };
 
 const ROLES = new Set(["system", "user", "assistant", "tool"]);
+const PART_TYPES = new Set(["text", "image", "file", "reasoning", "tool_call", "tool_result"]);
+
+/** Enough of a part's shape that every client can render it without crashing. */
+function isPart(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const part = value as Record<string, unknown>;
+  if (!PART_TYPES.has(part.type as string)) return false;
+  switch (part.type) {
+    case "text":
+    case "reasoning":
+      return typeof part.text === "string";
+    case "image":
+      return Boolean(part.source) && typeof part.source === "object";
+    case "file":
+      return typeof part.id === "string" && typeof part.name === "string" && typeof part.mime === "string";
+    case "tool_call":
+      return typeof part.id === "string" && typeof part.name === "string";
+    case "tool_result":
+      return typeof part.id === "string" && Array.isArray(part.content) && part.content.every(isPart);
+  }
+  return false;
+}
 
 /** Shape-check an uploaded export before trusting any of it. */
 export function isSessionExport(value: unknown): value is SessionExportFile {
@@ -20,7 +42,7 @@ export function isSessionExport(value: unknown): value is SessionExportFile {
     if (!message || typeof message !== "object") return false;
     if (typeof message.id !== "string" || !ROLES.has(message.role as string)) return false;
     if (message.parentId !== null && typeof message.parentId !== "string") return false;
-    if (!Array.isArray(message.parts)) return false;
+    if (!Array.isArray(message.parts) || !message.parts.every(isPart)) return false;
     if (typeof message.createdAt !== "number") return false;
   }
   if (data.attachments !== undefined) {
