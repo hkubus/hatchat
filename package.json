@@ -5,7 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18"
   },
   "scripts": {
     "dev": "concurrently -k -n server,runner,web -c blue,magenta,green \"pnpm run dev:server\" \"pnpm run dev:runner\" \"pnpm run dev:web\"",

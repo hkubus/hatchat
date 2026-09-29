@@ -46,12 +46,26 @@ A provider is registered only when its key is present. Set keys via env
 curl -X POST localhost:8787/api/secrets \
   -H 'content-type: application/json' \
   -d '{"name":"OPENROUTER_API_KEY","value":"sk-or-..."}'
-# restart the server to register the provider
+# the plugin reloads and the provider registers immediately
 ```
 
 Capabilities are per model and drive the loop: `deepseek-reasoner` reports
 `toolCalls: false`, so tools are not offered to it. OpenRouter capabilities are
-derived from each model's `supported_parameters` and `input_modalities`.
+derived from each model's `supported_parameters` and `input_modalities`, and
+each model's context window comes from `context_length`.
+
+**Retries.** A rate limit (429), timeout (408) or overloaded upstream (5xx,
+including OpenRouter's in-stream errors) or a dropped connection is retried
+with exponential backoff, honouring `Retry-After`, up to `HAT_PROVIDER_RETRIES`
+times (default 3). Only failures that arrive *before* the model has produced
+anything are retried — once text has streamed, a retry would duplicate it on
+screen, so the error surfaces instead. Each retry shows as a warning in the chat.
+
+**Cut-off replies.** Each assistant message stores why the model stopped. A
+reply that hit the output limit (`finish_reason: length`) gets a **Continue**
+button: `POST /api/sessions/:id/continue` sends a synthetic user message asking
+the model to pick up where it stopped. Clients hide that message, so the answer
+reads as one continuous reply.
 
 ## Authentication (M6)
 
@@ -218,7 +232,7 @@ Settings → Plugins → MCP servers:
 
 - `dist-mcp/mcp.js` keeps its bare imports external, so it needs Scout's
   `node_modules` next to it — it is not a standalone bundle. It also needs
-  Node ≥ 22.5, which is above hat's own `engines.node: ">=20"`.
+  Node ≥ 22.5, which hat's own `engines.node: ">=22.18"` already covers.
 - Scout is read-only over MCP unless `SCOUT_MCP_ALLOW_WRITES` is set, which
   additionally exposes 10 mutating tools. Hat skips approval for tools marked
   `readOnlyHint`, but that trusts Scout's own labels; leaving the variable unset
@@ -254,6 +268,28 @@ search backend, …) for its identity or the point of the conversation. Override
 it verbatim with `HAT_SYSTEM_PROMPT`. Providers that cannot take a system role
 get it merged into the first user message instead.
 
+Each conversation can add its own **instructions** (appended to the system
+prompt), a **temperature** and a **max reply tokens** cap — the sliders button
+in the chat header, or `PATCH /api/sessions/:id` with `instructions`,
+`temperature` (0–2, `null` for the default) and `maxTokens`. They travel with
+the conversation when it is forked or exported.
+
+## Context window
+
+Every turn replays the active branch, so a long conversation — or a few large
+tool outputs — would eventually overflow the model and fail. Before each model
+call the kernel (`packages/kernel/src/context.ts`) estimates the request and,
+when it would not fit the model's window (minus room for the reply), first
+replaces **old tool outputs** with a short placeholder (the newest tool result
+is never touched), then leaves out the **oldest exchanges**, adding a note
+that it did. Only the request is trimmed: stored history is unchanged, and a
+model with a larger window sees everything again.
+
+Cuts are made in pages of a quarter of the budget, so the start of the request
+stays byte-identical across turns until the conversation has grown by another
+page — prompt caching keeps working. The chat shows a warning when trimming
+starts, and the composer shows how full the window was on the last call.
+
 ## Browser
 
 The `browser` plugin adds a `browser` tool backed by headless Chromium
@@ -286,6 +322,15 @@ Attach images by button, paste, or drag-and-drop. Uploads are content-addressed
 (sha256), deduped, and stored under `HAT_UPLOAD_DIR`; dimensions are read from
 PNG/GIF/JPEG headers with no native image dependency.
 
+**Documents** — text, Markdown, CSV, JSON, source code and **PDFs** — attach
+the same way. Their text is extracted once on upload (PDFs via `unpdf`, loaded
+lazily), stored next to the blob (capped at 400k characters), and inlined into
+the user's message for the model as `<file name="…">…</file>`. The stored
+message keeps only a `file` part, which the UI shows as a card you can preview
+or download. Binary files and scanned PDFs without a text layer are rejected
+with a message saying so. Pasting a very long text into the web composer turns
+it into a `.txt` attachment.
+
 Messages reference attachments by id. The kernel resolves them to base64 data
 URLs **only for vision-capable models**; for others the image is replaced with an
 omitted-note and the capability check warns in the chat. This keeps large
@@ -295,8 +340,8 @@ blobs out of stored messages and off the wire unless needed.
 
 Each conversation has a **tool policy** (editable in the chat toolbar):
 
-- `ask` (default) — tools that require approval prompt you.
-- `auto` — run tools without asking.
+- `ask` — tools that require approval prompt you.
+- `auto` (default) — run tools without asking.
 - `allowlist` — auto-run only the listed tools, ask for the rest.
 - `deny` — block all tool execution.
 
@@ -306,6 +351,12 @@ can't spin forever. A turn is also capped at `HAT_MAX_TOOL_ITERATIONS`
 (default 100) tool steps; when the budget (or a guard) is hit, the agent makes one
 final call **with tools withheld** so the turn closes with a written answer
 instead of dangling on a tool result, and emits a `warning` explaining why.
+
+An approval (or an `ask_user` question) **waits for you** — the turn keeps
+running server-side while you are away, so a timeout would silently deny
+whatever the model was doing. Set `HAT_APPROVAL_TIMEOUT_MINUTES` to give up
+after a while instead. The session list reports each conversation as `idle`,
+`running` or `waiting` (blocked on you), shown as a dot in the sidebar.
 
 **Capability checks** compare the conversation's needs (vision from image
 parts, tool calls once tools are used) against the selected model. On a mismatch
@@ -401,6 +452,24 @@ Messages form a **tree**; the active path is root→leaf, so:
 - **Edit** a user message → sets the leaf to its parent and re-runs with new
   text, creating a sibling user branch.
 - The UI shows `‹ n/m ›` on any message with siblings to switch branches.
+- **Fork** any message → a new conversation holding the path up to it, with the
+  same settings (`POST /api/sessions/:id/fork`).
+
+**Search.** User and assistant text is indexed with SQLite FTS5. The sidebar
+search box filters titles and, from two characters, searches message contents
+(`GET /api/search?q=`). Opening a hit switches to the branch holding that
+message and scrolls to it.
+
+**Export / import.** `GET /api/sessions/:id/export?format=markdown` is the
+active branch as a readable transcript; the default JSON is the whole message
+tree with settings and attachments inline, and `POST /api/sessions/import`
+recreates it as a new conversation (fresh ids, attachments re-stored). Both are
+in the chat header's download menu; import is in the sidebar.
+
+**Notifications.** The web app can notify you (Settings → Preferences, opt-in)
+when a reply is ready or a conversation needs you while the tab is in the
+background. Reaching a closed tab or a suspended phone would need server push,
+which is not built.
 
 Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
@@ -531,6 +600,9 @@ pnpm test         # node:test unit tests (providers, crypto, store, SSE parser, 
 pnpm smoke        # boots server + runner, exercises turn/approval/branching
 ```
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three plus the
+web build on every push to `main` and every pull request.
+
 ## Run (compose)
 
 ```sh
@@ -554,8 +626,9 @@ The runner publishes **no ports** — it dials out to `server:8787/link`.
 This is a single-user app. Before exposing it:
 
 1. **Set `HAT_AUTH_TOKEN`.** With it unset, `/api` is unauthenticated.
-2. Prefer passkeys/session cookies over a bearer token (M6 work) and terminate
-   TLS at a reverse proxy (Caddy/Traefik).
+2. Prefer password login (session cookie + CSRF, `HAT_AUTH_PASSWORD`) for the
+   browser over sharing the bearer token, and terminate TLS at a reverse proxy
+   (Caddy/Traefik) with `HAT_COOKIE_SECURE=true`.
 3. Run the runner as a non-root user where a container runtime is available,
    so `shell_exec` gets the container sandbox tier (the `auto` default picks it
    up; set `HAT_EXEC_SANDBOX=container` to make it mandatory), and check
@@ -593,3 +666,10 @@ This is a single-user app. Before exposing it:
   A React Native (Expo) iOS app now shares the same server and the SSE parser,
   with EAS Build configured and an unsigned-IPA workflow for free Apple IDs.
   Still open there: native tab bars for system Liquid Glass, and a device.
+- **M8 (done)** Long-conversation robustness and everyday chat features:
+  context-window fitting, provider retries with backoff, Continue for cut-off
+  replies, per-conversation instructions and sampling settings, document (text,
+  code, PDF) attachments, fork, Markdown/JSON export and import, message search
+  in the UI, session status and opt-in notifications, a shared chat view-model
+  for all clients, sandboxed external plugins, MCP `readOnlyHint`, the `auto`
+  sandbox tier, and CI (typecheck, tests, web build, smoke).
