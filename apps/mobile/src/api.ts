@@ -316,6 +316,26 @@ export async function resolveApproval(
   if (!res.ok) throw new HttpError(res.status, `/api/approvals/${callId}`);
 }
 
+// --- Questions -------------------------------------------------------------
+
+/**
+ * Answer an `ask_user` tool call. The tool blocks the turn until this lands.
+ * A 404 means the question is no longer pending (answered elsewhere, or the
+ * turn ended).
+ */
+export async function answerQuestion(
+  callId: string,
+  answer: string,
+  sessionId: string,
+): Promise<void> {
+  const res = await authFetch(`/api/questions/${encodeURIComponent(callId)}`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ sessionId, answer }),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/questions/${callId}`);
+}
+
 // --- Attachments -----------------------------------------------------------
 
 /**

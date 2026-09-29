@@ -176,6 +176,7 @@ export default function ChatScreen({
         }}
         onSwitchBranch={(siblingId) => void chat.switchBranch(siblingId)}
         onDecide={chat.decide}
+        onAnswer={chat.answer}
         busy={chat.busy}
       />
     ),

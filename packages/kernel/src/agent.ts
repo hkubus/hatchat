@@ -31,6 +31,12 @@ export interface AgentTurnInput {
   userParts?: Part[];
   toolPolicy?: ToolPolicy;
   reasoningEffort?: ReasoningEffort;
+  /** Tools withheld from the model for this run (e.g. no nested sub-agents). */
+  excludeTools?: string[];
+  /** When false, messages are not reported through `onMessage` (ephemeral runs). Default true. */
+  persist?: boolean;
+  /** Receives out-of-band events that tools push while running (see `ToolContext.emit`). */
+  emit?(event: KernelEvent): void;
 }
 
 export interface KernelDeps {
@@ -50,6 +56,11 @@ export interface KernelDeps {
    * that do not support a native system role.
    */
   systemPrompt?: string;
+  /**
+   * Extra, per-session context appended to the system prompt each turn (e.g.
+   * saved memories). Keep it stable between turns: it sits in the cached prefix.
+   */
+  systemContext?(sessionId: string): string | undefined | Promise<string | undefined>;
   maxToolIterations?: number;
   maxToolResultChars?: number;
 }
@@ -85,6 +96,10 @@ export class Agent {
 
   async *run(input: AgentTurnInput): AsyncGenerator<KernelEvent> {
     const turnId = newId("turn");
+    const persist = input.persist !== false;
+    const onMessage = (message: ChatMessage): void => {
+      if (persist) this.deps.onMessage?.(input.sessionId, cloneMessage(message));
+    };
     yield { type: "turn.start", turnId };
 
     const messages: ChatMessage[] = input.history.map(cloneMessage);
@@ -96,7 +111,7 @@ export class Agent {
         createdAt: Date.now(),
       };
       messages.push(userMessage);
-      this.deps.onMessage?.(input.sessionId, cloneMessage(userMessage));
+      onMessage(userMessage);
     } else if (input.userText !== undefined) {
       const userMessage: ChatMessage = {
         id: newId("msg"),
@@ -105,15 +120,17 @@ export class Agent {
         createdAt: Date.now(),
       };
       messages.push(userMessage);
-      this.deps.onMessage?.(input.sessionId, cloneMessage(userMessage));
+      onMessage(userMessage);
     }
 
     await this.resolveAttachmentImages(messages);
 
     const { provider, model } = this.deps.providers.resolve(input.model);
     const caps = provider.capabilities(model);
-    if (this.deps.systemPrompt?.trim()) {
-      applySystemPrompt(messages, this.deps.systemPrompt, caps);
+    const extra = await this.systemContextFor(input.sessionId);
+    const systemPrompt = [this.deps.systemPrompt?.trim(), extra?.trim()].filter(Boolean).join("\n\n");
+    if (systemPrompt) {
+      applySystemPrompt(messages, systemPrompt, caps);
     }
     const policy: ToolPolicy = input.toolPolicy ?? {
       ...DEFAULT_TOOL_POLICY,
@@ -148,7 +165,7 @@ export class Agent {
       const request: ChatRequest = {
         model,
         messages: toProviderMessages(messages, caps),
-        tools: caps.toolCalls ? this.deps.tools.toToolSpecs() : undefined,
+        tools: caps.toolCalls ? this.deps.tools.toToolSpecs(input.excludeTools) : undefined,
         // Stable per-session key so providers can route same-prefix requests
         // to the same prompt-cache shard (see `prompt_cache_key`).
         cacheKey: input.sessionId,
@@ -207,7 +224,7 @@ export class Agent {
         assistant.meta = { ...assistant.meta, usage };
       }
       messages.push(assistant);
-      this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
+      onMessage(assistant);
       yield { type: "message.done", messageId: assistantId, finishReason: finish };
 
       if (finish === "error" || calls.length === 0) {
@@ -242,7 +259,9 @@ export class Agent {
           guardTripped = true;
         } else {
           callCounts.set(signature, seen + 1);
-          result = await this.executeTool(call, input.sessionId, input.signal, policy);
+          result = input.excludeTools?.includes(call.name)
+            ? { parts: [{ type: "text", text: `Tool "${call.name}" is not available here.` }], isError: true }
+            : await this.executeTool(call, input.sessionId, input.signal, policy, assistantId, input.emit);
         }
 
         failureStreak = result.isError ? failureStreak + 1 : 0;
@@ -257,7 +276,7 @@ export class Agent {
           createdAt: Date.now(),
         };
         messages.push(toolMessage);
-        this.deps.onMessage?.(input.sessionId, cloneMessage(toolMessage));
+        onMessage(toolMessage);
       }
 
       if (guardTripped) break;
@@ -368,9 +387,19 @@ export class Agent {
         meta: { provider: provider.id, model, ...(usage ? { usage } : {}) },
       };
       messages.push(assistant);
-      this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
+      if (input.persist !== false) this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
     }
     yield { type: "message.done", messageId: assistantId, finishReason: "stop" };
+  }
+
+  private async systemContextFor(sessionId: string): Promise<string | undefined> {
+    if (!this.deps.systemContext) return undefined;
+    try {
+      return await this.deps.systemContext(sessionId);
+    } catch (error) {
+      this.deps.logger.warn("system context failed", normalizeError(error, "system_context"));
+      return undefined;
+    }
   }
 
   private async resolveAttachmentImages(messages: ChatMessage[]): Promise<void> {
@@ -392,6 +421,8 @@ export class Agent {
     sessionId: string,
     signal: AbortSignal,
     policy: ToolPolicy,
+    messageId?: string,
+    emit?: (event: KernelEvent) => void,
   ): Promise<{ parts: Part[]; isError: boolean }> {
     const tool = this.deps.tools.get(call.name);
     if (!tool) {
@@ -460,6 +491,9 @@ export class Agent {
         audit: this.deps.audit,
         logger: this.deps.logger,
         signal,
+        callId: call.id,
+        messageId,
+        emit,
       };
       const args = tool.schema ? tool.schema.parse(call.args) : call.args;
       const parts = truncateParts(await tool.execute(args, ctx), this.deps.maxToolResultChars ?? 20_000);

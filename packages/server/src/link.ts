@@ -226,6 +226,8 @@ export class RunnerConnection implements RunnerChannel {
       args: request.args,
       cwd: request.cwd,
       env: request.env,
+      sessionId: request.sessionId,
+      shell: request.shell,
     });
     return Promise.resolve({
       id: procId,

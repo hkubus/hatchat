@@ -475,3 +475,115 @@ export async function selectBranch(sessionId: string, messageId: string): Promis
   if (!res.ok) throw new Error(`select branch: ${res.status}`);
   return (await res.json()) as SessionPayload;
 }
+
+// ---- assistant tools ------------------------------------------------------
+
+/** Answer an `ask_user` question the assistant is blocked on. */
+export async function answerQuestion(callId: string, sessionId: string, answer: string): Promise<void> {
+  const res = await authFetch(`/api/questions/${encodeURIComponent(callId)}`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ sessionId, answer }),
+  });
+  if (res.status === 404) throw new Error("This question is no longer waiting for an answer.");
+  if (!res.ok) throw new HttpError(res.status, `/api/questions/${callId}`);
+}
+
+/** Download an artifact under its given name (works with bearer auth too). */
+export async function downloadAttachment(id: string, name: string): Promise<void> {
+  const blob = await fetchAttachmentBlob(id);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+export interface MemoryRecord {
+  id: string;
+  text: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export async function getMemories(): Promise<MemoryRecord[]> {
+  return (await getJson<{ memories: MemoryRecord[] }>("/api/memories")).memories;
+}
+
+export async function addMemory(text: string): Promise<void> {
+  const res = await authFetch("/api/memories", {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "/api/memories");
+}
+
+export async function updateMemory(id: string, text: string): Promise<void> {
+  const res = await authFetch(`/api/memories/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/memories/${id}`);
+}
+
+export async function deleteMemory(id: string): Promise<void> {
+  const res = await authFetch(`/api/memories/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/memories/${id}`);
+}
+
+export interface ScheduleRecord {
+  id: string;
+  title: string;
+  prompt: string;
+  cron: string | null;
+  timezone: string;
+  runAt: number | null;
+  sessionId: string | null;
+  model: string;
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  lastSessionId: string | null;
+  lastError: string | null;
+  enabled: boolean;
+  createdAt: number;
+}
+
+export async function getSchedules(): Promise<ScheduleRecord[]> {
+  return (await getJson<{ schedules: ScheduleRecord[] }>("/api/schedules")).schedules;
+}
+
+export async function setScheduleEnabled(id: string, enabled: boolean): Promise<void> {
+  const res = await authFetch(`/api/schedules/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `update schedule: ${res.status}`);
+  }
+}
+
+export async function runSchedule(id: string): Promise<void> {
+  const res = await authFetch(`/api/schedules/${encodeURIComponent(id)}/run`, {
+    method: "POST",
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/schedules/${id}/run`);
+}
+
+export async function deleteSchedule(id: string): Promise<void> {
+  const res = await authFetch(`/api/schedules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) throw new HttpError(res.status, `/api/schedules/${id}`);
+}

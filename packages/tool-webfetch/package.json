@@ -1,0 +1,23 @@
+{
+  "name": "@hat/tool-webfetch",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@hat/core": "workspace:*",
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.13",
+    "turndown": "^7.2.4",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/turndown": "^5.0.6"
+  }
+}

@@ -52,6 +52,8 @@ function toContentParts(parts: Part[]): OpenAIContentPart[] {
           ? part.source.url
           : `data:${part.source.mime};base64,${part.source.data}`;
       out.push({ type: "image_url", image_url: { url } });
+    } else if (part.type === "file") {
+      out.push({ type: "text", text: `[file ${part.name} (${part.mime}, ${part.size} bytes), id ${part.id}]` });
     }
   }
   return out;

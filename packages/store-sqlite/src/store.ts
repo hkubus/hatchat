@@ -47,6 +47,43 @@ export interface AttachmentRecord {
   createdAt: number;
 }
 
+export interface MemoryRecord {
+  id: string;
+  text: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SearchHit {
+  messageId: string;
+  sessionId: string;
+  sessionTitle: string;
+  role: "user" | "assistant";
+  /** Matching excerpt with hits wrapped in « ». */
+  snippet: string;
+  createdAt: number;
+}
+
+export interface ScheduleRecord {
+  id: string;
+  title: string;
+  prompt: string;
+  /** 5-field cron expression, or null for a one-shot at `runAt`. */
+  cron: string | null;
+  /** IANA zone the cron fields are read in. */
+  timezone: string;
+  runAt: number | null;
+  /** Continue this conversation on each run; null starts a fresh one each time. */
+  sessionId: string | null;
+  model: string;
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  lastSessionId: string | null;
+  lastError: string | null;
+  enabled: boolean;
+  createdAt: number;
+}
+
 export interface PathNode {
   message: ChatMessage;
   parentId: string | null;
@@ -146,6 +183,22 @@ export class Store implements SecretStore {
       this.db.exec("UPDATE sessions SET reasoning_effort = 'low' WHERE reasoning_effort = 'off'");
       this.db.exec("PRAGMA user_version = 1");
     }
+    // Chat search index arrived with version 2; backfill existing messages.
+    if (schemaVersion < 2) {
+      const rows = this.db
+        .prepare(`SELECT id, session_id, role, parts FROM messages WHERE role IN ('user', 'assistant')`)
+        .all() as Array<{ id: string; session_id: string; role: string; parts: string }>;
+      const insert = this.db.prepare(
+        `INSERT INTO messages_fts (text, message_id, session_id, role) VALUES (?, ?, ?, ?)`,
+      );
+      this.db.exec("BEGIN");
+      for (const row of rows) {
+        const text = searchableText(JSON.parse(row.parts) as Part[]);
+        if (text) insert.run(text, row.id, row.session_id, row.role);
+      }
+      this.db.exec("PRAGMA user_version = 2");
+      this.db.exec("COMMIT");
+    }
   }
 
   close(): void {
@@ -228,6 +281,7 @@ export class Store implements SecretStore {
 
   deleteSession(sessionId: string): boolean {
     this.db.prepare(`DELETE FROM messages WHERE session_id = ?`).run(sessionId);
+    this.db.prepare(`DELETE FROM messages_fts WHERE session_id = ?`).run(sessionId);
     const result = this.db.prepare(`DELETE FROM sessions WHERE id = ?`).run(sessionId);
     return result.changes > 0;
   }
@@ -303,6 +357,12 @@ export class Store implements SecretStore {
         message.createdAt || now,
       );
       touch.run(message.id, now, title, sessionId);
+      const searchable = message.role === "user" || message.role === "assistant" ? searchableText(message.parts) : "";
+      if (searchable) {
+        this.db
+          .prepare(`INSERT INTO messages_fts (text, message_id, session_id, role) VALUES (?, ?, ?, ?)`)
+          .run(searchable, message.id, sessionId, message.role);
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -538,6 +598,143 @@ export class Store implements SecretStore {
     return this.artifacts.url(record.sha256);
   }
 
+  // ---- memories -----------------------------------------------------------
+
+  listMemories(): MemoryRecord[] {
+    const rows = this.db
+      .prepare(`SELECT id, text, created_at, updated_at FROM memories ORDER BY created_at ASC`)
+      .all() as Array<{ id: string; text: string; created_at: number; updated_at: number }>;
+    return rows.map((row) => ({ id: row.id, text: row.text, createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+
+  addMemory(text: string): MemoryRecord {
+    const now = Date.now();
+    const id = `mem_${newId().slice(0, 8)}`;
+    this.db
+      .prepare(`INSERT INTO memories (id, text, created_at, updated_at) VALUES (?, ?, ?, ?)`)
+      .run(id, text, now, now);
+    return { id, text, createdAt: now, updatedAt: now };
+  }
+
+  updateMemory(id: string, text: string): boolean {
+    return this.db.prepare(`UPDATE memories SET text = ?, updated_at = ? WHERE id = ?`).run(text, Date.now(), id).changes > 0;
+  }
+
+  deleteMemory(id: string): boolean {
+    return this.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id).changes > 0;
+  }
+
+  // ---- chat search --------------------------------------------------------
+
+  /**
+   * Full-text search over user and assistant messages, best matches first.
+   * The query is treated as plain words (each quoted), so user punctuation
+   * can't produce an FTS syntax error.
+   */
+  searchMessages(query: string, options: { limit?: number; excludeSessionId?: string } = {}): SearchHit[] {
+    const terms = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
+    if (terms.length === 0) return [];
+    const match = terms.map((term) => `"${term}"`).join(" OR ");
+    const rows = this.db
+      .prepare(
+        `SELECT f.message_id, f.session_id, f.role,
+                snippet(messages_fts, 0, '«', '»', '…', 24) AS snippet,
+                s.title, m.created_at
+           FROM messages_fts f
+           JOIN sessions s ON s.id = f.session_id
+           JOIN messages m ON m.id = f.message_id
+          WHERE messages_fts MATCH ? AND f.session_id != ?
+          ORDER BY bm25(messages_fts)
+          LIMIT ?`,
+      )
+      .all(match, options.excludeSessionId ?? "", options.limit ?? 10) as Array<{
+      message_id: string;
+      session_id: string;
+      role: string;
+      snippet: string;
+      title: string;
+      created_at: number;
+    }>;
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      sessionId: row.session_id,
+      sessionTitle: row.title,
+      role: row.role as "user" | "assistant",
+      snippet: row.snippet,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // ---- schedules ----------------------------------------------------------
+
+  createSchedule(input: Omit<ScheduleRecord, "id" | "createdAt" | "lastRunAt" | "lastSessionId" | "lastError" | "enabled">): ScheduleRecord {
+    const record: ScheduleRecord = {
+      ...input,
+      id: `sch_${newId().slice(0, 8)}`,
+      lastRunAt: null,
+      lastSessionId: null,
+      lastError: null,
+      enabled: true,
+      createdAt: Date.now(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO schedules (id, title, prompt, cron, timezone, run_at, session_id, model, next_run_at, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+      )
+      .run(
+        record.id,
+        record.title,
+        record.prompt,
+        record.cron,
+        record.timezone,
+        record.runAt,
+        record.sessionId,
+        record.model,
+        record.nextRunAt,
+        record.createdAt,
+      );
+    return record;
+  }
+
+  listSchedules(): ScheduleRecord[] {
+    const rows = this.db.prepare(`SELECT * FROM schedules ORDER BY created_at ASC`).all() as unknown as ScheduleRow[];
+    return rows.map(toSchedule);
+  }
+
+  getSchedule(id: string): ScheduleRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM schedules WHERE id = ?`).get(id) as unknown as ScheduleRow | undefined;
+    return row ? toSchedule(row) : undefined;
+  }
+
+  dueSchedules(now: number): ScheduleRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM schedules WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?`)
+      .all(now) as unknown as ScheduleRow[];
+    return rows.map(toSchedule);
+  }
+
+  /** Record a run and move the schedule to its next time (null disables one-shots). */
+  markScheduleRun(id: string, run: { at: number; sessionId: string | null; error: string | null; nextRunAt: number | null }): void {
+    this.db
+      .prepare(
+        `UPDATE schedules SET last_run_at = ?, last_session_id = ?, last_error = ?, next_run_at = ?,
+                enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
+          WHERE id = ?`,
+      )
+      .run(run.at, run.sessionId, run.error, run.nextRunAt, run.nextRunAt, id);
+  }
+
+  setScheduleEnabled(id: string, enabled: boolean, nextRunAt: number | null): boolean {
+    return this.db
+      .prepare(`UPDATE schedules SET enabled = ?, next_run_at = ? WHERE id = ?`)
+      .run(enabled ? 1 : 0, nextRunAt, id).changes > 0;
+  }
+
+  deleteSchedule(id: string): boolean {
+    return this.db.prepare(`DELETE FROM schedules WHERE id = ?`).run(id).changes > 0;
+  }
+
   // ---- plugin state -------------------------------------------------------
 
   getPluginState(id: string): { enabled: boolean; config: unknown } | undefined {
@@ -559,6 +756,51 @@ export class Store implements SecretStore {
       )
       .run(id, state.enabled ? 1 : 0, JSON.stringify(state.config ?? {}), Date.now());
   }
+}
+
+interface ScheduleRow {
+  id: string;
+  title: string;
+  prompt: string;
+  cron: string | null;
+  timezone: string;
+  run_at: number | null;
+  session_id: string | null;
+  model: string;
+  next_run_at: number | null;
+  last_run_at: number | null;
+  last_session_id: string | null;
+  last_error: string | null;
+  enabled: number;
+  created_at: number;
+}
+
+function toSchedule(row: ScheduleRow): ScheduleRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    prompt: row.prompt,
+    cron: row.cron,
+    timezone: row.timezone,
+    runAt: row.run_at,
+    sessionId: row.session_id,
+    model: row.model,
+    nextRunAt: row.next_run_at,
+    lastRunAt: row.last_run_at,
+    lastSessionId: row.last_session_id,
+    lastError: row.last_error,
+    enabled: row.enabled === 1,
+    createdAt: row.created_at,
+  };
+}
+
+/** The text of a message worth indexing for search (prose only, no tool noise). */
+function searchableText(parts: Part[]): string {
+  return parts
+    .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
 }
 
 function toSession(row: SessionRow): SessionRecord {

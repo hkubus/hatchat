@@ -36,6 +36,9 @@ import { Store } from "@hat/store-sqlite";
 import { createShellPlugin } from "@hat/tool-shell";
 import { createBrowserPlugin } from "@hat/tool-browser";
 import { createWebSearchPlugin } from "@hat/tool-websearch";
+import { createFsPlugin } from "@hat/tool-fs";
+import { createWebFetchPlugin } from "@hat/tool-webfetch";
+import { createProcessPlugin, createPythonPlugin } from "@hat/tool-process";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
@@ -50,6 +53,11 @@ import { KEEPALIVE, kernelStream } from "./sse.js";
 import { generateTitle } from "./title.js";
 import { TurnHub, type Turn } from "./turns.js";
 import { loadExternalPlugins } from "./plugin-loader.js";
+import { createArtifactsPlugin } from "./tools/artifacts.js";
+import { createMemoryPlugin, memoryPrompt } from "./tools/memory.js";
+import { QuestionManager, createPlanningPlugin } from "./tools/planning.js";
+import { Scheduler, createSchedulerPlugin, nextRunFor } from "./tools/schedule.js";
+import { createSubagentPlugin } from "./tools/subagent.js";
 
 export interface ServerRuntime {
   app: Hono;
@@ -150,6 +158,51 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createShellPlugin());
   pluginHost.register(createWebSearchPlugin());
   pluginHost.register(createBrowserPlugin());
+  pluginHost.register(createFsPlugin());
+  pluginHost.register(createWebFetchPlugin());
+  pluginHost.register(createProcessPlugin());
+  pluginHost.register(createPythonPlugin());
+  pluginHost.register(createArtifactsPlugin(store));
+  pluginHost.register(createMemoryPlugin(store));
+  const questions = new QuestionManager();
+  pluginHost.register(createPlanningPlugin(questions));
+  pluginHost.register(
+    createSubagentPlugin({
+      agent: () => agent,
+      sessionSettings: (sessionId) => {
+        const session = store.getSession(sessionId);
+        return {
+          model: session?.model ?? "fake/fake-agent",
+          toolPolicy: session ? policyFor(session) : undefined,
+          reasoningEffort: session?.reasoningEffort,
+        };
+      },
+    }),
+  );
+  const scheduler = new Scheduler({
+    store,
+    logger,
+    isBusy: (sessionId) => {
+      const turn = turns.get(sessionId);
+      return Boolean(turn && !turn.done);
+    },
+    runPrompt: (sessionId, prompt) =>
+      new Promise<void>((resolve) => {
+        const turn = runTurn({
+          sessionId,
+          history: pathOf(sessionId).map((n) => n.message),
+          userText: prompt,
+        });
+        turn.subscribe({ onEvent: () => {}, onEnd: resolve });
+      }),
+  });
+  pluginHost.register(
+    createSchedulerPlugin({
+      store,
+      scheduler,
+      modelFor: (sessionId) => store.getSession(sessionId)?.model ?? "fake/fake-agent",
+    }),
+  );
   pluginHost.register(createFakePlugin());
   pluginHost.register(createMcpPlugin());
 
@@ -194,6 +247,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     audit,
     logger,
     systemPrompt: config.systemPrompt,
+    systemContext: () =>
+      pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
     maxToolIterations: config.maxToolIterations,
     onMessage: (sessionId, message) => store.appendMessage(sessionId, message),
     resolveImage: async (attachmentId) => {
@@ -413,6 +468,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
           signal: turn.signal,
           toolPolicy: session ? policyFor(session) : undefined,
           reasoningEffort: session?.reasoningEffort,
+          emit: (event) => turn.push(event),
         })) {
           turn.push(event);
         }
@@ -525,7 +581,12 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     const record = store.getAttachment(id);
     const data = await store.readAttachment(id);
     if (!record || !data) return c.json({ error: "not found" }, 404);
+    // Artifacts are downloaded under the name the assistant gave them.
+    const download = c.req.query("download")?.replace(/["\\\r\n]/g, "").slice(0, 200);
     return c.body(new Uint8Array(data), 200, {
+      ...(download
+        ? { "content-disposition": `attachment; filename="${download.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(download)}` }
+        : {}),
       "content-type": record.mime,
       "cache-control": "public, max-age=31536000, immutable",
       "x-content-type-options": "nosniff",
@@ -804,6 +865,94 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ session: store.getSession(session.id), path: pathOf(session.id) });
   });
 
+  // ---- questions (ask_user) ----------------------------------------------
+
+  app.post("/api/questions/:callId", async (c) => {
+    let body: { answer?: unknown; sessionId?: unknown } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      /* ignore */
+    }
+    if (typeof body.answer !== "string" || !body.answer.trim() || typeof body.sessionId !== "string") {
+      return c.json({ error: "sessionId and a non-empty answer are required" }, 400);
+    }
+    const ok = questions.answer(c.req.param("callId"), body.sessionId, body.answer.trim().slice(0, 4_000));
+    return c.json({ ok }, ok ? 200 : 404);
+  });
+
+  // ---- memories -----------------------------------------------------------
+
+  app.get("/api/memories", (c) => c.json({ memories: store.listMemories() }));
+
+  app.post("/api/memories", async (c) => {
+    let body: { text?: unknown } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      /* ignore */
+    }
+    if (typeof body.text !== "string" || !body.text.trim()) return c.json({ error: "text is required" }, 400);
+    return c.json({ memory: store.addMemory(body.text.trim().slice(0, 500)) });
+  });
+
+  app.patch("/api/memories/:id", async (c) => {
+    let body: { text?: unknown } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      /* ignore */
+    }
+    if (typeof body.text !== "string" || !body.text.trim()) return c.json({ error: "text is required" }, 400);
+    const ok = store.updateMemory(c.req.param("id"), body.text.trim().slice(0, 500));
+    return c.json({ ok }, ok ? 200 : 404);
+  });
+
+  app.delete("/api/memories/:id", (c) => c.json({ ok: store.deleteMemory(c.req.param("id")) }));
+
+  // ---- chat search --------------------------------------------------------
+
+  app.get("/api/search", (c) => {
+    const query = c.req.query("q") ?? "";
+    return c.json({ hits: store.searchMessages(query, { limit: 30 }) });
+  });
+
+  // ---- schedules ----------------------------------------------------------
+
+  app.get("/api/schedules", (c) => c.json({ schedules: store.listSchedules() }));
+
+  app.patch("/api/schedules/:id", async (c) => {
+    const schedule = store.getSchedule(c.req.param("id"));
+    if (!schedule) return c.json({ error: "not found" }, 404);
+    let body: { enabled?: unknown } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      /* ignore */
+    }
+    if (typeof body.enabled !== "boolean") return c.json({ error: "enabled (boolean) is required" }, 400);
+    let next: number | null = null;
+    if (body.enabled) {
+      try {
+        next = nextRunFor(schedule, Date.now());
+      } catch {
+        next = null;
+      }
+      if (next === null) return c.json({ error: "this schedule has no future run" }, 400);
+    }
+    store.setScheduleEnabled(schedule.id, body.enabled, next);
+    return c.json({ schedule: store.getSchedule(schedule.id) });
+  });
+
+  app.post("/api/schedules/:id/run", (c) => {
+    const schedule = store.getSchedule(c.req.param("id"));
+    if (!schedule) return c.json({ error: "not found" }, 404);
+    void scheduler.runNow(schedule.id).catch(() => undefined);
+    return c.json({ ok: true });
+  });
+
+  app.delete("/api/schedules/:id", (c) => c.json({ ok: store.deleteSchedule(c.req.param("id")) }));
+
   // ---- approvals ----------------------------------------------------------
 
   app.post("/api/approvals/:callId", async (c) => {
@@ -821,11 +970,14 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ ok });
   });
 
+  scheduler.start();
+
   return {
     app,
     registry,
     store,
     close: () => {
+      scheduler.stop();
       registry.close();
       store.close();
     },

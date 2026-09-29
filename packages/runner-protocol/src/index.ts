@@ -74,6 +74,10 @@ export const procStartSchema = z.object({
   args: z.array(z.string()).optional(),
   cwd: z.string().optional(),
   env: z.record(z.string()).optional(),
+  /** Scope the process to this session's workspace (cwd is then relative to it). */
+  sessionId: z.string().optional(),
+  /** Run `command` as a shell line through the runner's sandbox plan. */
+  shell: z.boolean().optional(),
 });
 
 export const procStdinSchema = z.object({

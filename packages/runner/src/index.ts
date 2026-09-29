@@ -208,10 +208,11 @@ class Runner {
 
   private handleProcStart(message: Extract<ServerToRunner, { t: "proc.start" }>): void {
     let cwd: string;
+    const scope = message.sessionId ?? "_processes";
     try {
       cwd = message.cwd
-        ? this.workspace.resolveCwdSync("_processes", message.cwd)
-        : this.workspace.ensureSync("_processes");
+        ? this.workspace.resolveCwdSync(scope, message.cwd)
+        : this.workspace.ensureSync(scope);
     } catch (error) {
       this.sendError({ procId: message.procId }, error);
       return;
@@ -224,6 +225,7 @@ class Runner {
         args: message.args,
         cwd,
         env: message.env,
+        shell: message.shell ? this.config.sandbox : undefined,
       },
       (out) => this.send(out),
       (procId) => this.processes.delete(procId),

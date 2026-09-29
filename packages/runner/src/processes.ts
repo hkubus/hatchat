@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { RunnerToServer } from "@hat/runner-protocol";
+import { spawnPlan, type SandboxConfig } from "./sandbox.js";
 
 export interface ProcessSpec {
   procId: string;
@@ -7,6 +8,8 @@ export interface ProcessSpec {
   args?: string[];
   cwd: string;
   env?: Record<string, string>;
+  /** When set, `command` is a shell line, spawned through the sandbox plan. */
+  shell?: SandboxConfig;
 }
 
 export interface ProcessHandle {
@@ -34,9 +37,13 @@ export function startProcess(
     ...spec.env,
   };
 
-  const child = spawn(spec.command, spec.args ?? [], {
+  const plan = spec.shell
+    ? spawnPlan(spec.command, spec.cwd, spec.shell)
+    : { bin: spec.command, args: spec.args ?? [], shell: false };
+  const child = spawn(plan.bin, plan.args, {
     cwd: spec.cwd,
     env,
+    shell: plan.shell,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
