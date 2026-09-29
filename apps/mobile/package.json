@@ -1,0 +1,37 @@
+{
+  "name": "@hat/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "prebuild": "expo prebuild --clean",
+    "build:ios": "eas build --platform ios",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@hat/core": "workspace:*",
+    "expo": "~57.0.25",
+    "expo-blur": "~57.0.3",
+    "expo-image-picker": "~57.0.20",
+    "expo-secure-store": "~57.0.4",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-markdown-display": "^7.0.2",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-web": "~0.21.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.10.2",
+    "@types/react": "~19.2.2",
+    "expo-dev-client": "~57.0.19",
+    "tsx": "^4.19.2",
+    "typescript": "~6.0.3"
+  }
+}

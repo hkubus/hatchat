@@ -1,0 +1,99 @@
+# Builds an *unsigned* IPA on a hosted macOS runner.
+#
+# Why this exists alongside EAS Build: EAS's managed device-build flow assumes a
+# **paid** Apple Developer account. With a free personal team it will not
+# produce something installable, so the free route is to build unsigned here
+# and let SideStore (or AltStore/Sideloadly) sign it on-device with the free
+# Apple ID. The cost is that the app expires after 7 days and is capped at 3
+# sideloaded apps at a time.
+#
+# Once there is a paid team, delete this workflow and use `eas build -p ios`
+# (see docs/ios-app.md) — it also unlocks push notifications and the full set of
+# entitlements, none of which a free team can have.
+#
+# Result is uploaded as the `hat-unsigned-ipa` artifact.
+
+name: ios-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "mobile-v*"
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-26 is the image whose default Xcode ships the iOS 26 SDK, which the
+    # Liquid Glass module is compiled against. Drop to macos-15 if you do not
+    # need real Liquid Glass — the module has an `#available(iOS 26.0, *)`
+    # guard and falls back to `UIBlurEffect` on older SDKs.
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the app typechecks against the workspace
+        run: pnpm --filter @hat/mobile typecheck
+
+      - name: Generate the native iOS project
+        working-directory: apps/mobile
+        # `--clean` so the Xcode project is derived from app.json every time
+        # rather than drifting from a stale committed copy. The project is
+        # gitignored, so there is nothing to preserve.
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods
+        working-directory: apps/mobile
+        run: pod install
+
+      - name: Build unsigned Release binary
+        working-directory: apps/mobile
+        run: |
+          set -euo pipefail
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
+          PROJECT=$(ls -d ios/*.xcodeproj | head -1)
+          SCHEME=$(basename "$PROJECT" .xcodeproj)
+          echo "Building $SCHEME from $WORKSPACE"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      - name: Package the .app as an unsigned IPA
+        working-directory: apps/mobile
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "no .app produced" >&2; exit 1; }
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry hat-unsigned.ipa Payload
+          unzip -l hat-unsigned.ipa | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hat-unsigned-ipa
+          path: apps/mobile/hat-unsigned.ipa
+          if-no-files-found: error

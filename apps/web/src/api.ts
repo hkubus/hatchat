@@ -5,8 +5,8 @@ import type {
   ReasoningEffort,
   Usage,
 } from "@hat/core";
+import { SseFrameParser, decodeFrame } from "@hat/core";
 import { apiUrl, bearerHeaders } from "./runtime";
-import { SseFrameParser, decodeFrame } from "./sse";
 
 /** Carries the HTTP status so callers can tell "gone" from "unreachable". */
 export class HttpError extends Error {

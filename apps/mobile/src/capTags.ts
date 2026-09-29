@@ -1,0 +1,56 @@
+import type { ModelInfo, ProviderCapabilities } from "@hat/core";
+
+export interface CapTag {
+  key: string;
+  label: string;
+  title: string;
+}
+
+/**
+ * Compact context-window label: 1048576 -> "1M", 200000 -> "200k", 8192 -> "8k".
+ * Deliberately rounds to whole thousands, unlike the measured counts in
+ * `tokens.ts`: a window is an advertised round number, so "8k" reads truer than
+ * "8.2k".
+ */
+export function formatContext(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens <= 0) return "";
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    const rounded = millions >= 10 || Number.isInteger(millions) ? Math.round(millions) : Math.round(millions * 10) / 10;
+    return `${rounded}M`;
+  }
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`;
+  return `${tokens}`;
+}
+
+/** The capability chips shown against a model, in a stable order. */
+export function capTags(caps: ProviderCapabilities, contextWindow?: number): CapTag[] {
+  const tags: CapTag[] = [];
+  if (caps.toolCalls) tags.push({ key: "tools", label: "tools", title: "Can call tools" });
+  if (caps.vision) tags.push({ key: "vision", label: "vision", title: "Accepts image input" });
+  if (caps.reasoning) {
+    tags.push({ key: "reasoning", label: "reasoning", title: "Exposes reasoning output" });
+  }
+  if (caps.reasoningEffort) {
+    tags.push({
+      key: "effort",
+      label: "effort",
+      title: "Supports a tunable reasoning effort",
+    });
+  }
+  if (caps.jsonMode) tags.push({ key: "json", label: "json", title: "Supports JSON mode" });
+  if (contextWindow) {
+    tags.push({
+      key: "ctx",
+      label: `${formatContext(contextWindow)} ctx`,
+      title: `${contextWindow.toLocaleString()} token context window`,
+    });
+  }
+  return tags;
+}
+
+/** One-line capability summary, used where there is no room for chips. */
+export function capSummary(model: ModelInfo): string {
+  const tags = capTags(model.capabilities, model.contextWindow);
+  return tags.length > 0 ? tags.map((t) => t.label).join(" · ") : "no capabilities reported";
+}
