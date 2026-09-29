@@ -5,6 +5,8 @@ export interface HostCapabilities {
   arch: string;
   runtimes: string[];
   tags: string[];
+  /** Effective isolation tier for shell commands; absent on older runners. */
+  sandbox?: "host" | "container";
 }
 
 export interface ExecRequest {

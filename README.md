@@ -96,11 +96,27 @@ processes). `GET /api/runners` reports each runner's load.
 
 ## Sandbox tier (M6)
 
-`HAT_EXEC_SANDBOX=container` wraps every `shell_exec` on the runner in a
-throwaway container (`docker run --rm -i --network <n> --memory <m> --cpus <c>
---pids-limit 512 -v <workspace>:/workspace -w /workspace <image> sh -lc <cmd>`).
-Defaults to `host`. Requires a container runtime on the runner; the image should
-include the tools you expect (e.g. `node:22-slim`, or your own).
+In the `container` tier every `shell_exec` on the runner (and every shell-mode
+process, such as background processes and the Python tool) runs in a throwaway
+container (`docker run --rm -i --network <n> --memory <m> --cpus <c>
+--pids-limit 512 -v <workspace>:/workspace -w /workspace <image> sh -lc <cmd>`),
+hardened with `--cap-drop=ALL`, `no-new-privileges`, a read-only root
+filesystem and a non-root user. The image should include the tools you expect
+(e.g. `node:22-slim`, or your own).
+
+`HAT_EXEC_SANDBOX` picks the tier:
+
+- `auto` (default): at startup the runner probes for a working runtime (docker,
+  then podman; 5s timeout each) and uses `container` if one answers, otherwise
+  `host`.
+- `container`: always sandbox. The runner refuses to start if no runtime works.
+- `host`: run commands directly on the runner, with its privileges.
+
+`HAT_SANDBOX_RUNTIME` pins the runtime binary (e.g. `podman` or a full path);
+only that one is probed. The runner logs the chosen tier and why at startup,
+and advertises it as `capabilities.sandbox` (`host` | `container`) in
+`GET /api/runners`. The compose runner has no runtime (and no Docker socket), so
+it is pinned to `host`.
 
 ## MCP (M5)
 
@@ -478,8 +494,11 @@ This is a single-user app. Before exposing it:
 1. **Set `HAT_AUTH_TOKEN`.** With it unset, `/api` is unauthenticated.
 2. Prefer passkeys/session cookies over a bearer token (M6 work) and terminate
    TLS at a reverse proxy (Caddy/Traefik).
-3. The `shell_exec` tool is approval-gated per command by default. Keep it that
-   way until the container isolation tier (M6) lands.
+3. Run the runner where a container runtime is available so `shell_exec` gets
+   the container sandbox tier (the `auto` default picks it up; set
+   `HAT_EXEC_SANDBOX=container` to make it mandatory), and check
+   `capabilities.sandbox` in `GET /api/runners`. Keep `shell_exec` approval-gated
+   per command (the default) on any runner still in the `host` tier.
 4. Strongest cheap win: put both server and runner behind Tailscale/WireGuard
    and don't expose ports at all.
 

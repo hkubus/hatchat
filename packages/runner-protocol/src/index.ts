@@ -14,6 +14,7 @@ export const hostCapabilitiesSchema = z.object({
   arch: z.string(),
   runtimes: z.array(z.string()),
   tags: z.array(z.string()),
+  sandbox: z.enum(["host", "container"]).optional(),
 });
 
 export const dirEntrySchema = z.object({

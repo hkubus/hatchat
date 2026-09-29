@@ -10,6 +10,7 @@ import { detectCapabilities } from "./capabilities.js";
 import { loadConfig, type RunnerConfig } from "./config.js";
 import { startJob, type JobHandle } from "./exec.js";
 import { startProcess, type ProcessHandle } from "./processes.js";
+import { resolveSandbox, type SandboxConfig } from "./sandbox.js";
 import { WorkspaceManager } from "./workspace.js";
 
 try {
@@ -37,7 +38,10 @@ class Runner {
   private stopped = false;
   private readonly startedAt = Date.now();
 
-  constructor(private readonly config: RunnerConfig) {
+  constructor(
+    private readonly config: RunnerConfig,
+    private readonly sandbox: SandboxConfig,
+  ) {
     this.workspace = new WorkspaceManager(config.workspaceRoot, config.maxOutputBytes);
   }
 
@@ -77,7 +81,7 @@ class Runner {
         runnerId: this.config.runnerId,
         enrollToken: this.config.enrollToken,
         credential: this.config.credential,
-        caps: detectCapabilities(this.config.tags),
+        caps: detectCapabilities(this.config.tags, this.sandbox),
       });
     });
 
@@ -199,7 +203,7 @@ class Runner {
         stdin: message.stdin,
         maxOutputBytes: this.config.maxOutputBytes,
       },
-      this.config.sandbox,
+      this.sandbox,
       (out) => this.send(out),
       (jobId) => this.jobs.delete(jobId),
     );
@@ -225,7 +229,7 @@ class Runner {
         args: message.args,
         cwd,
         env: message.env,
-        shell: message.shell ? this.config.sandbox : undefined,
+        shell: message.shell ? this.sandbox : undefined,
       },
       (out) => this.send(out),
       (procId) => this.processes.delete(procId),
@@ -323,7 +327,26 @@ async function runFetch(
   }
 }
 
-const runner = new Runner(loadConfig());
+/** Load config and settle the sandbox tier once, before the first hello. */
+async function createRunner(): Promise<Runner> {
+  const config = loadConfig();
+  const { sandbox, reason } = await resolveSandbox(config.sandbox);
+  const tier =
+    sandbox.mode === "container" ? `container (${sandbox.runtime}, image ${sandbox.image})` : "host";
+  log(`sandbox tier: ${tier}, because ${reason}`);
+  if (sandbox.mode === "host") {
+    log("warning: shell commands run directly on this host with the runner's privileges");
+  }
+  return new Runner(config, sandbox);
+}
+
+let runner: Runner;
+try {
+  runner = await createRunner();
+} catch (error) {
+  console.error(`[runner] ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
 runner.start();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
