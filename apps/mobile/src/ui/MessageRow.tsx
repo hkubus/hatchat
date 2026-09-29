@@ -7,7 +7,7 @@
  * the message below does not re-render the ones above.
  *
  * Long-pressing a message opens the system context menu (Copy, Select Text,
- * Share, Edit / Regenerate), the way Messages does. Reasoning and tool output
+ * Share, Edit / Regenerate, Fork from Here), the way Messages does. Reasoning and tool output
  * are collapsed by default: they are the parts of a turn that can run to
  * hundreds of lines, and left open they bury the answer. What a tool exists to
  * *show* stays out of the fold: a `todo_write` checklist, a pending `ask_user`
@@ -32,6 +32,7 @@ import type { UiFile, UiImage, UiMessage, UiTool } from "@hat/core";
 import { formatBytes, joinAnswer, questionOf, todosOf, toolSummary } from "@hat/core";
 import * as haptics from "../haptics";
 import { useTheme } from "../theme";
+import { LOCAL_PREFIX } from "../useChat";
 import { Badge, Button, Mono } from "./controls";
 import Icon from "./Icon";
 import type { IconName } from "./Icon";
@@ -432,6 +433,8 @@ function FileCard({ file }: { file: UiFile }) {
   const theme = useTheme();
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
+  // A document on the optimistic user message is not on the server yet.
+  const pending = file.id.startsWith(LOCAL_PREFIX);
 
   const open = async () => {
     setLoading(true);
@@ -452,7 +455,7 @@ function FileCard({ file }: { file: UiFile }) {
       accessibilityRole="button"
       accessibilityLabel={`Open ${file.name}`}
       onPress={() => void open()}
-      disabled={loading}
+      disabled={loading || pending}
       style={({ pressed }) => [
         styles.file,
         { backgroundColor: theme.color.surfaceAlt },
@@ -468,10 +471,12 @@ function FileCard({ file }: { file: UiFile }) {
           style={[styles.fileMeta, { color: failed ? theme.color.danger : theme.color.textDim }]}
           numberOfLines={1}
         >
-          {failed ? "Couldn’t open — tap to retry" : `${formatBytes(file.size)} · ${file.mime}`}
+          {failed
+            ? "Couldn’t open — tap to retry"
+            : [file.size > 0 ? formatBytes(file.size) : "", file.mime].filter(Boolean).join(" · ")}
         </Text>
       </View>
-      {loading ? (
+      {loading || pending ? (
         <ActivityIndicator size="small" color={theme.color.textFaint} />
       ) : (
         <Icon name="square.and.arrow.up" size={17} color={theme.color.accent} />
@@ -511,6 +516,8 @@ export interface MessageRowProps {
   streaming: boolean;
   onRegenerate: (messageId: string) => void;
   onEdit: (messageId: string) => void;
+  /** Start a new conversation from the path up to this message. */
+  onFork: (messageId: string) => void;
   /**
    * Called with the sibling id to switch to. The id is resolved by the caller
    * from the row's own branch data, since the row only knows the index.
@@ -534,6 +541,7 @@ function MessageRowBase({
   streaming,
   onRegenerate,
   onEdit,
+  onFork,
   onSwitchBranch,
   onDecide,
   onAnswer,
@@ -572,16 +580,25 @@ function MessageRowBase({
         ]
       : []),
     ...(idle
-      ? [
-          isUser
-            ? { id: "edit", title: "Edit", icon: "pencil" as const, onPress: () => onEdit(message.id) }
-            : {
-                id: "regenerate",
-                title: "Regenerate",
-                icon: "arrow.clockwise" as const,
-                onPress: () => onRegenerate(message.id),
-              },
-        ]
+      ? isUser
+        ? [{ id: "edit", title: "Edit", icon: "pencil" as const, onPress: () => onEdit(message.id) }]
+        : [
+            {
+              id: "regenerate",
+              title: "Regenerate",
+              icon: "arrow.clockwise" as const,
+              onPress: () => onRegenerate(message.id),
+            },
+            // Offered on replies only: a fork ending on a user message would
+            // have no reply to regenerate or continue from.
+            {
+              id: "fork",
+              title: "Fork from Here",
+              subtitle: "New conversation up to this reply",
+              icon: "arrow.triangle.branch" as const,
+              onPress: () => onFork(message.id),
+            },
+          ]
       : []),
   ];
 
@@ -627,7 +644,19 @@ function MessageRowBase({
 
   return (
     <View style={[styles.row, isUser ? styles.rowUser : styles.rowAssistant]}>
-      {menu.length > 0 ? (
+      {/* Attached documents sit above the bubble as their own cards, the way
+          Messages shows attachments. Tapping one shares the stored file. */}
+      {message.files.length > 0 ? (
+        <View style={isUser ? styles.userFiles : styles.artifacts}>
+          {message.files.map((file) => (
+            <FileCard key={file.id} file={file} />
+          ))}
+        </View>
+      ) : null}
+
+      {/* A message of documents alone has nothing to put in a bubble; an
+          empty one would be a stray blue dot under the cards. */}
+      {isUser && !message.text && message.images.length === 0 ? null : menu.length > 0 ? (
         <Menu items={menu} trigger="longPress" style={isUser ? styles.menuUser : styles.menuAssistant}>
           {bubble}
         </Menu>
@@ -808,6 +837,7 @@ const styles = StyleSheet.create({
   answerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   answerInput: { flex: 1, minHeight: 36, borderRadius: 10, paddingHorizontal: 10, fontSize: 15 },
   artifacts: { gap: 8 },
+  userFiles: { gap: 6, width: "80%", maxWidth: 360 },
   artifactImage: { width: "100%", maxHeight: 420, borderRadius: 12, overflow: "hidden" },
   file: { flexDirection: "row", alignItems: "center", gap: 12, borderRadius: 12, padding: 12 },
   fileName: { fontSize: 15, fontWeight: "600" },

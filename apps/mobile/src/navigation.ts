@@ -15,6 +15,8 @@ export type RootStackParamList = {
   Chat: undefined;
   Settings: undefined;
   Model: undefined;
+  /** Instructions, temperature and max tokens for the open conversation. */
+  Conversation: undefined;
 };
 
 export type ScreenProps<T extends keyof RootStackParamList> = NativeStackScreenProps<

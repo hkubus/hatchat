@@ -6,12 +6,15 @@
  * the session list, and the settings screen can all read one source of truth
  * without any of them owning it.
  *
- * Two invariants from the web client are load-bearing and preserved verbatim:
+ * Two invariants from the web client are load-bearing:
  *
- *   - **Usage is not double-counted.** `liveUsage` accumulates the turn in
- *     flight and is cleared only *after* the post-turn refresh has folded the
- *     server's stored usage into `messages`. Clearing it earlier would add the
- *     same tokens twice.
+ *   - **Usage is counted once.** A `usage` event lands on the in-flight
+ *     message it belongs to (see `applyEffect`), so the turn's cost travels
+ *     with its messages: into `messages` when they are promoted at the end of
+ *     the turn, and then replaced by the server's stored figures on refresh.
+ *     There is deliberately no separate running tally: one would have to be
+ *     cleared at exactly the moment the promoted messages start counting, and
+ *     getting that wrong adds the same tokens twice.
  *   - **A turn always ends in a refresh.** The streamed view is an optimistic
  *     projection; the server's path is the truth. That is what makes abort,
  *     mid-turn failure, and multi-iteration tool loops land on something
@@ -19,16 +22,29 @@
  */
 
 import type { ModelInfo, ReasoningEffort, Usage } from "@hat/core";
-import { REASONING_EFFORTS, addUsage, sumUsage } from "@hat/core";
+import { REASONING_EFFORTS, sumUsage } from "@hat/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState } from "react-native";
 import * as api from "./api";
 import type { ApprovalMode, ApprovalDecision, RunnerSummary, SessionRecord, SessionSummary } from "./api";
 import type { UiMessage } from "@hat/core";
-import { applyEffect, approvalForDecision, buildMessages, readEvent } from "@hat/core";
+import {
+  applyEffect,
+  approvalForDecision,
+  buildMessages,
+  contextFill,
+  endsTruncated,
+  readEvent,
+} from "@hat/core";
 import { loadPref, savePref } from "./runtime";
 
 const DEFAULT_MODEL = "fake/fake-agent";
+
+/**
+ * Prefix of ids the app makes up for things shown before the server has
+ * stored them (the optimistic user message and its document chips).
+ */
+export const LOCAL_PREFIX = "local-";
 
 export interface PendingAttachment {
   uri: string;
@@ -36,6 +52,20 @@ export interface PendingAttachment {
   type: string;
   /** Local file URI, used for the preview thumbnail before the upload lands. */
   previewUri: string;
+  /**
+   * `image` is sent to the model as pixels; a `document` (text, code, PDF) is
+   * read as text by the server and shown as a file chip. Absent means image.
+   */
+  kind?: "image" | "document";
+  /** Bytes, when the picker reported it; shown on the document chip. */
+  size?: number;
+}
+
+/** The per-conversation settings edited on the Conversation screen. */
+export interface ConversationSettings {
+  instructions: string;
+  temperature: number | null;
+  maxTokens: number | null;
 }
 
 export interface ChatStore {
@@ -57,6 +87,13 @@ export interface ChatStore {
   allowedTools: string[];
   /** Everything the visible branch has cost, including the turn in flight. */
   sessionUsage: Usage;
+  /**
+   * How full the selected model's context window is, judged by the latest
+   * model call; undefined when the window or the usage is unknown.
+   */
+  contextUsage: { tokens: number; fraction: number; window: number } | undefined;
+  /** The conversation ends on a reply cut off at the output limit, and nothing is running. */
+  canContinue: boolean;
   selectedModel: ModelInfo | undefined;
 
   clearError: () => void;
@@ -70,6 +107,14 @@ export interface ChatStore {
   renameSession: (id: string, title: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   regenerate: (messageId: string) => Promise<void>;
+  /** Stream the rest of a reply that was cut off at the output limit. */
+  continueReply: () => Promise<void>;
+  /** Start a new conversation from the path up to `messageId` and switch to it. */
+  forkAt: (messageId: string) => Promise<void>;
+  /** Open a conversation on the branch that contains `messageId` (a search hit). */
+  openMessage: (sessionId: string, messageId: string) => Promise<void>;
+  /** Instructions, temperature and max tokens for the current conversation. */
+  updateConversation: (settings: ConversationSettings) => Promise<void>;
   editMessage: (messageId: string, text: string) => Promise<void>;
   switchBranch: (messageId: string) => Promise<void>;
   decide: (callId: string, decision: ApprovalDecision) => Promise<void>;
@@ -89,7 +134,6 @@ export function useChat(): ChatStore {
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [inFlight, setInFlightState] = useState<UiMessage[]>([]);
-  const [liveUsage, setLiveUsage] = useState<Usage | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -167,16 +211,23 @@ export function useChat(): ChatStore {
     (event: Parameters<typeof readEvent>[0], turnId: number) => {
       if (turnRef.current !== turnId) return;
 
-      if (event.type === "usage") {
-        // Usage is a per-iteration delta, so it accumulates.
-        setLiveUsage((prev) => addUsage(prev, event.usage));
-        return;
-      }
-
       const effect = readEvent(event);
       switch (effect.kind) {
         case "reset-usage":
-          setLiveUsage(undefined);
+          // Nothing to reset: usage lives on the in-flight messages (the
+          // `usage` effect falls through to `applyEffect` below), and every
+          // turn starts with none.
+          break;
+        case "finish-message":
+          // The message is complete, and durable on the server. The finish
+          // reason is what lets a reply cut off at the output limit offer
+          // Continue even if the post-turn refresh fails; dropping `streaming`
+          // stops its pulse while later iterations of the turn still run.
+          setInFlight((current) =>
+            applyEffect(current, effect).map((m) =>
+              m.id === effect.messageId ? { ...m, streaming: false } : m,
+            ),
+          );
           break;
         case "error":
           setError(effect.message);
@@ -210,15 +261,15 @@ export function useChat(): ChatStore {
    */
   const finishTurn = useCallback(
     async (id: string) => {
-      if (inFlightRef.current.length > 0) {
-        setMessages((prev) => [...prev, ...inFlightRef.current]);
+      // Moved, not copied, with their streamed usage: the refresh then
+      // replaces it with the stored figures, so it is counted exactly once.
+      const streamed = inFlightRef.current.map((m) => ({ ...m, streaming: false }));
+      if (streamed.length > 0) {
+        setMessages((prev) => [...prev, ...streamed]);
       }
       setInFlight([]);
       await refresh(id).catch(() => undefined);
       await refreshSessions().catch(() => undefined);
-      // Dropped only now: `messages` already carries the stored usage, so
-      // keeping `liveUsage` would count the same tokens twice.
-      setLiveUsage(undefined);
       setBusy(false);
     },
     [refresh, refreshSessions],
@@ -477,13 +528,18 @@ export function useChat(): ChatStore {
 
       setError(null);
 
-      // Upload first, so a rejected image fails before anything is persisted.
-      let attachmentIds: string[] = [];
+      // Upload first, so a rejected file fails before anything is persisted.
+      const attachmentIds: string[] = [];
+      const attachmentNames: Record<string, string> = {};
       if (attachments.length > 0) {
         try {
-          attachmentIds = await Promise.all(
-            attachments.map(async (a) => (await api.uploadAttachment(a)).id),
-          );
+          const records = await Promise.all(attachments.map((a) => api.uploadAttachment(a)));
+          records.forEach((record, index) => {
+            attachmentIds.push(record.id);
+            // Stored content is keyed by hash, so the name has to travel with
+            // the turn: a deduplicated upload would keep its first name.
+            if (record.kind === "document") attachmentNames[record.id] = attachments[index].name;
+          });
         } catch (e) {
           setError(describe(e));
           return;
@@ -495,20 +551,31 @@ export function useChat(): ChatStore {
       setMessages((prev) => [
         ...prev,
         {
-          id: `local-${Date.now()}`,
+          id: `${LOCAL_PREFIX}${Date.now()}`,
           role: "user",
           text: body,
           reasoning: "",
           tools: [],
-          images: attachments.map((a) => ({ src: a.previewUri })),
-          files: [],
+          images: attachments
+            .filter((a) => a.kind !== "document")
+            .map((a) => ({ src: a.previewUri })),
+          // `local-` ids mark these as not stored yet, so the chip does not
+          // offer a download until the refresh swaps in the real ones.
+          files: attachments
+            .filter((a) => a.kind === "document")
+            .map((a, index) => ({
+              id: `${LOCAL_PREFIX}${index}-${a.uri}`,
+              name: a.name,
+              mime: a.type,
+              size: a.size ?? 0,
+            })),
         },
       ]);
 
       try {
         const id = await ensureSession();
         await runStream(id, (onEvent, signal) =>
-          api.sendTurn(id, body, model, attachmentIds, onEvent, signal),
+          api.sendTurn(id, body, model, { ids: attachmentIds, names: attachmentNames }, onEvent, signal),
         );
       } catch (e) {
         if (!api.isAbortError(e)) setError(describe(e));
@@ -583,6 +650,50 @@ export function useChat(): ChatStore {
       );
     },
     [sessionId, busy, runStream],
+  );
+
+  const continueReply = useCallback(async () => {
+    if (!sessionId || busy) return;
+    await runStream(sessionId, (onEvent, signal) => api.continueTurn(sessionId, onEvent, signal));
+  }, [sessionId, busy, runStream]);
+
+  const forkAt = useCallback(
+    async (messageId: string) => {
+      if (!sessionId || busy) return;
+      const payload = await api.forkSession(sessionId, messageId);
+      // Switch the way `openSession` does. A fork is idle by construction, so
+      // there is no turn to follow.
+      abandonTurn();
+      setError(null);
+      setWarnings([]);
+      setInFlight([]);
+      setSessionId(payload.session.id);
+      setMessages(buildMessages(payload.path));
+      applySession(payload.session);
+      await savePref("session", payload.session.id);
+      await refreshSessions().catch(() => undefined);
+    },
+    [sessionId, busy, abandonTurn, setSessionId, applySession, refreshSessions],
+  );
+
+  const openMessage = useCallback(
+    async (targetSession: string, messageId: string) => {
+      // Select first, so the conversation opens on the branch with the hit
+      // rather than on whichever branch was active last.
+      await api.selectBranch(targetSession, messageId);
+      await openSession(targetSession);
+    },
+    [openSession],
+  );
+
+  const updateConversation = useCallback(
+    async (settings: ConversationSettings) => {
+      // A new chat has no server session until its first message; settings
+      // made before then create it.
+      const id = await ensureSession();
+      applySession(await api.updateSession(id, settings));
+    },
+    [ensureSession, applySession],
   );
 
   const editMessage = useCallback(
@@ -709,15 +820,30 @@ export function useChat(): ChatStore {
 
   // --- derived ------------------------------------------------------------
 
+  // The in-flight messages carry the turn's usage until they are promoted, so
+  // the two lists together are the whole branch with each call counted once.
+  // `inFlight` is rebuilt on every streamed token but its usage objects are
+  // not, so keying on them keeps these values (and the navigation bar that
+  // shows them) from being rebuilt per token.
+  const liveUsages = useStableList(inFlight.map((m) => m.usage));
   const sessionUsage = useMemo(
-    () => sumUsage([...messages.map((m) => m.usage), liveUsage]),
-    [messages, liveUsage],
+    () => sumUsage([...messages.map((m) => m.usage), ...liveUsages]),
+    [messages, liveUsages],
   );
 
   const selectedModel = useMemo(
     () => models.find((m) => m.id === model),
     [models, model],
   );
+
+  const contextWindow = selectedModel?.contextWindow;
+  const contextUsage = useMemo(() => {
+    const live = liveUsages.map((usage) => ({ role: "assistant" as const, usage }));
+    const fill = contextFill([...messages, ...live], contextWindow);
+    return fill && contextWindow ? { ...fill, window: contextWindow } : undefined;
+  }, [messages, liveUsages, contextWindow]);
+
+  const canContinue = !busy && inFlight.length === 0 && endsTruncated(messages);
 
   return {
     ready,
@@ -736,6 +862,8 @@ export function useChat(): ChatStore {
     policyMode,
     allowedTools,
     sessionUsage,
+    contextUsage,
+    canContinue,
     selectedModel,
     clearError: useCallback(() => setError(null), []),
     reportError: useCallback((message: string) => setError(message), []),
@@ -747,6 +875,10 @@ export function useChat(): ChatStore {
     renameSession,
     deleteSession,
     regenerate,
+    continueReply,
+    forkAt,
+    openMessage,
+    updateConversation,
     editMessage,
     switchBranch,
     decide,
@@ -756,6 +888,16 @@ export function useChat(): ChatStore {
     setPolicyMode,
     setAllowedTools,
   };
+}
+
+/** The previous array while every element is the same object, else `list`. */
+function useStableList<T>(list: T[]): T[] {
+  const ref = useRef(list);
+  const prev = ref.current;
+  if (prev.length !== list.length || prev.some((item, index) => item !== list[index])) {
+    ref.current = list;
+  }
+  return ref.current;
 }
 
 /** Turn anything thrown into something worth showing a user. */
