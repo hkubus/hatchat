@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   ChatMessage,
   ExecutionHost,
+  MessageMeta,
   KernelEvent,
   Part,
   ProcessHost,
@@ -51,6 +52,8 @@ import { RunnerRegistry } from "./link.js";
 import { createAuditLog, createLogger } from "./logger.js";
 import { KEEPALIVE, kernelStream } from "./sse.js";
 import { generateTitle } from "./title.js";
+import { IMAGE_MIME, readUpload } from "./documents.js";
+import { exportMarkdown, isSessionExport } from "./transfer.js";
 import { TurnHub, type Turn } from "./turns.js";
 import { loadExternalPlugins } from "./plugin-loader.js";
 import { createArtifactsPlugin } from "./tools/artifacts.js";
@@ -71,7 +74,13 @@ interface TurnOptions {
   history: ChatMessage[];
   userText?: string;
   userParts?: Part[];
+  userMeta?: MessageMeta;
 }
+
+/** What the "Continue" button sends on the user's behalf. */
+const CONTINUE_PROMPT =
+  "Your previous reply was cut off by the output limit. Continue exactly where it stopped, " +
+  "without repeating what you already wrote and without any preamble.";
 
 export async function createServer(config: ServerConfig): Promise<ServerRuntime> {
   const logger = createLogger();
@@ -164,7 +173,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createPythonPlugin());
   pluginHost.register(createArtifactsPlugin(store));
   pluginHost.register(createMemoryPlugin(store));
-  const questions = new QuestionManager();
+  const questions = new QuestionManager(config.approvalTimeoutMs);
   pluginHost.register(createPlanningPlugin(questions));
   pluginHost.register(
     createSubagentPlugin({
@@ -207,12 +216,14 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createMcpPlugin());
 
   for (const plugin of config.enableExternalPlugins
-    ? await loadExternalPlugins(config.pluginsDir, logger)
+    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation })
     : []) {
     pluginHost.register(plugin, "external");
   }
   if (!config.enableExternalPlugins) {
     logger.info("external plugins disabled (HAT_ENABLE_EXTERNAL_PLUGINS=false)");
+  } else if (!config.pluginIsolation) {
+    logger.warn("external plugin isolation is off (HAT_PLUGINS_ISOLATION); plugins run in-process");
   }
 
   await pluginHost.activateAll();
@@ -225,7 +236,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   const turns = new TurnHub();
   const approvals = new ApprovalManager((sessionId, event) => {
     turns.emit(sessionId, event);
-  });
+  }, config.approvalTimeoutMs);
 
   const resolveHost = async (sessionId: string): Promise<ExecutionHost> => {
     const channel = registry.acquire();
@@ -257,6 +268,11 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       if (!record || !data) return undefined;
       return { data: data.toString("base64"), mime: record.mime };
     },
+    resolveFile: async (attachmentId) => {
+      const text = store.getAttachmentText(attachmentId);
+      return text === undefined ? undefined : { text };
+    },
+    maxRetries: config.providerRetries,
   });
 
   const app = new Hono();
@@ -446,9 +462,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     // the title is still the derived placeholder. It never gates turn.done:
     // a slow titling model must not hold the stream open.
     const titleModel = config.titleModel ?? model;
+    // The subject is what the user typed; a turn with attachments carries it
+    // in its parts, and the synthetic "Continue" nudge is not the user's words.
+    const subject = options.userMeta?.synthetic
+      ? ""
+      : (options.userText ??
+        (options.userParts ?? []).map((part) => (part.type === "text" ? part.text : "")).join(" ")
+      ).trim();
     const titling =
-      session && session.titleSource === "derived" && options.userText?.trim()
-        ? generateTitle({ providers, model: titleModel, subject: options.userText, logger })
+      session && session.titleSource === "derived" && subject
+        ? generateTitle({ providers, model: titleModel, subject, logger })
             .then((title) => {
               if (title && store.setGeneratedTitle(options.sessionId, title)) {
                 turn.push({ type: "session.title", sessionId: options.sessionId, title });
@@ -465,9 +488,13 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
           model,
           userText: options.userText,
           userParts: options.userParts,
+          userMeta: options.userMeta,
           signal: turn.signal,
           toolPolicy: session ? policyFor(session) : undefined,
           reasoningEffort: session?.reasoningEffort,
+          instructions: session?.instructions || undefined,
+          temperature: session?.temperature ?? undefined,
+          maxTokens: session?.maxTokens ?? undefined,
           emit: (event) => turn.push(event),
         })) {
           turn.push(event);
@@ -523,7 +550,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- meta ---------------------------------------------------------------
 
-  app.get("/", (c) => c.text("hat server — M2\n"));
+  app.get("/", (c) => c.text("hat server\n"));
 
   app.get("/api/health", (c) =>
     c.json({
@@ -547,13 +574,6 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- attachments --------------------------------------------------------
 
-  const ALLOWED_UPLOAD_MIME = new Set([
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-  ]);
-
   app.post("/api/attachments", async (c) => {
     if (!uploadLimiter.allow(clientIp(c))) {
       return c.json({ error: "too many uploads; try again later" }, 429);
@@ -565,14 +585,22 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (file.size > 25 * 1024 * 1024) return c.json({ error: "file too large (max 25MB)" }, 413);
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const mime = file.type || "application/octet-stream";
-    if (!ALLOWED_UPLOAD_MIME.has(mime)) {
-      return c.json({ error: "only PNG, JPEG, GIF, WebP images are supported" }, 415);
-    }
-    const record = await store.putAttachment(buffer, mime);
+    const name = (file.name || "file").replace(/[\r\n]/g, " ").slice(0, 200);
+    const upload = await readUpload(buffer, file.type || "", name);
+    if (upload.kind === "rejected") return c.json({ error: upload.error }, upload.status);
+    const record =
+      upload.kind === "image"
+        ? await store.putAttachment(buffer, upload.mime)
+        : await store.putAttachment(buffer, upload.mime, { name, text: upload.text });
     const storeUrl = await store.attachmentUrl(record.id);
     return c.json({
-      attachment: { ...record, url: storeUrl ?? `/api/attachments/${record.id}` },
+      attachment: {
+        ...record,
+        kind: upload.kind,
+        // A deduplicated upload keeps its first name; this upload's name wins here.
+        ...(upload.kind === "document" ? { name } : {}),
+        url: storeUrl ?? `/api/attachments/${record.id}`,
+      },
     });
   });
 
@@ -671,6 +699,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- sessions -----------------------------------------------------------
 
+  /**
+   * What a conversation is doing right now, for the sidebar: a turn running,
+   * or a turn blocked on the user (a tool approval or an `ask_user` question).
+   */
+  const statusOf = (sessionId: string): "idle" | "running" | "waiting" => {
+    if (approvals.isWaiting(sessionId) || questions.isWaiting(sessionId)) return "waiting";
+    const turn = turns.get(sessionId);
+    return turn && !turn.done ? "running" : "idle";
+  };
+
   app.get("/api/sessions", (c) => {
     const usage = store.usageBySession();
     return c.json({
@@ -678,11 +716,59 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
         id: s.id,
         title: s.title,
         model: s.model,
-        messageCount: store.countMessages(s.id),
+        messageCount: store.countVisibleMessages(s.id),
         usage: usage.get(s.id) ?? null,
+        status: statusOf(s.id),
         updatedAt: s.updatedAt,
       })),
     });
+  });
+
+  /** Recreate a conversation from a `GET /export` JSON file. */
+  app.post("/api/sessions/import", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "expected a JSON export" }, 400);
+    }
+    if (!isSessionExport(body)) {
+      return c.json({ error: "not a hat conversation export (format hat.session, version 1)" }, 400);
+    }
+    // Attachments travel inline; re-store them and point the parts at the new ids.
+    const remap = new Map<string, string>();
+    for (const [oldId, attachment] of Object.entries(body.attachments ?? {})) {
+      try {
+        const record = await store.putAttachment(
+          Buffer.from(attachment.data, "base64"),
+          attachment.mime,
+          attachment.text !== undefined ? { name: attachment.name, text: attachment.text } : undefined,
+        );
+        remap.set(oldId, record.id);
+      } catch (error) {
+        logger.warn("import: attachment skipped", normalizeError(error, "import_attachment"));
+      }
+    }
+    const session = store.importSession(body, (part) => {
+      if (part.type === "image" && part.source.kind === "attachment") {
+        const id = remap.get(part.source.id);
+        return id ? { ...part, source: { ...part.source, id } } : { type: "text", text: "[image not included in the import]" };
+      }
+      if (part.type === "file") {
+        const id = remap.get(part.id);
+        return id ? { ...part, id } : part;
+      }
+      if (part.type === "tool_result") {
+        return {
+          ...part,
+          content: part.content.map((inner) =>
+            inner.type === "file" && remap.has(inner.id) ? { ...inner, id: remap.get(inner.id)! } : inner,
+          ),
+        };
+      }
+      return part;
+    });
+    return c.json({ session, path: pathOf(session.id) });
   });
 
   app.post("/api/sessions", async (c) => {
@@ -711,12 +797,18 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       approvalMode?: "ask" | "auto" | "allowlist" | "deny";
       allowedTools?: string[];
       reasoningEffort?: unknown;
+      instructions?: unknown;
+      temperature?: unknown;
+      maxTokens?: unknown;
     } = {};
     try {
       body = await c.req.json();
     } catch {
       /* ignore */
     }
+    const settings = parseSessionSettings(body);
+    if ("error" in settings) return c.json({ error: settings.error }, 400);
+    store.setSessionSettings(session.id, settings);
     if (body.model) store.setSessionModel(session.id, body.model);
     if (typeof body.title === "string" && body.title.trim()) {
       store.setSessionTitle(session.id, body.title.trim().slice(0, 200));
@@ -736,6 +828,71 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ ok: removed });
   });
 
+  /** Start a new conversation from this one's path up to `messageId`. */
+  app.post("/api/sessions/:id/fork", async (c) => {
+    const session = store.getSession(c.req.param("id"));
+    if (!session) return c.json({ error: "not found" }, 404);
+    let body: { messageId?: unknown } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      /* ignore */
+    }
+    const messageId = typeof body.messageId === "string" ? body.messageId : session.activeLeafId;
+    if (!messageId) return c.json({ error: "nothing to fork yet" }, 400);
+    const fork = store.forkSession(session.id, messageId);
+    if (!fork) return c.json({ error: "messageId must reference a message in this conversation" }, 400);
+    return c.json({ session: fork, path: pathOf(fork.id) });
+  });
+
+  /**
+   * Download a conversation. `format=markdown` is the active branch as a
+   * readable transcript; the default JSON is the whole tree with attachments
+   * inline, suitable for `POST /api/sessions/import`.
+   */
+  app.get("/api/sessions/:id/export", async (c) => {
+    const session = store.getSession(c.req.param("id"));
+    if (!session) return c.json({ error: "not found" }, 404);
+    const format = c.req.query("format") === "markdown" ? "markdown" : "json";
+    const base = (session.title || "conversation").replace(/[^\p{L}\p{N} _.-]+/gu, "").trim().slice(0, 80) || "conversation";
+    const filename = `${base}.${format === "markdown" ? "md" : "json"}`;
+    const disposition = `attachment; filename="${filename.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+    if (format === "markdown") {
+      return c.body(exportMarkdown(session, pathOf(session.id).map((n) => n.message)), 200, {
+        "content-type": "text/markdown; charset=utf-8",
+        "content-disposition": disposition,
+      });
+    }
+    const data = store.exportSession(session.id)!;
+    const attachments: Record<string, { mime: string; name?: string; text?: string; data: string }> = {};
+    const collect = async (id: string): Promise<void> => {
+      if (attachments[id]) return;
+      const record = store.getAttachment(id);
+      const bytes = await store.readAttachment(id);
+      if (!record || !bytes) return;
+      const text = store.getAttachmentText(id);
+      attachments[id] = {
+        mime: record.mime,
+        ...(record.name ? { name: record.name } : {}),
+        ...(text !== undefined ? { text } : {}),
+        data: bytes.toString("base64"),
+      };
+    };
+    for (const message of data.messages) {
+      for (const part of message.parts) {
+        if (part.type === "image" && part.source.kind === "attachment") await collect(part.source.id);
+        else if (part.type === "file") await collect(part.id);
+        else if (part.type === "tool_result") {
+          for (const inner of part.content) if (inner.type === "file") await collect(inner.id);
+        }
+      }
+    }
+    return c.body(JSON.stringify({ ...data, attachments }), 200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-disposition": disposition,
+    });
+  });
+
   // ---- turns + branching --------------------------------------------------
 
   app.post("/api/sessions/:id/turn", async (c) => {
@@ -744,7 +901,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!turnLimiter.allow(`${clientIp(c)}:${session.id}`)) {
       return c.json({ error: "too many turns; slow down" }, 429);
     }
-    let body: { text?: string; model?: string; attachmentIds?: unknown } = {};
+    let body: { text?: string; model?: string; attachmentIds?: unknown; attachmentNames?: unknown } = {};
     try {
       body = await c.req.json();
     } catch {
@@ -764,10 +921,18 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (attachmentIds.length > 0) {
       userParts = [];
       if (text.trim()) userParts.push({ type: "text", text });
+      const names =
+        body.attachmentNames && typeof body.attachmentNames === "object"
+          ? (body.attachmentNames as Record<string, unknown>)
+          : {};
       for (const id of attachmentIds) {
         const record = store.getAttachment(id);
-        if (record && record.mime.startsWith("image/")) {
+        if (!record) continue;
+        if (IMAGE_MIME.has(record.mime)) {
           userParts.push({ type: "image", source: { kind: "attachment", id, mime: record.mime } });
+        } else if (record.hasText) {
+          const name = typeof names[id] === "string" ? String(names[id]).slice(0, 200) : record.name ?? "file";
+          userParts.push({ type: "file", id, name, mime: record.mime, size: record.size });
         }
       }
     }
@@ -777,6 +942,27 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       history: pathOf(session.id).map((n) => n.message),
       userText: userParts ? undefined : text,
       userParts,
+    });
+  });
+
+  /**
+   * Continue a reply that was cut off at the output limit. The nudge is a real
+   * (synthetic) user message so the history keeps alternating, which every
+   * provider accepts; clients hide it and read the next reply as the rest.
+   */
+  app.post("/api/sessions/:id/continue", (c) => {
+    const session = store.getSession(c.req.param("id"));
+    if (!session) return c.json({ error: "not found" }, 404);
+    const history = pathOf(session.id).map((n) => n.message);
+    const last = history.at(-1);
+    if (!last || last.role !== "assistant") {
+      return c.json({ error: "there is no reply to continue" }, 400);
+    }
+    return streamTurn(c, {
+      sessionId: session.id,
+      history,
+      userText: CONTINUE_PROMPT,
+      userMeta: { synthetic: "continue" },
     });
   });
 
@@ -791,7 +977,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       /* ignore */
     }
     if (!body.messageId) return c.json({ error: "messageId is required" }, 400);
-    const target = store.getMessage(body.messageId);
+    const target = store.hasMessage(session.id, body.messageId) ? store.getMessage(body.messageId) : undefined;
     if (!target || target.role !== "assistant") {
       return c.json({ error: "messageId must reference an assistant message" }, 400);
     }
@@ -816,7 +1002,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!body.messageId || !body.text?.trim()) {
       return c.json({ error: "messageId and text are required" }, 400);
     }
-    const target = store.getMessage(body.messageId);
+    const target = store.hasMessage(session.id, body.messageId) ? store.getMessage(body.messageId) : undefined;
     if (!target || target.role !== "user") {
       return c.json({ error: "messageId must reference a user message" }, 400);
     }
@@ -858,7 +1044,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     } catch {
       /* ignore */
     }
-    if (!body.messageId || !store.getMessage(body.messageId)) {
+    if (!body.messageId || !store.hasMessage(session.id, body.messageId)) {
       return c.json({ error: "valid messageId is required" }, 400);
     }
     store.selectBranch(session.id, body.messageId);
@@ -982,4 +1168,36 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       store.close();
     },
   };
+}
+
+/**
+ * Validate the model settings a PATCH may carry. Absent fields are left alone;
+ * `null` (or an empty string for instructions) resets to the default.
+ */
+function parseSessionSettings(body: {
+  instructions?: unknown;
+  temperature?: unknown;
+  maxTokens?: unknown;
+}):
+  | { instructions?: string; temperature?: number | null; maxTokens?: number | null }
+  | { error: string } {
+  const out: { instructions?: string; temperature?: number | null; maxTokens?: number | null } = {};
+  if (body.instructions !== undefined) {
+    if (typeof body.instructions !== "string") return { error: "instructions must be a string" };
+    if (body.instructions.length > 20_000) return { error: "instructions are limited to 20,000 characters" };
+    out.instructions = body.instructions.trim();
+  }
+  if (body.temperature !== undefined) {
+    if (body.temperature === null) out.temperature = null;
+    else if (typeof body.temperature === "number" && body.temperature >= 0 && body.temperature <= 2) {
+      out.temperature = body.temperature;
+    } else return { error: "temperature must be a number from 0 to 2, or null" };
+  }
+  if (body.maxTokens !== undefined) {
+    if (body.maxTokens === null) out.maxTokens = null;
+    else if (Number.isInteger(body.maxTokens) && (body.maxTokens as number) >= 1 && (body.maxTokens as number) <= 1_000_000) {
+      out.maxTokens = body.maxTokens as number;
+    } else return { error: "maxTokens must be a positive integer, or null" };
+  }
+  return out;
 }

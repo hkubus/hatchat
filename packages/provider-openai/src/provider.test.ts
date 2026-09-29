@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ChatRequest, ProviderCapabilities } from "@hat/core";
 import { toWireName } from "./messages.js";
-import { createOpenAICompatibleProvider, extractCachedTokens } from "./provider.js";
+import {
+  createOpenAICompatibleProvider,
+  extractCachedTokens,
+  isRetryableStatus,
+  parseRetryAfter,
+} from "./provider.js";
 
 const CAPS: ProviderCapabilities = {
   streaming: true,
@@ -169,6 +174,49 @@ test("surfaces http errors", async () => {
   const events = await collect(makeProvider(fetchImpl));
   assert.equal(events[0].type, "error");
   assert.equal((events[0] as { error: { code: string } }).error.code, "http_429");
+});
+
+test("marks rate limits retryable and carries Retry-After", async () => {
+  const fetchImpl = (async () =>
+    new Response("slow down", { status: 429, headers: { "retry-after": "7" } })) as unknown as typeof fetch;
+  const [event] = await collect(makeProvider(fetchImpl));
+  assert.equal(event.type, "error");
+  const error = (event as { error: { retryable?: boolean; retryAfterMs?: number } }).error;
+  assert.equal(error.retryable, true);
+  assert.equal(error.retryAfterMs, 7_000);
+});
+
+test("client errors are not retryable", async () => {
+  const fetchImpl = (async () => new Response("bad", { status: 400 })) as unknown as typeof fetch;
+  const [event] = await collect(makeProvider(fetchImpl));
+  assert.equal((event as { error: { retryable?: boolean } }).error.retryable, false);
+});
+
+test("a connection failure is retryable", async () => {
+  const fetchImpl = (async () => {
+    throw new TypeError("fetch failed");
+  }) as unknown as typeof fetch;
+  const [event] = await collect(makeProvider(fetchImpl));
+  assert.equal((event as { error: { code: string; retryable?: boolean } }).error.code, "network_error");
+  assert.equal((event as { error: { retryable?: boolean } }).error.retryable, true);
+});
+
+test("an in-stream overload error is retryable", async () => {
+  const fetchImpl = (async () =>
+    sseResponse([`data: ${JSON.stringify({ error: { code: 502, message: "upstream overloaded" } })}\n\n`])) as unknown as typeof fetch;
+  const [event] = await collect(makeProvider(fetchImpl));
+  assert.equal((event as { error: { retryable?: boolean } }).error.retryable, true);
+});
+
+test("parseRetryAfter reads seconds and HTTP dates", () => {
+  assert.equal(parseRetryAfter("3"), 3_000);
+  assert.equal(parseRetryAfter("0.5"), 500);
+  assert.equal(parseRetryAfter(null), undefined);
+  assert.equal(parseRetryAfter("soon"), undefined);
+  const now = Date.parse("2026-01-01T00:00:00Z");
+  assert.equal(parseRetryAfter("Thu, 01 Jan 2026 00:00:10 GMT", now), 10_000);
+  assert.equal(isRetryableStatus(503), true);
+  assert.equal(isRetryableStatus(404), false);
 });
 
 test("sends a flat reasoning_effort field by default", async () => {

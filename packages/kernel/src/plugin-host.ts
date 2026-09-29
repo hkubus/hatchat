@@ -1,6 +1,6 @@
 import type { Logger, Plugin, PluginContext, ProcessHost, SecretStore } from "@hat/core";
 import { normalizeError } from "@hat/core";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { toJsonSchema } from "./json-schema.js";
 import type { ProviderRegistry, ToolRegistry } from "./registries.js";
 
 export type PluginSource = "builtin" | "external";
@@ -136,6 +136,17 @@ export class PluginHost {
       processHost: this.deps.processHost,
       runnerAvailable: this.deps.runnerAvailable,
       logger: scopedLogger(id, this.deps.logger),
+      fail: (error) => {
+        // Only a live activation can fail this way: a stale one (since
+        // deactivated) is ignored, and one still inside `activate` surfaces
+        // its failure through the rejected activation below.
+        if (this.contributions.get(id) !== contribution) return;
+        this.rollback(contribution);
+        this.contributions.delete(id);
+        const message = normalizeError(error, "plugin_failed").message;
+        this.statuses.set(id, { status: "error", error: message });
+        this.deps.logger.warn(`plugin ${id} failed: ${message}`);
+      },
     };
 
     try {
@@ -198,15 +209,9 @@ export class PluginHost {
   private describe(id: string, plugin: Plugin, source: PluginSource): PluginDescriptor {
     const state = this.states.get(id) ?? { enabled: true, config: {} };
     const status = this.statuses.get(id) ?? { status: "disabled" as PluginStatus };
-    let configSchema: unknown;
-    if (plugin.configSchema) {
-      const json = zodToJsonSchema(plugin.configSchema, {
-        target: "jsonSchema7",
-        $refStrategy: "none",
-      }) as Record<string, unknown>;
-      delete json.$schema;
-      configSchema = json;
-    }
+    const configSchema = plugin.configSchema
+      ? toJsonSchema(plugin.configSchema)
+      : plugin.configJsonSchema;
     return {
       id,
       name: plugin.name,

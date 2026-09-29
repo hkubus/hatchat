@@ -18,6 +18,7 @@ export type SettingsStackParamList = {
   Plugin: { pluginId: string };
   Runners: undefined;
   Allowlist: undefined;
+  Conversation: undefined;
   Connection: undefined;
 };
 

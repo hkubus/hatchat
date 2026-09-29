@@ -10,6 +10,7 @@ import { detectCapabilities } from "./capabilities.js";
 import { loadConfig, type RunnerConfig } from "./config.js";
 import { startJob, type JobHandle } from "./exec.js";
 import { startProcess, type ProcessHandle } from "./processes.js";
+import { resolveSandbox, type SandboxConfig } from "./sandbox.js";
 import { WorkspaceManager } from "./workspace.js";
 
 try {
@@ -37,7 +38,12 @@ class Runner {
   private stopped = false;
   private readonly startedAt = Date.now();
 
-  constructor(private readonly config: RunnerConfig) {
+  constructor(
+    private readonly config: RunnerConfig,
+    private readonly sandbox: SandboxConfig,
+    /** Tier for shell-mode processes; may be `host` while `sandbox` is `container`. */
+    private readonly processSandbox: SandboxConfig,
+  ) {
     this.workspace = new WorkspaceManager(config.workspaceRoot, config.maxOutputBytes);
   }
 
@@ -45,10 +51,12 @@ class Runner {
     this.connect();
   }
 
-  stop(): void {
+  /** Resolves once sandbox containers have been removed (best-effort, bounded). */
+  async stop(): Promise<void> {
     this.stopped = true;
-    this.killManaged();
+    const reaped = this.killManaged();
     this.ws?.close();
+    await reaped;
   }
 
   /**
@@ -57,11 +65,14 @@ class Runner {
    * so jobs and long-lived processes (stdio MCP servers) must die with the link
    * instead of piling up across reconnects.
    */
-  private killManaged(): void {
-    for (const job of this.jobs.values()) job.abort();
+  private async killManaged(): Promise<void> {
+    const pending = [
+      ...[...this.jobs.values()].map((job) => job.abort()),
+      ...[...this.processes.values()].map((proc) => proc.kill()),
+    ];
     this.jobs.clear();
-    for (const proc of this.processes.values()) proc.kill();
     this.processes.clear();
+    await Promise.all(pending);
   }
 
   private connect(): void {
@@ -77,7 +88,7 @@ class Runner {
         runnerId: this.config.runnerId,
         enrollToken: this.config.enrollToken,
         credential: this.config.credential,
-        caps: detectCapabilities(this.config.tags),
+        caps: detectCapabilities(this.config.tags, this.sandbox),
       });
     });
 
@@ -92,8 +103,9 @@ class Runner {
     ws.on("close", () => {
       log("link closed; reconnecting in 1s");
       this.ws = undefined;
+      // Reap before failAllPending, which forgets the jobs map.
+      void this.killManaged();
       this.failAllPending("link closed");
-      this.killManaged();
       if (!this.stopped) setTimeout(() => this.connect(), 1000);
     });
 
@@ -124,7 +136,7 @@ class Runner {
         this.jobs.get(message.jobId)?.write(message.chunk);
         break;
       case "exec.cancel":
-        this.jobs.get(message.jobId)?.abort();
+        void this.jobs.get(message.jobId)?.abort();
         break;
       case "proc.start":
         this.handleProcStart(message);
@@ -136,7 +148,7 @@ class Runner {
         this.processes.get(message.procId)?.endStdin();
         break;
       case "proc.cancel":
-        this.processes.get(message.procId)?.kill();
+        void this.processes.get(message.procId)?.kill();
         break;
       case "fs.read":
         void this.handle(async () => ({
@@ -199,7 +211,7 @@ class Runner {
         stdin: message.stdin,
         maxOutputBytes: this.config.maxOutputBytes,
       },
-      this.config.sandbox,
+      this.sandbox,
       (out) => this.send(out),
       (jobId) => this.jobs.delete(jobId),
     );
@@ -225,7 +237,7 @@ class Runner {
         args: message.args,
         cwd,
         env: message.env,
-        shell: message.shell ? this.config.sandbox : undefined,
+        shell: message.shell ? this.processSandbox : undefined,
       },
       (out) => this.send(out),
       (procId) => this.processes.delete(procId),
@@ -323,13 +335,33 @@ async function runFetch(
   }
 }
 
-const runner = new Runner(loadConfig());
+/** Load config and settle the sandbox tiers once, before the first hello. */
+async function createRunner(): Promise<Runner> {
+  const config = loadConfig();
+  const { sandbox, reason, processes, processReason } = await resolveSandbox(config.sandbox);
+  const tier =
+    sandbox.mode === "container" ? `container (${sandbox.runtime}, image ${sandbox.image})` : "host";
+  log(`sandbox tier: ${tier}, because ${reason}`);
+  log(`process tier (background processes, python): ${processes.mode}, because ${processReason}`);
+  if (processes.mode === "host") {
+    const what = sandbox.mode === "host" ? "shell commands" : "background processes and python";
+    log(`warning: ${what} run directly on this host with the runner's privileges`);
+  }
+  return new Runner(config, sandbox, processes);
+}
+
+let runner: Runner;
+try {
+  runner = await createRunner();
+} catch (error) {
+  console.error(`[runner] ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
 runner.start();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     log(`received ${signal}, shutting down`);
-    runner.stop();
-    process.exit(0);
+    void runner.stop().finally(() => process.exit(0));
   });
 }

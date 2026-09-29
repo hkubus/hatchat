@@ -56,6 +56,15 @@ export interface ServerConfig {
   titleModel?: string;
   /** Set HAT_ENABLE_EXTERNAL_PLUGINS=false to disable loading ./plugins. */
   enableExternalPlugins: boolean;
+  /**
+   * How long a tool approval or `ask_user` question waits for the user before
+   * giving up; 0 (the default) waits until answered or the turn is stopped.
+   */
+  approvalTimeoutMs: number;
+  /** Retries for a rate-limited or overloaded provider before a turn fails. */
+  providerRetries: number;
+  /** Run each external plugin in its own sandboxed process; HAT_PLUGINS_ISOLATION=off loads them in-process. */
+  pluginIsolation: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -151,5 +160,8 @@ export function loadConfig(): ServerConfig {
     sseKeepaliveMs: envInt("HAT_SSE_KEEPALIVE_MS", 1_000),
     titleModel: process.env.HAT_TITLE_MODEL || undefined,
     enableExternalPlugins: envBool("HAT_ENABLE_EXTERNAL_PLUGINS", true),
+    approvalTimeoutMs: Math.max(0, envInt("HAT_APPROVAL_TIMEOUT_MINUTES", 0)) * 60_000,
+    providerRetries: Math.max(0, envInt("HAT_PROVIDER_RETRIES", 3)),
+    pluginIsolation: envBool("HAT_PLUGINS_ISOLATION", true),
   };
 }

@@ -153,6 +153,9 @@ async function main(): Promise<void> {
     model: "fake/fake-agent",
   });
   const sessionId = session.id;
+  // New sessions run tools without asking; this check is about the approval
+  // round-trip, so ask for it explicitly.
+  await patchJson(`${BASE}/api/sessions/${sessionId}`, { approvalMode: "ask" });
 
   // --- turn + approval round-trip + runner execution -----------------------
   const turn = await postSSE(`${BASE}/api/sessions/${sessionId}/turn`, {
@@ -380,6 +383,100 @@ async function main(): Promise<void> {
     `${BASE}/api/sessions/${sessionId}`,
   );
   check("policy persisted on the session", resumed.session.approvalMode === "ask");
+
+  // --- documents: attached text reaches the model ----------------------------
+  const docForm = new FormData();
+  docForm.append("file", new Blob(["the secret word is marmalade"], { type: "text/plain" }), "notes.txt");
+  const docUpload = (await (await fetch(`${BASE}/api/attachments`, { method: "POST", body: docForm })).json()) as {
+    attachment: { id: string; kind: string; name: string };
+  };
+  check("text document accepted as a document", docUpload.attachment?.kind === "document");
+  const binForm = new FormData();
+  binForm.append("file", new Blob([new Uint8Array([0, 1, 2, 3])], { type: "application/zip" }), "a.zip");
+  const binRes = await fetch(`${BASE}/api/attachments`, { method: "POST", body: binForm });
+  check("binary upload rejected", binRes.status === 415);
+
+  const docSession = (await postJson<{ session: { id: string } }>(`${BASE}/api/sessions`, { model: "fake/fake-agent" })).session.id;
+  const docTurn = await postSSE(`${BASE}/api/sessions/${docSession}/turn`, {
+    text: "read this",
+    attachmentIds: [docUpload.attachment.id],
+    attachmentNames: { [docUpload.attachment.id]: "notes.txt" },
+  });
+  const docReply = docTurn.events.filter((e) => e.type === "text.delta").map((e) => e.text).join("");
+  check("document text inlined for the model", docReply.includes("marmalade"));
+  const docPath = await getJson<{ path: PathNode[] }>(`${BASE}/api/sessions/${docSession}`);
+  check(
+    "stored user message keeps a file part, not the text",
+    docPath.path[0].message.parts.some((p: any) => p.type === "file" && p.name === "notes.txt"),
+  );
+
+  // --- a reply cut off at the length limit can be continued -----------------
+  const longTurn = await postSSE(`${BASE}/api/sessions/${docSession}/turn`, { text: "long: one two three" });
+  const longDone = longTurn.events.filter((e) => e.type === "message.done").at(-1);
+  check("length finish reason streamed", longDone?.finishReason === "length");
+  const cut = await getJson<{ path: PathNode[] }>(`${BASE}/api/sessions/${docSession}`);
+  check("length finish reason persisted", (cut.path.at(-1)?.message as any).meta?.finishReason === "length");
+  const cont = await postSSE(`${BASE}/api/sessions/${docSession}/continue`, {});
+  const contText = cont.events.filter((e) => e.type === "text.delta").map((e) => e.text).join("");
+  check("continue finishes the reply", contText.includes("the rest of the reply"));
+  const continued = await getJson<{ path: PathNode[] }>(`${BASE}/api/sessions/${docSession}`);
+  check(
+    "the continue nudge is stored as a synthetic user message",
+    (continued.path.at(-2)?.message as any).meta?.synthetic === "continue",
+  );
+
+  // --- per-conversation settings ---------------------------------------------
+  const badSettings = await fetch(`${BASE}/api/sessions/${docSession}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ temperature: 9 }),
+  });
+  check("out-of-range temperature rejected", badSettings.status === 400);
+  const withSettings = await patchJson<{ session: { instructions: string; temperature: number; maxTokens: number } }>(
+    `${BASE}/api/sessions/${docSession}`,
+    { instructions: "Be brief.", temperature: 0.4, maxTokens: 512 },
+  );
+  check(
+    "instructions and sampling settings persisted",
+    withSettings.session.instructions === "Be brief." &&
+      withSettings.session.temperature === 0.4 &&
+      withSettings.session.maxTokens === 512,
+  );
+
+  // --- fork, export, import ----------------------------------------------------
+  const forkFrom = continued.path[1].message.id;
+  const fork = await postJson<{ session: { id: string; instructions: string }; path: PathNode[] }>(
+    `${BASE}/api/sessions/${docSession}/fork`,
+    { messageId: forkFrom },
+  );
+  check("fork copies the path up to the chosen message", fork.path.length === 2 && fork.session.instructions === "Be brief.");
+
+  const exportRes = await fetch(`${BASE}/api/sessions/${docSession}/export`);
+  const exported = (await exportRes.json()) as { format: string; messages: unknown[]; attachments: Record<string, unknown> };
+  check(
+    "JSON export carries the tree and attachments",
+    exported.format === "hat.session" &&
+      exported.messages.length === continued.path.length &&
+      Object.keys(exported.attachments).length === 1,
+  );
+  const imported = await postJson<{ session: { id: string; title: string }; path: PathNode[] }>(
+    `${BASE}/api/sessions/import`,
+    exported,
+  );
+  check("import recreates the conversation", imported.path.length === continued.path.length);
+  const importedDoc = imported.path[0].message.parts.find((p: any) => p.type === "file") as any;
+  check(
+    "imported file parts point at a stored attachment",
+    Boolean(importedDoc) && (await fetch(`${BASE}/api/attachments/${importedDoc.id}`)).ok,
+  );
+  const markdown = await (await fetch(`${BASE}/api/sessions/${docSession}/export?format=markdown`)).text();
+  check("Markdown export is a readable transcript", markdown.includes("## You") && markdown.includes("*[attached notes.txt]*"));
+
+  const statuses = await getJson<{ sessions: Array<{ id: string; status: string }> }>(`${BASE}/api/sessions`);
+  check("session list reports idle status", statuses.sessions.find((s) => s.id === docSession)?.status === "idle");
+
+  const found = await getJson<{ hits: Array<{ sessionId: string }> }>(`${BASE}/api/search?q=${encodeURIComponent("three")}`);
+  check("search finds message text", found.hits.some((hit) => hit.sessionId === docSession));
 
   const failed = checks.filter(([, ok]) => !ok);
   console.log(`\n[smoke] ${checks.length - failed.length}/${checks.length} checks passed`);

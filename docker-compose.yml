@@ -22,6 +22,10 @@ services:
       HAT_ENROLL_TOKEN: ${HAT_ENROLL_TOKEN:-dev-enroll-token}
       HAT_RUNNER_TAGS: docker
       HAT_WORKSPACE_ROOT: /srv/hat/workspaces
+      # The image has no container runtime, and mounting the host Docker socket
+      # is not a drop-in: sandbox bind mounts would resolve /srv/hat/workspaces
+      # on the host, not in this volume. Commands run inside this container.
+      HAT_EXEC_SANDBOX: host
     volumes:
       - runner-workspaces:/srv/hat/workspaces
     # Intentionally no ports: the runner dials out to the server.

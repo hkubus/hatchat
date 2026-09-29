@@ -89,3 +89,33 @@ export function ChevronDownIcon(props: IconProps): JSX.Element {
     </Svg>
   );
 }
+
+export function ForkIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <circle cx="6" cy="5" r="2" />
+      <circle cx="18" cy="5" r="2" />
+      <circle cx="12" cy="19" r="2" />
+      <path d="M6 7v2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7M12 12v5" />
+    </Svg>
+  );
+}
+
+export function SlidersIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0" />
+      <circle cx="16" cy="6" r="2" />
+      <circle cx="10" cy="12" r="2" />
+      <circle cx="18" cy="18" r="2" />
+    </Svg>
+  );
+}
+
+export function DownloadIcon(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <path d="M12 4v11M7 10l5 5 5-5M5 20h14" />
+    </Svg>
+  );
+}

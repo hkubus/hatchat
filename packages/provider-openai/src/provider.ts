@@ -68,6 +68,24 @@ export function extractCachedTokens(usage: {
   return undefined;
 }
 
+/**
+ * `Retry-After` as milliseconds: either delta-seconds or an HTTP date.
+ * Undefined when absent or unparseable.
+ */
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds)) return seconds >= 0 ? Math.round(seconds * 1000) : undefined;
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return undefined;
+  return Math.max(0, date - now);
+}
+
+/** Statuses worth retrying: rate limits, timeouts and overloaded upstreams. */
+export function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
 async function safeText(response: Response): Promise<string> {
   try {
     return await response.text();
@@ -157,7 +175,12 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
           signal,
         });
       } catch (error) {
-        yield { type: "error", error: normalizeError(error, "network_error") };
+        // A connection that never got a response is safe to retry; an abort
+        // is the user cancelling and must not be.
+        yield {
+          type: "error",
+          error: { ...normalizeError(error, "network_error"), retryable: !signal.aborted },
+        };
         return;
       }
 
@@ -168,7 +191,8 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
           error: {
             code: `http_${response.status}`,
             message: `${config.label} error ${response.status}: ${detail.slice(0, 500)}`,
-            retryable: response.status >= 500 || response.status === 429,
+            retryable: isRetryableStatus(response.status),
+            retryAfterMs: parseRetryAfter(response.headers.get("retry-after")),
           },
         };
         return;
@@ -180,11 +204,15 @@ export function createOpenAICompatibleProvider(config: OpenAICompatibleConfig): 
       try {
         for await (const chunk of iterateSSE(response.body, signal)) {
           if (chunk.error) {
+            // OpenRouter reports upstream rate limits and overloads in-stream,
+            // with the HTTP-style status as the error code.
+            const status = Number(chunk.error.code);
             yield {
               type: "error",
               error: {
                 code: "provider_error",
                 message: chunk.error.message ?? "provider returned an error",
+                retryable: Number.isInteger(status) && isRetryableStatus(status),
               },
             };
             return;

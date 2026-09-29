@@ -1,40 +1,11 @@
-import type { Part } from "@hat/core";
+import type { UiFile, UiImage, UiQuestion, UiTodo } from "@hat/core";
+import { formatBytes } from "@hat/core";
 import { useState } from "react";
 import * as api from "./api";
 import MessageImage from "./MessageImage";
 
-type FilePart = Extract<Part, { type: "file" }>;
-
-export interface TodoItem {
-  content: string;
-  status: "pending" | "in_progress" | "completed";
-}
-
-/** The checklist carried by a `todo_write` call, or null if the args are malformed. */
-export function todosOf(args: unknown): TodoItem[] | null {
-  const todos = (args as { todos?: unknown } | null)?.todos;
-  if (!Array.isArray(todos)) return null;
-  return todos.filter(
-    (t): t is TodoItem =>
-      Boolean(t) && typeof t.content === "string" && ["pending", "in_progress", "completed"].includes(t.status),
-  );
-}
-
-export interface Question {
-  question: string;
-  options: string[];
-  multiSelect: boolean;
-}
-
-export function questionOf(args: unknown): Question | null {
-  const raw = args as { question?: unknown; options?: unknown; multi_select?: unknown } | null;
-  if (!raw || typeof raw.question !== "string") return null;
-  return {
-    question: raw.question,
-    options: Array.isArray(raw.options) ? raw.options.filter((o): o is string => typeof o === "string") : [],
-    multiSelect: raw.multi_select === true,
-  };
-}
+/** A stored file: an artifact the assistant made, or a document the user attached. */
+type StoredFile = UiFile;
 
 /** Argument fields that best identify a call of each built-in tool. */
 const BRIEF_FIELDS: Record<string, string> = {
@@ -66,7 +37,7 @@ export function argBrief(name: string, args: unknown): string | undefined {
   return value.split("\n").find((line) => line.trim())?.trim();
 }
 
-export function TodoList({ todos }: { todos: TodoItem[] }): JSX.Element {
+export function TodoList({ todos }: { todos: UiTodo[] }): JSX.Element {
   const done = todos.filter((t) => t.status === "completed").length;
   return (
     <div className="todo" role="group" aria-label={`Checklist, ${done} of ${todos.length} done`}>
@@ -95,7 +66,7 @@ export function QuestionCard({
   question,
   onAnswer,
 }: {
-  question: Question;
+  question: UiQuestion;
   onAnswer: (answer: string) => Promise<void>;
 }): JSX.Element {
   const [picked, setPicked] = useState<string[]>([]);
@@ -170,12 +141,6 @@ export function QuestionCard({
   );
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
 const PREVIEW_CHARS = 20_000;
 
 function isTextual(mime: string): boolean {
@@ -187,7 +152,7 @@ function isTextual(mime: string): boolean {
  * sandboxed frame (no scripts, no same-origin access); other text previews as
  * plain text. Everything can be downloaded under its given name.
  */
-export function ArtifactCard({ file }: { file: FilePart }): JSX.Element {
+export function ArtifactCard({ file }: { file: StoredFile }): JSX.Element {
   const [preview, setPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const isImage = file.mime.startsWith("image/") && file.mime !== "image/svg+xml";
@@ -250,31 +215,18 @@ export function ArtifactCard({ file }: { file: FilePart }): JSX.Element {
 }
 
 /** Images and files from a tool's result, shown outside the collapsed call. */
-export function ToolOutputs({ parts }: { parts: Part[] }): JSX.Element | null {
-  const images = parts.filter((p): p is Extract<Part, { type: "image" }> => p.type === "image");
-  const files = parts.filter((p): p is FilePart => p.type === "file");
-  if (images.length === 0 && files.length === 0) return null;
+export function ToolOutputs({ images, files }: { images?: UiImage[]; files?: UiFile[] }): JSX.Element | null {
+  if (!images?.length && !files?.length) return null;
   return (
     <div className="tool-outputs">
-      {images.length > 0 && (
+      {images && images.length > 0 && (
         <div className="msg-images">
-          {images.map((image, index) =>
-            image.source.kind === "attachment" ? (
-              <MessageImage key={index} attachmentId={image.source.id} src="" />
-            ) : (
-              <MessageImage
-                key={index}
-                src={
-                  image.source.kind === "url"
-                    ? image.source.url
-                    : `data:${image.source.mime};base64,${image.source.data}`
-                }
-              />
-            ),
-          )}
+          {images.map((image, index) => (
+            <MessageImage key={index} attachmentId={image.attachmentId} src={image.src} />
+          ))}
         </div>
       )}
-      {files.map((file) => (
+      {files?.map((file) => (
         <ArtifactCard key={file.id} file={file} />
       ))}
     </div>

@@ -1,5 +1,5 @@
 import type {
-  ChatMessage,
+  ChatPathNode,
   KernelEvent,
   ModelInfo,
   ReasoningEffort,
@@ -43,17 +43,18 @@ export interface SessionRecord {
   approvalMode: "ask" | "auto" | "allowlist" | "deny";
   allowedTools: string[];
   reasoningEffort: ReasoningEffort;
+  /** Per-conversation instructions appended to the system prompt; "" for none. */
+  instructions: string;
+  temperature: number | null;
+  maxTokens: number | null;
   createdAt: number;
   updatedAt: number;
 }
 
-export interface PathNode {
-  message: ChatMessage;
-  parentId: string | null;
-  siblingIndex: number;
-  siblingCount: number;
-  siblingIds: string[];
-}
+export type PathNode = ChatPathNode;
+
+/** What a conversation is doing right now; `waiting` means it needs the user. */
+export type SessionStatus = "idle" | "running" | "waiting";
 
 export interface SessionPayload {
   session: SessionRecord;
@@ -67,7 +68,18 @@ export interface SessionSummary {
   messageCount: number;
   /** Tokens spent on the active branch; null when nothing has been recorded. */
   usage: Usage | null;
+  status?: SessionStatus;
   updatedAt: number;
+}
+
+export interface SearchHit {
+  messageId: string;
+  sessionId: string;
+  sessionTitle: string;
+  role: "user" | "assistant";
+  /** Matching excerpt with hits wrapped in « ». */
+  snippet: string;
+  createdAt: number;
 }
 
 export interface ProviderStatus {
@@ -85,6 +97,9 @@ export interface AttachmentRecord {
   size: number;
   width?: number;
   height?: number;
+  /** `document` uploads carry extracted text the model reads. */
+  kind: "image" | "document";
+  name?: string;
   createdAt: number;
   url: string;
 }
@@ -192,6 +207,12 @@ export async function logout(): Promise<void> {
 }
 
 
+/** The server's `{ error }` message when it sent one, else a status line. */
+async function errorMessage(res: Response, what: string): Promise<string> {
+  const body = (await res.json().catch(() => ({}))) as { error?: unknown };
+  return typeof body.error === "string" ? body.error : `${what}: ${res.status}`;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await authFetch(url);
   if (!res.ok) throw new HttpError(res.status, url);
@@ -289,6 +310,9 @@ export async function updateSession(
     approvalMode?: SessionRecord["approvalMode"];
     allowedTools?: string[];
     reasoningEffort?: ReasoningEffort;
+    instructions?: string;
+    temperature?: number | null;
+    maxTokens?: number | null;
   },
 ): Promise<SessionRecord> {
   const res = await authFetch(`/api/sessions/${encodeURIComponent(id)}`, {
@@ -296,7 +320,7 @@ export async function updateSession(
     headers: jsonHeaders(),
     body: JSON.stringify(patch),
   });
-  if (!res.ok) throw new Error(`update session: ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res, "update session"));
   return (await res.json()).session as SessionRecord;
 }
 
@@ -414,16 +438,27 @@ export function sendTurn(
   sessionId: string,
   text: string,
   model: string,
-  attachmentIds: string[],
+  attachments: Array<{ id: string; name?: string }>,
   onEvent: (event: KernelEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const attachmentNames: Record<string, string> = {};
+  for (const a of attachments) if (a.name) attachmentNames[a.id] = a.name;
   return postSSE(
     `/api/sessions/${encodeURIComponent(sessionId)}/turn`,
-    { text, model, attachmentIds },
+    { text, model, attachmentIds: attachments.map((a) => a.id), attachmentNames },
     onEvent,
     signal,
   );
+}
+
+/** Finish a reply that was cut off at the output limit. */
+export function continueTurn(
+  sessionId: string,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return postSSE(`/api/sessions/${encodeURIComponent(sessionId)}/continue`, {}, onEvent, signal);
 }
 
 export async function uploadAttachment(file: File): Promise<AttachmentRecord> {
@@ -433,8 +468,48 @@ export async function uploadAttachment(file: File): Promise<AttachmentRecord> {
     method: "POST",
     body: form,
   });
-  if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+  if (!res.ok) throw new Error(`${file.name}: ${await errorMessage(res, "upload failed")}`);
   return (await res.json()).attachment as AttachmentRecord;
+}
+
+/** Start a new conversation from this one's path up to `messageId`. */
+export async function forkSession(sessionId: string, messageId: string): Promise<SessionPayload> {
+  const res = await authFetch(`/api/sessions/${encodeURIComponent(sessionId)}/fork`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ messageId }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "fork"));
+  return (await res.json()) as SessionPayload;
+}
+
+/** Save a conversation as Markdown (active branch) or JSON (whole tree, re-importable). */
+export async function exportSession(sessionId: string, format: "markdown" | "json"): Promise<void> {
+  const res = await authFetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/export?format=${format}`,
+  );
+  if (!res.ok) throw new Error(await errorMessage(res, "export"));
+  const disposition = res.headers.get("content-disposition") ?? "";
+  const encoded = /filename\*=UTF-8''([^;]+)/.exec(disposition)?.[1];
+  const name = encoded ? decodeURIComponent(encoded) : `conversation.${format === "markdown" ? "md" : "json"}`;
+  saveBlob(await res.blob(), name);
+}
+
+/** Recreate a conversation from a JSON export. */
+export async function importSession(file: File): Promise<SessionPayload> {
+  const res = await authFetch("/api/sessions/import", {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: await file.text(),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "import"));
+  return (await res.json()) as SessionPayload;
+}
+
+export async function searchMessages(query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const res = await authFetch(`/api/search?q=${encodeURIComponent(query)}`, { signal });
+  if (!res.ok) throw new HttpError(res.status, "/api/search");
+  return ((await res.json()) as { hits: SearchHit[] }).hits;
 }
 
 export function regenerate(
@@ -491,7 +566,10 @@ export async function answerQuestion(callId: string, sessionId: string, answer: 
 
 /** Download an artifact under its given name (works with bearer auth too). */
 export async function downloadAttachment(id: string, name: string): Promise<void> {
-  const blob = await fetchAttachmentBlob(id);
+  saveBlob(await fetchAttachmentBlob(id), name);
+}
+
+function saveBlob(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;

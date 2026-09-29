@@ -8,6 +8,8 @@ import type {
   FinishReason,
   KernelEvent,
   Logger,
+  MessageMeta,
+  NormalizedError,
   Part,
   Provider,
   ProviderCapabilities,
@@ -15,9 +17,11 @@ import type {
   SecretStore,
   ToolContext,
   ToolPolicy,
+  ToolSpec,
   Usage,
 } from "@hat/core";
 import { DEFAULT_TOOL_POLICY, addUsage, decideTool, newId, normalizeError } from "@hat/core";
+import { estimateTextTokens, fitToContext, messageBudget } from "./context.js";
 import type { ProviderRegistry, ToolRegistry } from "./registries.js";
 
 export interface AgentTurnInput {
@@ -37,6 +41,14 @@ export interface AgentTurnInput {
   persist?: boolean;
   /** Receives out-of-band events that tools push while running (see `ToolContext.emit`). */
   emit?(event: KernelEvent): void;
+  /** Per-conversation instructions from the user, appended to the system prompt. */
+  instructions?: string;
+  /** Sampling temperature; unset leaves the provider default. */
+  temperature?: number;
+  /** Cap on reply tokens per model call; unset leaves the provider default. */
+  maxTokens?: number;
+  /** Metadata stored on the new user message (e.g. marking a synthetic "continue"). */
+  userMeta?: MessageMeta;
 }
 
 export interface KernelDeps {
@@ -61,8 +73,23 @@ export interface KernelDeps {
    * saved memories). Keep it stable between turns: it sits in the cached prefix.
    */
   systemContext?(sessionId: string): string | undefined | Promise<string | undefined>;
+  /** Resolve a user-attached document to its text, inlined for the model. */
+  resolveFile?(attachmentId: string): Promise<{ text: string } | undefined>;
   maxToolIterations?: number;
   maxToolResultChars?: number;
+  /** Retries for a retryable provider error that arrives before any output. Default 3. */
+  maxRetries?: number;
+  /** First retry delay; doubles each attempt. Default 1000ms. */
+  retryBaseDelayMs?: number;
+}
+
+/** What one model call produced, after any retries. */
+interface ModelResult {
+  text: string;
+  reasoning: string;
+  calls: ToolCallRecord[];
+  usage?: Usage;
+  finish: FinishReason;
 }
 
 interface ToolCallRecord {
@@ -109,6 +136,7 @@ export class Agent {
         role: "user",
         parts: input.userParts.map((part) => structuredClone(part)),
         createdAt: Date.now(),
+        ...(input.userMeta ? { meta: { ...input.userMeta } } : {}),
       };
       messages.push(userMessage);
       onMessage(userMessage);
@@ -118,20 +146,76 @@ export class Agent {
         role: "user",
         parts: [{ type: "text", text: input.userText }],
         createdAt: Date.now(),
+        ...(input.userMeta ? { meta: { ...input.userMeta } } : {}),
       };
       messages.push(userMessage);
       onMessage(userMessage);
     }
 
-    await this.resolveAttachmentImages(messages);
+    await this.resolveAttachments(messages);
 
     const { provider, model } = this.deps.providers.resolve(input.model);
     const caps = provider.capabilities(model);
     const extra = await this.systemContextFor(input.sessionId);
-    const systemPrompt = [this.deps.systemPrompt?.trim(), extra?.trim()].filter(Boolean).join("\n\n");
-    if (systemPrompt) {
-      applySystemPrompt(messages, systemPrompt, caps);
-    }
+    const instructions = input.instructions?.trim()
+      ? `Instructions for this conversation, from the user:\n${input.instructions.trim()}`
+      : undefined;
+    const systemPrompt = [this.deps.systemPrompt?.trim(), extra?.trim(), instructions]
+      .filter(Boolean)
+      .join("\n\n");
+    const tools = caps.toolCalls ? this.deps.tools.toToolSpecs(input.excludeTools) : undefined;
+
+    // The request is rebuilt from `messages` before every model call: the
+    // system prompt is applied to a copy (so it never reaches stored history)
+    // and the copy is fitted to the context window, which a tool-heavy turn
+    // can outgrow halfway through.
+    let lastContextNote = "";
+    const prepare = (list: ChatMessage[], withTools: ToolSpec[] | undefined) => {
+      let fitted = list;
+      let note: string | undefined;
+      if (caps.contextWindow) {
+        const fixed =
+          estimateTextTokens(systemPrompt) + (withTools ? estimateTextTokens(JSON.stringify(withTools)) : 0);
+        const fit = fitToContext(
+          list,
+          messageBudget({ contextWindow: caps.contextWindow, maxOutputTokens: input.maxTokens, fixedTokens: fixed }),
+        );
+        fitted = fit.messages;
+        const trimmed = [
+          fit.elidedToolResults > 0 ? `elided ${fit.elidedToolResults} older tool outputs` : "",
+          fit.droppedMessages > 0 ? `left out the ${fit.droppedMessages} oldest messages` : "",
+        ].filter(Boolean);
+        if (trimmed.length > 0) {
+          note = `This conversation is near the model's context window, so this request ${trimmed.join(" and ")}. Stored history is unchanged.`;
+        }
+      }
+      const out = toProviderMessages(fitted, caps);
+      if (systemPrompt) applySystemPrompt(out, systemPrompt, caps);
+      // Only speak up when the trimming changes, not on every iteration.
+      const warning = note && note !== lastContextNote ? note : undefined;
+      if (note) lastContextNote = note;
+      return { messages: out, warning };
+    };
+    const requestFor = (list: ChatMessage[], withTools: ToolSpec[] | undefined) => {
+      const prepared = prepare(list, withTools);
+      const request: ChatRequest = {
+        model,
+        messages: prepared.messages,
+        tools: withTools,
+        // Stable per-session key so providers can route same-prefix requests
+        // to the same prompt-cache shard (see `prompt_cache_key`).
+        cacheKey: input.sessionId,
+        temperature: input.temperature,
+        maxTokens: input.maxTokens,
+        // Only meaningful for providers that advertise the knob; "off" is the
+        // provider's own default, so we leave the field unset.
+        reasoningEffort:
+          input.reasoningEffort && input.reasoningEffort !== "off" && caps.reasoningEffort
+            ? input.reasoningEffort
+            : undefined,
+      };
+      return { request, warning: prepared.warning };
+    };
     const policy: ToolPolicy = input.toolPolicy ?? {
       ...DEFAULT_TOOL_POLICY,
       maxIterations: this.deps.maxToolIterations ?? DEFAULT_TOOL_POLICY.maxIterations,
@@ -156,60 +240,14 @@ export class Agent {
       };
       yield { type: "message.start", messageId: assistantId, role: "assistant" };
 
-      const calls: ToolCallRecord[] = [];
-      let text = "";
-      let reasoning = "";
-      let usage: Usage | undefined;
-      let finish: FinishReason = "stop";
-
-      const request: ChatRequest = {
-        model,
-        messages: toProviderMessages(messages, caps),
-        tools: caps.toolCalls ? this.deps.tools.toToolSpecs(input.excludeTools) : undefined,
-        // Stable per-session key so providers can route same-prefix requests
-        // to the same prompt-cache shard (see `prompt_cache_key`).
-        cacheKey: input.sessionId,
-        // Only meaningful for providers that advertise the knob; "off" is the
-        // provider's own default, so we leave the field unset.
-        reasoningEffort:
-          input.reasoningEffort && input.reasoningEffort !== "off" && caps.reasoningEffort
-            ? input.reasoningEffort
-            : undefined,
-      };
-
-      try {
-        for await (const event of provider.chat(request, input.signal)) {
-          switch (event.type) {
-            case "text.delta":
-              text += event.text;
-              yield { type: "text.delta", messageId: assistantId, text: event.text };
-              break;
-            case "reasoning.delta":
-              reasoning += event.text;
-              yield { type: "reasoning.delta", messageId: assistantId, text: event.text };
-              break;
-            case "toolcall":
-              calls.push(event.call);
-              break;
-            case "usage":
-              usage = addUsage(usage, event.usage);
-              yield { type: "usage", usage: event.usage };
-              break;
-            case "done":
-              finish = event.finishReason;
-              break;
-            case "error":
-              yield { type: "error", error: event.error };
-              finish = "error";
-              break;
-          }
-        }
-      } catch (error) {
-        const normalized = normalizeError(error, "provider_error");
-        this.deps.logger.error("provider stream failed", normalized);
-        yield { type: "error", error: normalized };
-        finish = "error";
-      }
+      const { request, warning } = requestFor(messages, tools);
+      if (warning) yield { type: "warning", message: warning };
+      const { text, reasoning, calls, usage, finish } = yield* this.callModel(
+        provider,
+        request,
+        input.signal,
+        assistantId,
+      );
 
       if (reasoning) {
         assistant.parts.push({ type: "reasoning", text: reasoning });
@@ -220,9 +258,7 @@ export class Agent {
       for (const call of calls) {
         assistant.parts.push({ type: "tool_call", id: call.id, name: call.name, args: call.args });
       }
-      if (usage) {
-        assistant.meta = { ...assistant.meta, usage };
-      }
+      assistant.meta = { ...assistant.meta, ...(usage ? { usage } : {}), finishReason: finish };
       messages.push(assistant);
       onMessage(assistant);
       yield { type: "message.done", messageId: assistantId, finishReason: finish };
@@ -287,8 +323,8 @@ export class Agent {
         input,
         provider,
         model,
-        caps,
         messages,
+        (list) => requestFor(list, undefined),
         guardTripped ? "guard" : "iterations",
       );
     }
@@ -306,8 +342,8 @@ export class Agent {
     input: AgentTurnInput,
     provider: Provider,
     model: string,
-    caps: ProviderCapabilities,
     messages: ChatMessage[],
+    requestFor: (list: ChatMessage[]) => { request: ChatRequest; warning?: string },
     reason: "iterations" | "guard",
   ): AsyncGenerator<KernelEvent> {
     yield {
@@ -336,44 +372,14 @@ export class Agent {
       ],
       createdAt: Date.now(),
     };
-    const request: ChatRequest = {
-      model,
-      messages: toProviderMessages([...messages, nudge], caps),
-      cacheKey: input.sessionId,
-      reasoningEffort:
-        input.reasoningEffort && input.reasoningEffort !== "off" && caps.reasoningEffort
-          ? input.reasoningEffort
-          : undefined,
-    };
-
-    let text = "";
-    let reasoning = "";
-    let usage: Usage | undefined;
-    try {
-      for await (const event of provider.chat(request, input.signal)) {
-        switch (event.type) {
-          case "text.delta":
-            text += event.text;
-            yield { type: "text.delta", messageId: assistantId, text: event.text };
-            break;
-          case "reasoning.delta":
-            reasoning += event.text;
-            yield { type: "reasoning.delta", messageId: assistantId, text: event.text };
-            break;
-          case "usage":
-            usage = addUsage(usage, event.usage);
-            yield { type: "usage", usage: event.usage };
-            break;
-          case "error":
-            yield { type: "error", error: event.error };
-            break;
-          default:
-            break;
-        }
-      }
-    } catch (error) {
-      this.deps.logger.error("closing answer failed", normalizeError(error, "provider_error"));
-    }
+    const { request, warning } = requestFor([...messages, nudge]);
+    if (warning) yield { type: "warning", message: warning };
+    const { text, reasoning, usage, finish } = yield* this.callModel(
+      provider,
+      request,
+      input.signal,
+      assistantId,
+    );
 
     const parts: Part[] = [];
     if (reasoning) parts.push({ type: "reasoning", text: reasoning });
@@ -384,12 +390,83 @@ export class Agent {
         role: "assistant",
         parts,
         createdAt: Date.now(),
-        meta: { provider: provider.id, model, ...(usage ? { usage } : {}) },
+        meta: { provider: provider.id, model, ...(usage ? { usage } : {}), finishReason: finish },
       };
       messages.push(assistant);
       if (input.persist !== false) this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
     }
-    yield { type: "message.done", messageId: assistantId, finishReason: "stop" };
+    yield { type: "message.done", messageId: assistantId, finishReason: finish };
+  }
+
+  /**
+   * Stream one model call into kernel events. A retryable failure (rate limit,
+   * overloaded upstream, dropped connection) that arrives before the model has
+   * produced anything is retried with backoff; once output has streamed, a
+   * retry would duplicate it on screen, so the error surfaces instead.
+   */
+  private async *callModel(
+    provider: Provider,
+    request: ChatRequest,
+    signal: AbortSignal,
+    assistantId: string,
+  ): AsyncGenerator<KernelEvent, ModelResult> {
+    const maxRetries = this.deps.maxRetries ?? 3;
+    let usage: Usage | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const result: ModelResult = { text: "", reasoning: "", calls: [], finish: "stop" };
+      let failure: NormalizedError | undefined;
+      let produced = false;
+      try {
+        for await (const event of provider.chat(request, signal)) {
+          switch (event.type) {
+            case "text.delta":
+              produced = true;
+              result.text += event.text;
+              yield { type: "text.delta", messageId: assistantId, text: event.text };
+              break;
+            case "reasoning.delta":
+              produced = true;
+              result.reasoning += event.text;
+              yield { type: "reasoning.delta", messageId: assistantId, text: event.text };
+              break;
+            case "toolcall":
+              produced = true;
+              result.calls.push(event.call);
+              break;
+            case "usage":
+              usage = addUsage(usage, event.usage);
+              yield { type: "usage", usage: event.usage };
+              break;
+            case "done":
+              result.finish = event.finishReason;
+              break;
+            case "error":
+              failure = event.error;
+              break;
+          }
+        }
+      } catch (error) {
+        failure = normalizeError(error, "provider_error");
+        this.deps.logger.error("provider stream failed", failure);
+      }
+      result.usage = usage;
+      if (!failure) return result;
+
+      if (!failure.retryable || produced || signal.aborted || attempt >= maxRetries) {
+        yield { type: "error", error: failure };
+        result.finish = "error";
+        return result;
+      }
+      const delay = retryDelay(attempt, this.deps.retryBaseDelayMs ?? 1_000, failure.retryAfterMs);
+      yield {
+        type: "warning",
+        message: `${firstLine(failure.message)} — retrying in ${Math.max(1, Math.round(delay / 1000))}s (attempt ${attempt + 2} of ${maxRetries + 1}).`,
+      };
+      if (!(await sleep(delay, signal))) {
+        // Cancelled while waiting: the turn is over, not failed.
+        return result;
+      }
+    }
   }
 
   private async systemContextFor(sessionId: string): Promise<string | undefined> {
@@ -402,16 +479,28 @@ export class Agent {
     }
   }
 
-  private async resolveAttachmentImages(messages: ChatMessage[]): Promise<void> {
-    if (!this.deps.resolveImage) return;
+  /**
+   * Swap attachment references for what the model can read: image bytes for
+   * vision, and the text of documents the user attached. Artifacts the
+   * assistant produced (file parts in tool results) stay as descriptions.
+   */
+  private async resolveAttachments(messages: ChatMessage[]): Promise<void> {
     for (const message of messages) {
       for (let i = 0; i < message.parts.length; i++) {
         const part = message.parts[i];
-        if (part.type !== "image" || part.source.kind !== "attachment") continue;
-        const resolved = await this.deps.resolveImage(part.source.id);
-        message.parts[i] = resolved
-          ? { type: "image", source: { kind: "data", data: resolved.data, mime: resolved.mime } }
-          : { type: "text", text: `[attached image ${part.source.id} is unavailable]` };
+        if (part.type === "image" && part.source.kind === "attachment" && this.deps.resolveImage) {
+          const resolved = await this.deps.resolveImage(part.source.id);
+          message.parts[i] = resolved
+            ? { type: "image", source: { kind: "data", data: resolved.data, mime: resolved.mime } }
+            : { type: "text", text: `[attached image ${part.source.id} is unavailable]` };
+        } else if (part.type === "file" && message.role === "user" && this.deps.resolveFile) {
+          const resolved = await this.deps.resolveFile(part.id);
+          if (!resolved) continue;
+          message.parts[i] = {
+            type: "text",
+            text: `<file name=${JSON.stringify(part.name)} type=${JSON.stringify(part.mime)}>\n${resolved.text}\n</file>`,
+          };
+        }
       }
     }
   }
@@ -557,6 +646,34 @@ function toProviderMessages(
     }
     return clone;
   });
+}
+
+/** Exponential backoff with jitter, deferring to a server-requested delay. */
+function retryDelay(attempt: number, baseMs: number, retryAfterMs?: number): number {
+  if (retryAfterMs !== undefined && retryAfterMs > 0) return Math.min(retryAfterMs, 60_000);
+  const exponential = baseMs * 2 ** attempt;
+  return Math.min(30_000, exponential + Math.floor(Math.random() * baseMs * 0.25));
+}
+
+/** Resolves true after `ms`, or false as soon as `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function firstLine(text: string): string {
+  const line = text.split("\n")[0] ?? "";
+  return line.length > 200 ? `${line.slice(0, 200)}…` : line;
 }
 
 function describeCall(name: string, args: unknown): string {

@@ -2,6 +2,8 @@ export interface NormalizedError {
   code: string;
   message: string;
   retryable?: boolean;
+  /** Server-requested delay before retrying (e.g. from `Retry-After`). */
+  retryAfterMs?: number;
   cause?: unknown;
 }
 

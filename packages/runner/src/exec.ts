@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { RunnerToServer } from "@hat/runner-protocol";
-import { spawnPlan, type SandboxConfig } from "./sandbox.js";
+import { removeContainer, spawnPlan, type SandboxConfig } from "./sandbox.js";
 
 export interface RunSpec {
   jobId: string;
@@ -13,13 +13,14 @@ export interface RunSpec {
 }
 
 export interface JobHandle {
-  abort(): void;
+  /** Resolves once any container cleanup has finished (or given up). */
+  abort(): Promise<void>;
   write(chunk: string): void;
 }
 
 /**
  * Start a detached shell job. Output is streamed to the server; the process
- * tree is killed on timeout, cancel, or output-cap breach.
+ * tree (and container) is killed on timeout, cancel, or output-cap breach.
  */
 export function startJob(
   spec: RunSpec,
@@ -32,30 +33,23 @@ export function startJob(
   let finished = false;
   let timedOut = false;
 
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    HOME: spec.cwd,
-  };
-  // Allowlist caller env: never let the model override loader / runtime knobs.
-  if (spec.env) {
-    for (const [key, value] of Object.entries(spec.env)) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-      if (/^(LD_|DYLD_|NODE_OPTIONS|NODE_PATH|PATH|HOME|IFS)$/i.test(key)) continue;
-      env[key] = value;
-    }
-  }
-
-  const plan = spawnPlan(spec.command, spec.cwd, sandbox);
+  // The plan filters caller env: the model never overrides loader / runtime knobs.
+  const plan = spawnPlan(spec.command, spec.cwd, sandbox, { env: spec.env, id: spec.jobId });
   const child = spawn(plan.bin, plan.args, {
     shell: plan.shell,
     cwd: spec.cwd,
-    env,
+    env: plan.env,
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  const kill = (): void => {
-    if (finished || !child.pid) return;
+  let removal: Promise<void> | undefined;
+  /**
+   * Kill the process tree, then force-remove the job's container (if any):
+   * killing the runtime CLI alone leaves the container running.
+   */
+  const kill = (): Promise<void> => {
+    if (finished || !child.pid) return removal ?? Promise.resolve();
     try {
       if (process.platform !== "win32") {
         process.kill(-child.pid, "SIGKILL");
@@ -69,6 +63,8 @@ export function startJob(
         /* already gone */
       }
     }
+    removal ??= removeContainer(plan.cleanup);
+    return removal;
   };
 
   const timer = setTimeout(() => {
@@ -78,7 +74,7 @@ export function startJob(
       jobId: spec.jobId,
       chunk: `\n[timeout after ${spec.timeoutMs}ms; killing process]\n`,
     });
-    kill();
+    void kill();
   }, spec.timeoutMs);
 
   const emit = (chunk: string, stream: "stdout" | "stderr"): void => {
@@ -90,7 +86,7 @@ export function startJob(
         jobId: spec.jobId,
         chunk: `\n[output limit ${spec.maxOutputBytes} bytes reached; killing process]\n`,
       });
-      kill();
+      void kill();
       return;
     }
     if (stream === "stdout") {
@@ -135,13 +131,13 @@ export function startJob(
   child.stdin.end();
 
   return {
-    abort(): void {
+    abort(): Promise<void> {
       send({
         t: "exec.stderr",
         jobId: spec.jobId,
         chunk: "\n[cancelled]\n",
       });
-      kill();
+      return kill();
     },
     write(chunk: string): void {
       if (!finished && child.stdin.writable) {

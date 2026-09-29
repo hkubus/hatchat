@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import type { ChatMessage, Usage } from "@hat/core";
-import { usageTotal } from "@hat/core";
+import { textOf, usageTotal } from "@hat/core";
 import { Store } from "./store.js";
 
 function message(id: string, role: ChatMessage["role"], text: string): ChatMessage {
@@ -326,4 +326,144 @@ test("schedules become due, advance, and one-shots disable themselves", () => {
   assert.equal(after.lastError, "boom");
   assert.deepEqual(store.dueSchedules(Number.MAX_SAFE_INTEGER), []);
   assert.ok(store.deleteSchedule(schedule.id));
+});
+
+test("per-session settings round-trip and clear back to defaults", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  assert.equal(session.instructions, "");
+  assert.equal(session.temperature, null);
+
+  store.setSessionSettings(session.id, { instructions: "Be terse.", temperature: 0.3, maxTokens: 500 });
+  let updated = store.getSession(session.id)!;
+  assert.equal(updated.instructions, "Be terse.");
+  assert.equal(updated.temperature, 0.3);
+  assert.equal(updated.maxTokens, 500);
+
+  // Omitted fields are left alone; null clears.
+  store.setSessionSettings(session.id, { temperature: null });
+  updated = store.getSession(session.id)!;
+  assert.equal(updated.temperature, null);
+  assert.equal(updated.maxTokens, 500);
+  assert.equal(updated.instructions, "Be terse.");
+});
+
+test("forkSession copies only the path up to the chosen message", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.setSessionSettings(session.id, { instructions: "keep" });
+  store.appendMessage(session.id, message("m1", "user", "one"));
+  store.appendMessage(session.id, message("m2", "assistant", "reply1"));
+  store.appendMessage(session.id, message("m3", "user", "two"));
+  store.appendMessage(session.id, message("m4", "assistant", "reply2"));
+  // A sibling branch that must not come along.
+  store.setActiveLeaf(session.id, "m1");
+  store.appendMessage(session.id, message("m5", "assistant", "alt"));
+
+  const fork = store.forkSession(session.id, "m3")!;
+  assert.ok(fork);
+  assert.notEqual(fork.id, session.id);
+  assert.equal(fork.instructions, "keep");
+  assert.match(fork.title, /\(fork\)$/);
+  const path = store.getPath(fork.id);
+  assert.deepEqual(
+    path.map((n) => textOf(n.message)),
+    ["one", "reply1", "two"],
+  );
+  assert.ok(path.every((n) => !["m1", "m2", "m3"].includes(n.message.id)), "fresh ids");
+  assert.equal(store.countMessages(fork.id), 3);
+  // The source is untouched.
+  assert.equal(store.countMessages(session.id), 5);
+  // A message from another session cannot be forked from here.
+  const other = store.createSession("fake/fake-agent");
+  assert.equal(store.forkSession(other.id, "m3"), undefined);
+});
+
+test("export and import preserve the whole tree, settings and active branch", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.setSessionTitle(session.id, "Original");
+  store.setSessionSettings(session.id, { instructions: "Speak plainly.", maxTokens: 256 });
+  store.appendMessage(session.id, message("m1", "user", "one"));
+  store.appendMessage(session.id, message("m2", "assistant", "first"));
+  store.setActiveLeaf(session.id, "m1");
+  store.appendMessage(session.id, message("m3", "assistant", "second"));
+
+  const exported = store.exportSession(session.id)!;
+  assert.equal(exported.format, "hat.session");
+  assert.equal(exported.messages.length, 3);
+  assert.equal(exported.activeLeafId, "m3");
+
+  const json = JSON.parse(JSON.stringify(exported));
+  const imported = store.importSession(json);
+  assert.equal(imported.title, "Original");
+  assert.equal(imported.instructions, "Speak plainly.");
+  assert.equal(imported.maxTokens, 256);
+  const path = store.getPath(imported.id);
+  assert.deepEqual(path.map((n) => textOf(n.message)), ["one", "second"]);
+  assert.equal(path[1].siblingCount, 2, "the other branch came along too");
+  assert.equal(store.countMessages(imported.id), 3);
+  // Search indexes imported messages like any other.
+  assert.ok(store.searchMessages("second").some((hit) => hit.sessionId === imported.id));
+});
+
+test("import drops messages whose parent is missing", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.importSession({
+    format: "hat.session",
+    version: 1,
+    exportedAt: 0,
+    session: {
+      title: "t",
+      createdAt: 0,
+      model: "fake/fake-agent",
+      approvalMode: "ask",
+      allowedTools: [],
+      reasoningEffort: "low",
+      instructions: "",
+      temperature: null,
+      maxTokens: null,
+    },
+    activeLeafId: "b",
+    messages: [
+      { id: "a", parentId: null, role: "user", parts: [{ type: "text", text: "root" }], createdAt: 1 },
+      { id: "b", parentId: "zz", role: "assistant", parts: [{ type: "text", text: "orphan" }], createdAt: 2 },
+    ],
+  });
+  assert.equal(store.countMessages(session.id), 1);
+  assert.equal(session.approvalMode, "ask");
+});
+
+test("document attachments keep their name and extracted text", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hat-doc-"));
+  const { createArtifactStore } = await import("@hat/artifacts");
+  const store = new Store(":memory:", crypto.randomBytes(32), createArtifactStore({ dir }));
+  const bytes = Buffer.from("hello, document");
+  const record = await store.putAttachment(bytes, "text/plain", { name: "notes.txt", text: "hello, document" });
+  assert.equal(record.name, "notes.txt");
+  assert.equal(record.hasText, true);
+  assert.equal(store.getAttachmentText(record.id), "hello, document");
+
+  const image = await store.putAttachment(Buffer.from([1, 2, 3]), "image/png");
+  assert.equal(image.hasText, undefined);
+  assert.equal(store.getAttachmentText(image.id), undefined);
+});
+
+test("synthetic nudges are neither searchable nor counted as visible rows", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("m1", "user", "tell me about otters"));
+  store.appendMessage(session.id, message("m2", "assistant", "otters are"));
+  store.appendMessage(session.id, {
+    ...message("m3", "user", "Continue exactly where it stopped"),
+    meta: { synthetic: "continue" },
+  });
+  store.appendMessage(session.id, message("m4", "assistant", " very playful"));
+  assert.equal(store.searchMessages("stopped").length, 0);
+  assert.equal(store.searchMessages("playful").length, 1);
+  assert.equal(store.countVisibleMessages(session.id), 3);
+  assert.equal(store.countMessages(session.id), 4);
+  assert.equal(store.hasMessage(session.id, "m1"), true);
+  const other = store.createSession("fake/fake-agent");
+  assert.equal(store.hasMessage(other.id, "m1"), false);
 });

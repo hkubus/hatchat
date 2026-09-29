@@ -25,6 +25,12 @@ export interface PluginContext {
    */
   runnerAvailable?: () => boolean;
   logger: Logger;
+  /**
+   * Report that the plugin broke after activation (e.g. its isolated process
+   * died): its contributions are unregistered and its status becomes `error`
+   * until it is re-activated. No-op once this activation has ended.
+   */
+  fail?(error: unknown): void;
 }
 
 /**
@@ -42,6 +48,11 @@ export interface Plugin {
   /** Secret names the plugin needs; it stays in `needs-config` until set. */
   readonly requiresSecrets?: string[];
   readonly configSchema?: ZodTypeAny;
+  /**
+   * Raw JSON Schema for config, for plugins that can't hand over zod (isolated
+   * external plugins). The host skips validation; the plugin validates itself.
+   */
+  readonly configJsonSchema?: unknown;
   activate(ctx: PluginContext): void | Promise<void>;
   deactivate?(): void | Promise<void>;
 }

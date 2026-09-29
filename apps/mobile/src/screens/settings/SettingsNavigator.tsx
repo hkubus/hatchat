@@ -11,6 +11,7 @@
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { useTheme } from "../../theme";
 import { barItems } from "../../ui/barItems";
+import { ConversationForm } from "../ConversationScreen";
 import AllowlistScreen from "./AllowlistScreen";
 import ConnectionScreen from "./ConnectionScreen";
 import PluginScreen from "./PluginScreen";
@@ -63,6 +64,9 @@ export default function SettingsNavigator({ onDisconnect }: { onDisconnect: () =
       <Stack.Screen name="Plugin" component={PluginScreen} options={{ title: "" }} />
       <Stack.Screen name="Runners" component={RunnersScreen} options={{ title: "Runners" }} />
       <Stack.Screen name="Allowlist" component={AllowlistScreen} options={{ title: "Allowed Tools" }} />
+      <Stack.Screen name="Conversation" options={{ title: "Instructions & Sampling" }}>
+        {({ navigation }) => <ConversationForm navigation={navigation} sheet={false} />}
+      </Stack.Screen>
       <Stack.Screen name="Connection" component={ConnectionScreen} options={{ title: "Server" }} />
     </Stack.Navigator>
   );

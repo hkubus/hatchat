@@ -14,10 +14,22 @@ type TurnEmitter = (sessionId: string, event: KernelEvent) => void;
 export class ApprovalManager implements ApprovalBroker {
   private readonly pending = new Map<string, { sessionId: string; finish: (decision: ApprovalDecision) => void }>();
 
+  /**
+   * @param timeoutMs how long a request may wait before it is denied; 0 waits
+   * until the user answers or the turn is cancelled. A turn keeps running with
+   * nobody watching, so a short timeout silently denies whatever the model was
+   * doing while the user was away.
+   */
   constructor(
     private readonly emitTurnEvent: TurnEmitter,
-    private readonly timeoutMs = 300_000,
+    private readonly timeoutMs = 0,
   ) {}
+
+  /** Whether a conversation is blocked on the user answering an approval. */
+  isWaiting(sessionId: string): boolean {
+    for (const entry of this.pending.values()) if (entry.sessionId === sessionId) return true;
+    return false;
+  }
 
   request(req: ApprovalRequest, signal: AbortSignal): Promise<ApprovalDecision> {
     this.emitTurnEvent(req.sessionId, {
@@ -32,7 +44,7 @@ export class ApprovalManager implements ApprovalBroker {
       const finish = (decision: ApprovalDecision): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         this.pending.delete(req.callId);
         this.emitTurnEvent(req.sessionId, {
@@ -46,12 +58,12 @@ export class ApprovalManager implements ApprovalBroker {
       const onAbort = (): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         this.pending.delete(req.callId);
         reject(new Error("approval aborted"));
       };
 
-      const timer = setTimeout(() => finish("deny"), this.timeoutMs);
+      const timer = this.timeoutMs > 0 ? setTimeout(() => finish("deny"), this.timeoutMs) : undefined;
 
       if (signal.aborted) {
         onAbort();

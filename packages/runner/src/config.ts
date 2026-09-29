@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import type { SandboxConfig } from "./sandbox.js";
+import { parseProcessTier, parseSandboxMode, type SandboxSettings } from "./sandbox.js";
 
 export interface RunnerConfig {
   serverUrl: string;
@@ -12,7 +12,7 @@ export interface RunnerConfig {
   defaultTimeoutMs: number;
   maxTimeoutMs: number;
   maxOutputBytes: number;
-  sandbox: SandboxConfig;
+  sandbox: SandboxSettings;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -43,8 +43,9 @@ export function loadConfig(): RunnerConfig {
     maxTimeoutMs: envInt("HAT_EXEC_MAX_TIMEOUT_MS", 600_000),
     maxOutputBytes: envInt("HAT_EXEC_MAX_OUTPUT_BYTES", 1_000_000),
     sandbox: {
-      mode: envStr("HAT_EXEC_SANDBOX", "host") === "container" ? "container" : "host",
-      runtime: envStr("HAT_SANDBOX_RUNTIME", "docker"),
+      mode: parseSandboxMode(envStr("HAT_EXEC_SANDBOX", "auto")),
+      runtime: process.env.HAT_SANDBOX_RUNTIME?.trim() || undefined,
+      processes: parseProcessTier(process.env.HAT_SANDBOX_PROCESSES),
       image: envStr("HAT_SANDBOX_IMAGE", "node:22-slim"),
       network: envStr("HAT_SANDBOX_NETWORK", "none"),
       memory: envStr("HAT_SANDBOX_MEMORY", "512m"),

@@ -24,10 +24,13 @@ import {
   Text,
   View,
 } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
 import Swipeable from "react-native-gesture-handler/ReanimatedSwipeable";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
-import type { SessionSummary } from "../api";
+import * as api from "../api";
+import type { SearchHit, SessionSummary } from "../api";
 import * as haptics from "../haptics";
+import { snippetParts } from "../search";
 import { useChatStore } from "../navigation";
 import type { ScreenProps } from "../navigation";
 import { useTheme } from "../theme";
@@ -41,6 +44,19 @@ const DAY = 24 * 60 * 60 * 1000;
 
 /** `Alert.prompt` is iOS-only; elsewhere rename is simply not offered. */
 const CAN_RENAME = Platform.OS === "ios";
+
+/** Typing pauses this long before the server is searched. */
+const SEARCH_DEBOUNCE_MS = 300;
+
+/** How often statuses are refreshed while a conversation is running or waiting. */
+const STATUS_POLL_MS = 4000;
+
+type Row = SessionSummary | SearchHit;
+type Section = { title: string; data: Row[] };
+
+function isHit(row: Row): row is SearchHit {
+  return "messageId" in row;
+}
 
 function startOfToday(): number {
   const now = new Date();
@@ -96,10 +112,59 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
     setError(e instanceof Error ? e.message : String(e));
   }, []);
 
+  // Refetched whenever the list comes back into view, so statuses and titles
+  // are current after a conversation was used.
+  const { refreshSessions } = chat;
+  useFocusEffect(
+    useCallback(() => {
+      void refreshSessions().catch(() => undefined);
+    }, [refreshSessions]),
+  );
+
+  // Statuses only change on the server, so while something is running or
+  // waiting on the user, poll — only while this screen is in view.
+  const anyActive = chat.sessions.some((s) => s.status === "running" || s.status === "waiting");
+  useFocusEffect(
+    useCallback(() => {
+      if (!anyActive) return;
+      const timer = setInterval(() => void refreshSessions().catch(() => undefined), STATUS_POLL_MS);
+      return () => clearInterval(timer);
+    }, [anyActive, refreshSessions]),
+  );
+
+  // Message search: the title filter below is instant and local; the server's
+  // full-text search runs once typing pauses. A newer query aborts the older
+  // request, so a slow response can never overwrite a newer one.
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [searching, setSearching] = useState(false);
+  const trimmedQuery = query.trim();
   useEffect(() => {
-    void chat.refreshSessions().catch(() => undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!trimmedQuery) {
+      setHits([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      api.searchMessages(trimmedQuery, controller.signal).then(
+        (result) => {
+          setHits(result);
+          setSearching(false);
+        },
+        (e: unknown) => {
+          if (api.isAbortError(e)) return;
+          // Search is an extra; a server without it still filters titles.
+          setHits([]);
+          setSearching(false);
+        },
+      );
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [trimmedQuery]);
 
   const create = useCallback(async () => {
     setError(null);
@@ -162,6 +227,23 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
     [chat, navigation, fail],
   );
 
+  /** Open the conversation a search hit is in, on the branch that holds it. */
+  const openHit = useCallback(
+    async (hit: SearchHit) => {
+      setError(null);
+      setOpening(hit.messageId);
+      try {
+        await chat.openMessage(hit.sessionId, hit.messageId);
+        navigation.navigate("Chat");
+      } catch (e) {
+        fail(e);
+      } finally {
+        setOpening(null);
+      }
+    },
+    [chat, navigation, fail],
+  );
+
   const confirmDelete = useCallback(
     (item: SessionSummary) => {
       haptics.warning();
@@ -203,11 +285,19 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
 
   const sections = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    const matches = needle
-      ? chat.sessions.filter((s) => s.title.toLowerCase().includes(needle))
-      : chat.sessions;
-    const sorted = [...matches].sort((a, b) => b.updatedAt - a.updatedAt);
-    const grouped: { title: string; data: SessionSummary[] }[] = [];
+    if (needle) {
+      // Searching reads like Messages: matching conversations, then matching
+      // messages from inside them.
+      const matches = chat.sessions
+        .filter((s) => s.title.toLowerCase().includes(needle))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      const found: Section[] = [];
+      if (matches.length > 0) found.push({ title: "Conversations", data: matches });
+      if (hits.length > 0) found.push({ title: "Messages", data: hits });
+      return found;
+    }
+    const sorted = [...chat.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    const grouped: Section[] = [];
     for (const session of sorted) {
       const title = bucket(session.updatedAt);
       const last = grouped[grouped.length - 1];
@@ -215,13 +305,63 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
       else grouped.push({ title, data: [session] });
     }
     return grouped;
-  }, [chat.sessions, query]);
+  }, [chat.sessions, query, hits]);
+
+  const renderHit = useCallback(
+    (hit: SearchHit, first: boolean, last: boolean) => (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${hit.role === "user" ? "Your message" : "Reply"} in ${hit.sessionTitle}: ${snippetParts(hit.snippet)
+          .map((part) => part.text)
+          .join("")}`}
+        accessibilityHint="Opens the conversation at this message."
+        onPress={() => void openHit(hit)}
+        style={({ pressed }) => [
+          styles.row,
+          { backgroundColor: pressed ? theme.color.fill : theme.color.surface },
+          first && { borderTopLeftRadius: SECTION_RADIUS, borderTopRightRadius: SECTION_RADIUS },
+          last && { borderBottomLeftRadius: SECTION_RADIUS, borderBottomRightRadius: SECTION_RADIUS },
+        ]}
+      >
+        <View style={styles.rowBody}>
+          <View style={styles.rowLine}>
+            <Text style={[styles.rowTitle, { color: theme.color.text }]} numberOfLines={1}>
+              {hit.sessionTitle}
+            </Text>
+            <Text style={[styles.rowTime, { color: theme.color.textDim }]}>{listTime(hit.createdAt)}</Text>
+            {opening === hit.messageId ? (
+              <ActivityIndicator size="small" color={theme.color.textFaint} />
+            ) : (
+              <Icon name="chevron.right" size={13} weight="semibold" color={theme.color.textFaint} />
+            )}
+          </View>
+          <Text style={[styles.snippet, { color: theme.color.textDim }]} numberOfLines={2}>
+            {hit.role === "user" ? <Text style={styles.snippetRole}>You: </Text> : null}
+            {snippetParts(hit.snippet).map((part, i) =>
+              part.hit ? (
+                <Text key={i} style={[styles.snippetHit, { color: theme.color.text }]}>
+                  {part.text}
+                </Text>
+              ) : (
+                part.text
+              ),
+            )}
+          </Text>
+        </View>
+        {!last ? <View style={[styles.separator, { backgroundColor: theme.color.separator }]} /> : null}
+      </Pressable>
+    ),
+    [theme, opening, openHit],
+  );
 
   const renderItem = useCallback(
-    ({ item, index, section }: { item: SessionSummary; index: number; section: { data: SessionSummary[] } }) => {
+    ({ item: row, index, section }: { item: Row; index: number; section: Section }) => {
       const first = index === 0;
       const last = index === section.data.length - 1;
+      if (isHit(row)) return renderHit(row, first, last);
+      const item = row;
       const tokens = sessionTokens(item);
+      const status = item.status === "running" || item.status === "waiting" ? item.status : null;
       const corners = [
         first && { borderTopLeftRadius: SECTION_RADIUS, borderTopRightRadius: SECTION_RADIUS },
         last && { borderBottomLeftRadius: SECTION_RADIUS, borderBottomRightRadius: SECTION_RADIUS },
@@ -287,7 +427,13 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
           >
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel={item.title}
+              accessibilityLabel={
+                status === "waiting"
+                  ? `${item.title}. Needs you`
+                  : status === "running"
+                    ? `${item.title}. Responding`
+                    : item.title
+              }
               accessibilityHint="Opens the conversation. Swipe left or long press for more actions."
               accessibilityActions={[
                 ...(CAN_RENAME ? [{ name: "rename", label: "Rename" }] : []),
@@ -305,6 +451,13 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
             >
               <View style={styles.rowBody}>
                 <View style={styles.rowLine}>
+                  {/* Waiting gets a symbol, not just a colour, so it reads as
+                      "needs you" rather than a busier kind of running. */}
+                  {status === "waiting" ? (
+                    <Icon name="exclamationmark.circle.fill" size={15} color={theme.color.warn} />
+                  ) : status === "running" ? (
+                    <View style={[styles.runningDot, { backgroundColor: theme.color.accent }]} />
+                  ) : null}
                   <Text style={[styles.rowTitle, { color: theme.color.text }]} numberOfLines={1}>
                     {item.title}
                   </Text>
@@ -318,6 +471,11 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
                   )}
                 </View>
                 <Text style={[styles.rowMeta, { color: theme.color.textDim }]} numberOfLines={1}>
+                  {status === "waiting" ? (
+                    <Text style={[styles.rowStatus, { color: theme.color.warn }]}>Needs you · </Text>
+                  ) : status === "running" ? (
+                    <Text style={[styles.rowStatus, { color: theme.color.accent }]}>Responding · </Text>
+                  ) : null}
                   {item.messageCount} {item.messageCount === 1 ? "message" : "messages"}
                   {tokens ? ` · ${tokens} tokens` : ""}
                 </Text>
@@ -330,7 +488,7 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
         </Swipeable>
       );
     },
-    [theme, opening, open, rename, confirmDelete, rowMethods],
+    [theme, opening, open, rename, confirmDelete, rowMethods, renderHit],
   );
 
   return (
@@ -338,7 +496,7 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
       style={{ backgroundColor: theme.color.grouped }}
       contentInsetAdjustmentBehavior="automatic"
       sections={sections}
-      keyExtractor={(item) => item.id}
+      keyExtractor={(item) => (isHit(item) ? `hit:${item.messageId}` : item.id)}
       renderItem={renderItem}
       stickySectionHeadersEnabled={false}
       renderSectionHeader={({ section }) => (
@@ -357,8 +515,12 @@ export default function SessionsScreen({ navigation }: ScreenProps<"Chats">) {
         ) : null
       }
       ListEmptyComponent={
-        query ? (
-          <Empty title="No Results" detail={`No conversations match “${query}”.`} />
+        trimmedQuery ? (
+          searching ? (
+            <ActivityIndicator style={styles.loading} color={theme.color.textFaint} />
+          ) : (
+            <Empty title="No Results" detail={`No conversations or messages match “${trimmedQuery}”.`} />
+          )
         ) : chat.ready ? (
           <View style={styles.empty}>
             <Empty
@@ -396,6 +558,11 @@ const styles = StyleSheet.create({
   rowTitle: { flex: 1, fontSize: 17, fontWeight: "600", letterSpacing: -0.4 },
   rowTime: { fontSize: 15 },
   rowMeta: { fontSize: 15 },
+  rowStatus: { fontWeight: "600" },
+  runningDot: { width: 9, height: 9, borderRadius: 4.5 },
+  snippet: { fontSize: 15, lineHeight: 20 },
+  snippetRole: { fontWeight: "500" },
+  snippetHit: { fontWeight: "600" },
   separator: { height: StyleSheet.hairlineWidth },
   empty: { alignItems: "center", gap: 8 },
   loading: { paddingVertical: 48 },

@@ -10,6 +10,7 @@ export const mcpServerSchema = z.object({
   env: z.record(z.string()).optional(),
   url: z.string().optional(),
   token: z.string().optional(),
+  trustReadOnlyHint: z.boolean().optional(),
 });
 
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;
@@ -25,7 +26,7 @@ export const mcpConfigSchema = z.object({
     .array(mcpServerSchema)
     .optional()
     .describe(
-      'MCP servers, e.g. [{"name":"fs","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]. Use "transport":"http" with "url" for remote servers.',
+      'MCP servers, e.g. [{"name":"fs","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]. Use "transport":"http" with "url" for remote servers. Set "trustReadOnlyHint":false to require approval even for tools the server marks read-only.',
     ),
   requireApproval: z
     .boolean()
@@ -43,6 +44,7 @@ export interface ServerConfig {
   env?: Record<string, string>;
   url?: string;
   token?: string;
+  trustReadOnlyHint?: boolean;
 }
 
 function normalizeServer(raw: unknown, index: number): ServerConfig {
@@ -121,6 +123,21 @@ function toParts(result: { content?: unknown[]; isError?: boolean }): Part[] {
     parts.push({ type: "text", text: result.isError ? "MCP tool reported an error." : "(no content)" });
   }
   return parts;
+}
+
+/**
+ * Annotations come from the server and are only hints, so anything short of an
+ * explicit, non-destructive read-only claim from a trusted server still asks.
+ */
+export function mcpToolNeedsApproval(
+  tool: McpTool,
+  requireApproval: boolean,
+  trustReadOnlyHint = true,
+): boolean {
+  if (!requireApproval) return false;
+  const hints = tool.annotations;
+  const readOnly = hints?.readOnlyHint === true && hints.destructiveHint !== true;
+  return !(trustReadOnlyHint && readOnly);
 }
 
 function makeTool(
@@ -204,7 +221,8 @@ export function createMcpPlugin(): Plugin {
         connections.set(server.name, { close: connection.close });
         const tools = await connection.client.listTools();
         for (const tool of tools) {
-          ctx.register.tool(makeTool(server.name, tool, connection.client, requireApproval, isRunnerUp));
+          const needsApproval = mcpToolNeedsApproval(tool, requireApproval, server.trustReadOnlyHint ?? true);
+          ctx.register.tool(makeTool(server.name, tool, connection.client, needsApproval, isRunnerUp));
         }
         ctx.logger.info(`connected ${server.name}: ${tools.length} tool(s)`);
       }

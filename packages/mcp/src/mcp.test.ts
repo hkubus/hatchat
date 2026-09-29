@@ -11,8 +11,8 @@ import type {
 } from "@hat/core";
 import { AsyncQueue } from "@hat/core";
 import { JsonRpcClient } from "./jsonrpc.js";
-import { McpClient } from "./mcp.js";
-import { createMcpPlugin } from "./plugin.js";
+import { McpClient, parseMcpTool } from "./mcp.js";
+import { createMcpPlugin, mcpToolNeedsApproval } from "./plugin.js";
 import type { Transport } from "./jsonrpc.js";
 
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -69,8 +69,14 @@ test("mcp client initializes, lists and calls tools", async () => {
   assert.equal(result.content?.[0]?.text, "echo:hi");
 });
 
+const echoTool = {
+  name: "echo",
+  description: "echo",
+  inputSchema: { type: "object", properties: { text: { type: "string" } } },
+};
+
 /** A fake runner process that speaks MCP over "stdio". */
-function fakeProcess(): SpawnedProcess {
+function fakeProcess(tools: unknown[] = [echoTool]): SpawnedProcess {
   const queue = new AsyncQueue<ExecEvent>();
   return {
     id: "proc",
@@ -81,16 +87,7 @@ function fakeProcess(): SpawnedProcess {
         const msg = JSON.parse(line) as { id?: number; method?: string; params?: any };
         let result: unknown;
         if (msg.method === "initialize") result = { protocolVersion: "2024-11-05" };
-        else if (msg.method === "tools/list")
-          result = {
-            tools: [
-              {
-                name: "echo",
-                description: "echo",
-                inputSchema: { type: "object", properties: { text: { type: "string" } } },
-              },
-            ],
-          };
+        else if (msg.method === "tools/list") result = { tools };
         else if (msg.method === "tools/call")
           result = { content: [{ type: "text", text: `mcp echo: ${msg.params?.arguments?.text ?? ""}` }] };
         if (msg.id !== undefined && result !== undefined) {
@@ -195,4 +192,68 @@ test("tools stay registered when the runner drops, and say so", async () => {
   assert.match((recovered[0] as { text: string }).text, /mcp echo: again/);
 
   await plugin.deactivate?.();
+});
+
+test("tools/list annotations are parsed, and malformed hints dropped", () => {
+  const tool = parseMcpTool({
+    name: "read",
+    annotations: { title: "Read", readOnlyHint: true, destructiveHint: "no", extra: 1 },
+  });
+  assert.deepEqual(tool?.annotations, { title: "Read", readOnlyHint: true, destructiveHint: undefined });
+
+  // A hint that is not a boolean is absent, not truthy.
+  assert.equal(parseMcpTool({ name: "x", annotations: { readOnlyHint: "true" } })?.annotations?.readOnlyHint, undefined);
+  assert.equal(parseMcpTool({ name: "x", annotations: "read-only" })?.annotations, undefined);
+  assert.equal(parseMcpTool({ description: "no name" }), undefined);
+});
+
+test("only a non-destructive read-only hint skips approval", () => {
+  const tool = (annotations?: Record<string, boolean>) => ({ name: "t", annotations });
+  assert.equal(mcpToolNeedsApproval(tool({ readOnlyHint: true }), true), false);
+  assert.equal(mcpToolNeedsApproval(tool({ readOnlyHint: true, destructiveHint: true }), true), true);
+  assert.equal(mcpToolNeedsApproval(tool({ readOnlyHint: false }), true), true);
+  assert.equal(mcpToolNeedsApproval(tool(), true), true);
+  // A server that is not trusted gets no pass for its hints.
+  assert.equal(mcpToolNeedsApproval(tool({ readOnlyHint: true }), true, false), true);
+  // And requireApproval: false still turns approval off entirely.
+  assert.equal(mcpToolNeedsApproval(tool({ destructiveHint: true }), false), false);
+});
+
+async function registerAnnotated(server: Record<string, unknown>): Promise<Map<string, Tool>> {
+  const registered = new Map<string, Tool>();
+  const tools = [
+    { ...echoTool, name: "read", annotations: { readOnlyHint: true } },
+    { ...echoTool, name: "wipe", annotations: { readOnlyHint: true, destructiveHint: true } },
+    { ...echoTool, name: "sneaky", annotations: { readOnlyHint: "true" } },
+    echoTool,
+  ];
+  const processHost: ProcessHost = { async spawn() { return fakeProcess(tools); } };
+  const ctx: PluginContext = {
+    pluginId: "mcp",
+    register: { provider() {}, tool(tool) { registered.set(tool.name, tool); } },
+    getConfig: (() => ({
+      servers: [{ name: "s", transport: "stdio", command: "node", ...server }],
+    })) as PluginContext["getConfig"],
+    secrets: { async get() { return undefined; } },
+    processHost,
+    logger,
+  };
+  const plugin = createMcpPlugin();
+  await plugin.activate(ctx);
+  await plugin.deactivate?.();
+  return registered;
+}
+
+test("mcp plugin trusts readOnlyHint by default", async () => {
+  const tools = await registerAnnotated({});
+  assert.equal(tools.get("mcp__s__read")?.requiresApproval, false);
+  assert.equal(tools.get("mcp__s__wipe")?.requiresApproval, true);
+  assert.equal(tools.get("mcp__s__sneaky")?.requiresApproval, true);
+  assert.equal(tools.get("mcp__s__echo")?.requiresApproval, true);
+});
+
+test("trustReadOnlyHint: false makes every tool of that server ask", async () => {
+  const tools = await registerAnnotated({ trustReadOnlyHint: false });
+  assert.equal(tools.size, 4);
+  for (const tool of tools.values()) assert.equal(tool.requiresApproval, true, tool.name);
 });

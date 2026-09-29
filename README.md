@@ -46,12 +46,26 @@ A provider is registered only when its key is present. Set keys via env
 curl -X POST localhost:8787/api/secrets \
   -H 'content-type: application/json' \
   -d '{"name":"OPENROUTER_API_KEY","value":"sk-or-..."}'
-# restart the server to register the provider
+# the plugin reloads and the provider registers immediately
 ```
 
 Capabilities are per model and drive the loop: `deepseek-reasoner` reports
 `toolCalls: false`, so tools are not offered to it. OpenRouter capabilities are
-derived from each model's `supported_parameters` and `input_modalities`.
+derived from each model's `supported_parameters` and `input_modalities`, and
+each model's context window comes from `context_length`.
+
+**Retries.** A rate limit (429), timeout (408) or overloaded upstream (5xx,
+including OpenRouter's in-stream errors) or a dropped connection is retried
+with exponential backoff, honouring `Retry-After`, up to `HAT_PROVIDER_RETRIES`
+times (default 3). Only failures that arrive *before* the model has produced
+anything are retried — once text has streamed, a retry would duplicate it on
+screen, so the error surfaces instead. Each retry shows as a warning in the chat.
+
+**Cut-off replies.** Each assistant message stores why the model stopped. A
+reply that hit the output limit (`finish_reason: length`) gets a **Continue**
+button: `POST /api/sessions/:id/continue` sends a synthetic user message asking
+the model to pick up where it stopped. Clients hide that message, so the answer
+reads as one continuous reply.
 
 ## Authentication (M6)
 
@@ -96,11 +110,48 @@ processes). `GET /api/runners` reports each runner's load.
 
 ## Sandbox tier (M6)
 
-`HAT_EXEC_SANDBOX=container` wraps every `shell_exec` on the runner in a
-throwaway container (`docker run --rm -i --network <n> --memory <m> --cpus <c>
---pids-limit 512 -v <workspace>:/workspace -w /workspace <image> sh -lc <cmd>`).
-Defaults to `host`. Requires a container runtime on the runner; the image should
-include the tools you expect (e.g. `node:22-slim`, or your own).
+In the `container` tier every `shell_exec` on the runner runs in a throwaway
+container (`docker run --rm -i --network <n> --memory <m> --cpus <c>
+--pids-limit 512 -v <workspace>:/workspace -w /workspace <image> sh -lc <cmd>`),
+hardened with `--cap-drop=ALL`, `no-new-privileges` and a read-only root
+filesystem. The image should include the tools you expect (e.g. `node:22-slim`,
+or your own).
+
+`HAT_EXEC_SANDBOX` picks the tier:
+
+- `auto` (default): at startup the runner probes for a working runtime (docker,
+  then podman; 5s timeout each) and uses `container` if one answers, otherwise
+  `host`.
+- `container`: always sandbox. The runner refuses to start if no runtime works.
+- `host`: run commands directly on the runner, with its privileges.
+
+`HAT_SANDBOX_RUNTIME` pins the runtime binary (e.g. `podman` or a full path);
+only that one is probed. The runner logs the chosen tier and why at startup,
+and advertises it as `capabilities.sandbox` (`host` | `container`) in
+`GET /api/runners`. The compose runner has no runtime (and no Docker socket), so
+it is pinned to `host`.
+
+Inside the container:
+
+- The command runs as the runner's own uid:gid, so files it writes to the
+  workspace belong to the runner's user (`--userns=keep-id` on rootless podman;
+  container root, which maps to the runner's user, on rootless docker). Run the
+  runner as a non-root user: a root runner means uid 0 in the container, with
+  all capabilities dropped.
+- `HOME` is `/workspace`. Per-command env is forwarded as `-e KEY`, with values
+  kept out of the runtime's argv; names that would steer the runtime CLI
+  (`DOCKER_*`, `CONTAINER_*`, `XDG_*`, proxies, ...) are dropped.
+- Each container is named `hat-<job id>-<random>`. On cancel, timeout, output
+  cap, link loss or runner shutdown the runner runs `<runtime> rm -f <name>`
+  (best-effort, 5s timeout), since killing the CLI alone leaves it running.
+
+Background processes and the Python tool (shell-mode processes) stay on the
+**host** under `auto`, because the default image has no `python3` and the
+default network is `none`. Set `HAT_SANDBOX_PROCESSES=container` to sandbox them
+too (with an image that has what they need). An explicit
+`HAT_EXEC_SANDBOX=container` sandboxes them by default, and
+`HAT_SANDBOX_PROCESSES=host` opts them out. stdio MCP servers always run on the
+host.
 
 ## MCP (M5)
 
@@ -125,7 +176,13 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 - **http** uses the Streamable HTTP transport (JSON or SSE responses, session id
   propagation) on the server.
 - MCP tools carry their real JSON Schema (`Tool.parameters`), so no zod
-  conversion is needed; `requiresApproval` defaults to true.
+  conversion is needed.
+- Tools require approval by default. The exception is a tool whose
+  `annotations` say `readOnlyHint: true` without `destructiveHint: true`: it
+  runs without asking. Annotations are only hints from the server, so a missing
+  or malformed hint keeps the approval. To ignore a server's hints entirely, set
+  `"trustReadOnlyHint": false` on that server. `requireApproval: false` on the
+  plugin still turns approval off for every MCP tool.
 - `notifications/tools/list_changed` is wired; server→client requests we don't
   implement (sampling, elicitation) are declined with a JSON-RPC error, which
   servers handle gracefully.
@@ -175,10 +232,12 @@ Settings → Plugins → MCP servers:
 
 - `dist-mcp/mcp.js` keeps its bare imports external, so it needs Scout's
   `node_modules` next to it — it is not a standalone bundle. It also needs
-  Node ≥ 22.5, which is above hat's own `engines.node: ">=20"`.
+  Node ≥ 22.5, which hat's own `engines.node: ">=22.18"` already covers.
 - Scout is read-only over MCP unless `SCOUT_MCP_ALLOW_WRITES` is set, which
-  additionally exposes 10 mutating tools. Hat ignores MCP's `readOnlyHint`, so
-  leaving that variable unset is the stronger control.
+  additionally exposes 10 mutating tools. Hat skips approval for tools marked
+  `readOnlyHint`, but that trusts Scout's own labels; leaving the variable unset
+  is the stronger control, and `"trustReadOnlyHint": false` makes every Scout
+  tool ask.
 - `scout://status` and `scout://dashboard` are MCP *resources*; hat's client
   implements tools only, so they are not exposed.
 - `search_listings` and the scan tools perform real marketplace scans over the
@@ -208,6 +267,28 @@ model does not mistake one connected integration (an MCP server, the shell, a
 search backend, …) for its identity or the point of the conversation. Override
 it verbatim with `HAT_SYSTEM_PROMPT`. Providers that cannot take a system role
 get it merged into the first user message instead.
+
+Each conversation can add its own **instructions** (appended to the system
+prompt), a **temperature** and a **max reply tokens** cap — the sliders button
+in the chat header, or `PATCH /api/sessions/:id` with `instructions`,
+`temperature` (0–2, `null` for the default) and `maxTokens`. They travel with
+the conversation when it is forked or exported.
+
+## Context window
+
+Every turn replays the active branch, so a long conversation — or a few large
+tool outputs — would eventually overflow the model and fail. Before each model
+call the kernel (`packages/kernel/src/context.ts`) estimates the request and,
+when it would not fit the model's window (minus room for the reply), first
+replaces **old tool outputs** with a short placeholder (the newest tool result
+is never touched), then leaves out the **oldest exchanges**, adding a note
+that it did. Only the request is trimmed: stored history is unchanged, and a
+model with a larger window sees everything again.
+
+Cuts are made in pages of a quarter of the budget, so the start of the request
+stays byte-identical across turns until the conversation has grown by another
+page — prompt caching keeps working. The chat shows a warning when trimming
+starts, and the composer shows how full the window was on the last call.
 
 ## Browser
 
@@ -241,6 +322,15 @@ Attach images by button, paste, or drag-and-drop. Uploads are content-addressed
 (sha256), deduped, and stored under `HAT_UPLOAD_DIR`; dimensions are read from
 PNG/GIF/JPEG headers with no native image dependency.
 
+**Documents** — text, Markdown, CSV, JSON, source code and **PDFs** — attach
+the same way. Their text is extracted once on upload (PDFs via `unpdf`, loaded
+lazily), stored next to the blob (capped at 400k characters), and inlined into
+the user's message for the model as `<file name="…">…</file>`. The stored
+message keeps only a `file` part, which the UI shows as a card you can preview
+or download. Binary files and scanned PDFs without a text layer are rejected
+with a message saying so. Pasting a very long text into the web composer turns
+it into a `.txt` attachment.
+
 Messages reference attachments by id. The kernel resolves them to base64 data
 URLs **only for vision-capable models**; for others the image is replaced with an
 omitted-note and the capability check warns in the chat. This keeps large
@@ -250,8 +340,8 @@ blobs out of stored messages and off the wire unless needed.
 
 Each conversation has a **tool policy** (editable in the chat toolbar):
 
-- `ask` (default) — tools that require approval prompt you.
-- `auto` — run tools without asking.
+- `ask` — tools that require approval prompt you.
+- `auto` (default) — run tools without asking.
 - `allowlist` — auto-run only the listed tools, ask for the rest.
 - `deny` — block all tool execution.
 
@@ -261,6 +351,12 @@ can't spin forever. A turn is also capped at `HAT_MAX_TOOL_ITERATIONS`
 (default 100) tool steps; when the budget (or a guard) is hit, the agent makes one
 final call **with tools withheld** so the turn closes with a written answer
 instead of dangling on a tool result, and emits a `warning` explaining why.
+
+An approval (or an `ask_user` question) **waits for you** — the turn keeps
+running server-side while you are away, so a timeout would silently deny
+whatever the model was doing. Set `HAT_APPROVAL_TIMEOUT_MINUTES` to give up
+after a while instead. The session list reports each conversation as `idle`,
+`running` or `waiting` (blocked on you), shown as a dot in the sidebar.
 
 **Capability checks** compare the conversation's needs (vision from image
 parts, tool calls once tools are used) against the selected model. On a mismatch
@@ -289,7 +385,7 @@ plugin is disabled, errors, or is reconfigured.
 ### External plugins
 
 Drop ESM modules into `HAT_PLUGINS_DIR` (default `./plugins`) that default-export
-a `Plugin`. They are **trusted and in-process** (sandboxing is a later milestone):
+a `Plugin`. Each one runs **in its own child process**, not in the server:
 
 ```js
 import { definePlugin, z } from "@hat/plugin-sdk";
@@ -313,6 +409,39 @@ export default definePlugin({
 
 See `plugins/example.mjs`. Manage everything under **Settings → Plugins**.
 
+The same plugin API works across the process boundary
+(`packages/server/src/plugin-isolation/`): the server registers proxy
+tools/providers that forward calls over IPC, provider streams come back as
+events, and aborts are passed on as cancellations. Zod schemas stay in the
+child, which validates tool args and config itself and sends the server JSON
+Schema.
+
+- **Environment**: the child gets none of the server's env vars (only
+  `NODE_ENV`, `TZ`, `LANG`), so no `HAT_MASTER_KEY`, `HAT_AUTH_*` or provider keys.
+- **Sandbox** (Node >= 22.18): the child runs under Node's permission model.
+  It can read only the plugin directory and the code it imports (`node_modules`
+  and linked workspace packages). It can't write files, spawn processes, start
+  workers or load native addons. On older Node the child still runs in its own
+  process with a scrubbed env, but without the filesystem sandbox (a warning is
+  logged).
+- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`.
+  Anything else is refused.
+- **Tool context**: `sessionId`, `callId`, `signal`, `logger` and `secrets`.
+  `ctx.host` forwards to the call's execution host, stays pinned to that session,
+  and works only while the call runs. Each part needs its declared permission:
+  `runner:exec` (exec), `runner:fs` (fs), `runner:net` (fetch). `ctx.processHost`,
+  `runnerAvailable`, approval requests and `emit` are not available.
+- **Lifecycle**: every activation starts a fresh process. Disabling or
+  reconfiguring kills it. If it crashes, the plugin goes to `error` with the
+  reason and its tools/providers are unregistered; re-enable it to restart.
+- **Limits**: network access isn't restricted (Node's permission model has no
+  network control). A `requiresApproval` predicate is treated as "always ask".
+  Provider `capabilities(model)` answers from the last `listModels()` result.
+  `id`, `requiresSecrets` and `permissions` are read once at startup.
+
+`HAT_PLUGINS_ISOLATION=off` loads external plugins into the server process
+instead, where they are fully trusted, as before.
+
 ## Persistence + branching (M1)
 
 Sessions, messages and secrets live in SQLite (`node:sqlite`, no native build).
@@ -323,6 +452,24 @@ Messages form a **tree**; the active path is root→leaf, so:
 - **Edit** a user message → sets the leaf to its parent and re-runs with new
   text, creating a sibling user branch.
 - The UI shows `‹ n/m ›` on any message with siblings to switch branches.
+- **Fork** any message → a new conversation holding the path up to it, with the
+  same settings (`POST /api/sessions/:id/fork`).
+
+**Search.** User and assistant text is indexed with SQLite FTS5. The sidebar
+search box filters titles and, from two characters, searches message contents
+(`GET /api/search?q=`). Opening a hit switches to the branch holding that
+message and scrolls to it.
+
+**Export / import.** `GET /api/sessions/:id/export?format=markdown` is the
+active branch as a readable transcript; the default JSON is the whole message
+tree with settings and attachments inline, and `POST /api/sessions/import`
+recreates it as a new conversation (fresh ids, attachments re-stored). Both are
+in the chat header's download menu; import is in the sidebar.
+
+**Notifications.** The web app can notify you (Settings → Preferences, opt-in)
+when a reply is ready or a conversation needs you while the tab is in the
+background. Reaching a closed tab or a suspended phone would need server push,
+which is not built.
 
 Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
@@ -453,6 +600,9 @@ pnpm test         # node:test unit tests (providers, crypto, store, SSE parser, 
 pnpm smoke        # boots server + runner, exercises turn/approval/branching
 ```
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three plus the
+web build on every push to `main` and every pull request.
+
 ## Run (compose)
 
 ```sh
@@ -476,10 +626,16 @@ The runner publishes **no ports** — it dials out to `server:8787/link`.
 This is a single-user app. Before exposing it:
 
 1. **Set `HAT_AUTH_TOKEN`.** With it unset, `/api` is unauthenticated.
-2. Prefer passkeys/session cookies over a bearer token (M6 work) and terminate
-   TLS at a reverse proxy (Caddy/Traefik).
-3. The `shell_exec` tool is approval-gated per command by default. Keep it that
-   way until the container isolation tier (M6) lands.
+2. Prefer password login (session cookie + CSRF, `HAT_AUTH_PASSWORD`) for the
+   browser over sharing the bearer token, and terminate TLS at a reverse proxy
+   (Caddy/Traefik) with `HAT_COOKIE_SECURE=true`.
+3. Run the runner as a non-root user where a container runtime is available,
+   so `shell_exec` gets the container sandbox tier (the `auto` default picks it
+   up; set `HAT_EXEC_SANDBOX=container` to make it mandatory), and check
+   `capabilities.sandbox` in `GET /api/runners`. Keep `shell_exec` approval-gated
+   per command (the default) on any runner still in the `host` tier. Background
+   processes and the Python tool stay on the host under `auto`: keep them
+   approval-gated too, or sandbox them with `HAT_SANDBOX_PROCESSES=container`.
 4. Strongest cheap win: put both server and runner behind Tailscale/WireGuard
    and don't expose ports at all.
 
@@ -510,3 +666,10 @@ This is a single-user app. Before exposing it:
   A React Native (Expo) iOS app now shares the same server and the SSE parser,
   with EAS Build configured and an unsigned-IPA workflow for free Apple IDs.
   Still open there: native tab bars for system Liquid Glass, and a device.
+- **M8 (done)** Long-conversation robustness and everyday chat features:
+  context-window fitting, provider retries with backoff, Continue for cut-off
+  replies, per-conversation instructions and sampling settings, document (text,
+  code, PDF) attachments, fork, Markdown/JSON export and import, message search
+  in the UI, session status and opt-in notifications, a shared chat view-model
+  for all clients, sandboxed external plugins, MCP `readOnlyHint`, the `auto`
+  sandbox tier, and CI (typecheck, tests, web build, smoke).

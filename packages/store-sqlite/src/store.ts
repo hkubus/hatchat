@@ -33,8 +33,38 @@ export interface SessionRecord {
   approvalMode: ApprovalMode;
   allowedTools: string[];
   reasoningEffort: ReasoningEffort;
+  /** Per-conversation instructions appended to the system prompt; "" for none. */
+  instructions: string;
+  /** Sampling temperature; null leaves the provider default. */
+  temperature: number | null;
+  /** Reply-token cap per model call; null leaves the provider default. */
+  maxTokens: number | null;
   createdAt: number;
   updatedAt: number;
+}
+
+/** The settings a conversation carries, as exported, forked and imported. */
+export type SessionSettings = Pick<
+  SessionRecord,
+  "model" | "approvalMode" | "allowedTools" | "reasoningEffort" | "instructions" | "temperature" | "maxTokens"
+>;
+
+/** A portable copy of one conversation: the whole message tree, not just the active branch. */
+export interface SessionExport {
+  format: "hat.session";
+  version: 1;
+  exportedAt: number;
+  session: SessionSettings & { title: string; createdAt: number };
+  activeLeafId: string | null;
+  /** Parents always precede their children. */
+  messages: Array<{
+    id: string;
+    parentId: string | null;
+    role: Role;
+    parts: Part[];
+    meta?: MessageMeta;
+    createdAt: number;
+  }>;
 }
 
 export interface AttachmentRecord {
@@ -44,6 +74,10 @@ export interface AttachmentRecord {
   size: number;
   width?: number;
   height?: number;
+  /** Original file name, for documents. */
+  name?: string;
+  /** Whether extracted text is stored for the model (see `getAttachmentText`). */
+  hasText?: boolean;
   createdAt: number;
 }
 
@@ -111,9 +145,16 @@ interface SessionRow {
   approval_mode: string;
   allowed_tools: string;
   reasoning_effort: string;
+  instructions: string | null;
+  temperature: number | null;
+  max_tokens: number | null;
   created_at: number;
   updated_at: number;
 }
+
+/** Attachment columns minus the (possibly large) extracted text. */
+const ATTACHMENT_COLUMNS =
+  "id, sha256, mime, size, width, height, name, (text IS NOT NULL) AS has_text, created_at";
 
 interface AttachmentRow {
   id: string;
@@ -122,6 +163,8 @@ interface AttachmentRow {
   size: number;
   width: number | null;
   height: number | null;
+  name: string | null;
+  has_text: number;
   created_at: number;
 }
 
@@ -155,10 +198,21 @@ export class Store implements SecretStore {
       "allowed_tools TEXT NOT NULL DEFAULT '[]'",
       "reasoning_effort TEXT NOT NULL DEFAULT 'low'",
       "title_source TEXT NOT NULL DEFAULT 'derived'",
+      "instructions TEXT NOT NULL DEFAULT ''",
+      "temperature REAL",
+      "max_tokens INTEGER",
     ];
     for (const column of columns) {
       try {
         this.db.exec(`ALTER TABLE sessions ADD COLUMN ${column}`);
+      } catch {
+        /* column already exists */
+      }
+    }
+    // Documents the user attaches keep their original name and extracted text.
+    for (const column of ["name TEXT", "text TEXT"]) {
+      try {
+        this.db.exec(`ALTER TABLE attachments ADD COLUMN ${column}`);
       } catch {
         /* column already exists */
       }
@@ -225,6 +279,9 @@ export class Store implements SecretStore {
       approvalMode: "auto",
       allowedTools: [],
       reasoningEffort: "low",
+      instructions: "",
+      temperature: null,
+      maxTokens: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -304,6 +361,169 @@ export class Store implements SecretStore {
       );
   }
 
+  /**
+   * Update the per-conversation model settings. `undefined` leaves a field
+   * alone; `null` (or "" for instructions) clears it back to the default.
+   */
+  setSessionSettings(
+    sessionId: string,
+    patch: { instructions?: string; temperature?: number | null; maxTokens?: number | null },
+  ): void {
+    const session = this.getSession(sessionId);
+    if (!session) return;
+    this.db
+      .prepare(
+        `UPDATE sessions SET instructions = ?, temperature = ?, max_tokens = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(
+        patch.instructions ?? session.instructions,
+        patch.temperature === undefined ? session.temperature : patch.temperature,
+        patch.maxTokens === undefined ? session.maxTokens : patch.maxTokens,
+        Date.now(),
+        sessionId,
+      );
+  }
+
+  /** Copy every setting that shapes the model's behaviour onto another session. */
+  private applySettings(sessionId: string, settings: SessionSettings): void {
+    this.db
+      .prepare(
+        `UPDATE sessions SET model = ?, approval_mode = ?, allowed_tools = ?, reasoning_effort = ?,
+                instructions = ?, temperature = ?, max_tokens = ?
+          WHERE id = ?`,
+      )
+      .run(
+        settings.model,
+        settings.approvalMode,
+        JSON.stringify(settings.allowedTools),
+        settings.reasoningEffort,
+        settings.instructions,
+        settings.temperature,
+        settings.maxTokens,
+        sessionId,
+      );
+  }
+
+  /**
+   * Start a new conversation from the root→`messageId` path of another one,
+   * with the same settings. Only that path is copied, not sibling branches;
+   * messages get fresh ids so the two conversations never share a node.
+   */
+  forkSession(sessionId: string, messageId: string): SessionRecord | undefined {
+    const source = this.getSession(sessionId);
+    const target = this.getMessage(messageId);
+    if (!source || !target || this.sessionOf(messageId) !== sessionId) return undefined;
+    const chain: ChatMessage[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = messageId;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const message = this.getMessage(cursor);
+      if (!message) break;
+      chain.unshift(message);
+      cursor = this.getParentId(cursor);
+    }
+    const fork = this.createSession(source.model, `${source.title} (fork)`.slice(0, 200));
+    this.applySettings(fork.id, source);
+    let parent: string | null = null;
+    for (const message of chain) {
+      const copy: ChatMessage = { ...message, id: newId("msg") };
+      this.appendMessage(fork.id, copy, parent);
+      parent = copy.id;
+    }
+    this.db
+      .prepare(`UPDATE sessions SET title = ?, title_source = 'user' WHERE id = ?`)
+      .run(`${source.title} (fork)`.slice(0, 200), fork.id);
+    return this.getSession(fork.id);
+  }
+
+  /** The whole conversation tree plus its settings, in a portable form. */
+  exportSession(sessionId: string): SessionExport | undefined {
+    const session = this.getSession(sessionId);
+    if (!session) return undefined;
+    const rows = this.db
+      .prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY rowid ASC`)
+      .all(sessionId) as unknown as MessageRow[];
+    return {
+      format: "hat.session",
+      version: 1,
+      exportedAt: Date.now(),
+      session: {
+        title: session.title,
+        createdAt: session.createdAt,
+        model: session.model,
+        approvalMode: session.approvalMode,
+        allowedTools: session.allowedTools,
+        reasoningEffort: session.reasoningEffort,
+        instructions: session.instructions,
+        temperature: session.temperature,
+        maxTokens: session.maxTokens,
+      },
+      activeLeafId: session.activeLeafId,
+      messages: rows.map((row) => {
+        const message = toMessage(row);
+        return {
+          id: message.id,
+          parentId: row.parent_id,
+          role: message.role,
+          parts: message.parts,
+          ...(message.meta ? { meta: message.meta } : {}),
+          createdAt: message.createdAt,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Recreate an exported conversation as a new session. Message ids are
+   * remapped (an import never collides with, or aliases, existing history);
+   * `mapPart` lets the caller rewrite attachment references it re-uploaded.
+   * Messages whose parent is missing are dropped rather than orphaned.
+   */
+  importSession(data: SessionExport, mapPart: (part: Part) => Part = (part) => part): SessionRecord {
+    const settings = data.session;
+    const session = this.createSession(settings.model || "fake/fake-agent", "New chat");
+    this.applySettings(session.id, {
+      model: settings.model || session.model,
+      approvalMode: settings.approvalMode ?? session.approvalMode,
+      allowedTools: Array.isArray(settings.allowedTools) ? settings.allowedTools : [],
+      reasoningEffort: settings.reasoningEffort ?? session.reasoningEffort,
+      instructions: typeof settings.instructions === "string" ? settings.instructions : "",
+      temperature: typeof settings.temperature === "number" ? settings.temperature : null,
+      maxTokens: typeof settings.maxTokens === "number" ? settings.maxTokens : null,
+    });
+    const ids = new Map<string, string>();
+    for (const message of data.messages) {
+      const parent = message.parentId === null ? null : ids.get(message.parentId);
+      if (parent === undefined) continue;
+      const id = newId("msg");
+      ids.set(message.id, id);
+      this.appendMessage(
+        session.id,
+        {
+          id,
+          role: message.role,
+          parts: message.parts.map((part) => mapPart(structuredClone(part))),
+          createdAt: message.createdAt,
+          ...(message.meta ? { meta: message.meta } : {}),
+        },
+        parent,
+      );
+    }
+    const leaf = data.activeLeafId ? ids.get(data.activeLeafId) : undefined;
+    this.db
+      .prepare(`UPDATE sessions SET title = ?, title_source = 'user', active_leaf_id = COALESCE(?, active_leaf_id) WHERE id = ?`)
+      .run((settings.title || "Imported chat").slice(0, 200), leaf ?? null, session.id);
+    return this.getSession(session.id)!;
+  }
+
+  private sessionOf(messageId: string): string | undefined {
+    const row = this.db
+      .prepare(`SELECT session_id FROM messages WHERE id = ?`)
+      .get(messageId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
+
   setSessionReasoningEffort(sessionId: string, effort: ReasoningEffort): void {
     this.db
       .prepare(`UPDATE sessions SET reasoning_effort = ?, updated_at = ? WHERE id = ?`)
@@ -357,7 +577,12 @@ export class Store implements SecretStore {
         message.createdAt || now,
       );
       touch.run(message.id, now, title, sessionId);
-      const searchable = message.role === "user" || message.role === "assistant" ? searchableText(message.parts) : "";
+      // The synthetic "Continue" nudge is hidden in every client, so it must
+      // not turn up as a search hit either.
+      const searchable =
+        (message.role === "user" || message.role === "assistant") && !message.meta?.synthetic
+          ? searchableText(message.parts)
+          : "";
       if (searchable) {
         this.db
           .prepare(`INSERT INTO messages_fts (text, message_id, session_id, role) VALUES (?, ?, ?, ?)`)
@@ -436,6 +661,23 @@ export class Store implements SecretStore {
       if (kids.length === 0) return current;
       current = kids[kids.length - 1].id;
     }
+  }
+
+  /** Messages a client shows as rows: user and assistant, minus synthetic nudges. */
+  countVisibleMessages(sessionId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM messages
+          WHERE session_id = ? AND role IN ('user', 'assistant')
+            AND (meta IS NULL OR json_extract(meta, '$.synthetic') IS NULL)`,
+      )
+      .get(sessionId) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
+  /** Whether `messageId` is a message of `sessionId` (not merely some message). */
+  hasMessage(sessionId: string, messageId: string): boolean {
+    return this.sessionOf(messageId) === sessionId;
   }
 
   countMessages(sessionId: string): number {
@@ -542,10 +784,28 @@ export class Store implements SecretStore {
 
   // ---- attachments --------------------------------------------------------
 
-  async putAttachment(data: Buffer, mime: string): Promise<AttachmentRecord> {
+  /**
+   * Store a blob, deduplicated by content. `name` and `text` describe a
+   * document: its file name, and the text the model reads in its place.
+   */
+  async putAttachment(
+    data: Buffer,
+    mime: string,
+    document?: { name?: string; text?: string },
+  ): Promise<AttachmentRecord> {
     const sha256 = createHash("sha256").update(data).digest("hex");
     const existing = this.getAttachmentByHash(sha256);
-    if (existing) return existing;
+    if (existing) {
+      // The same bytes uploaded before as something else (or before text
+      // extraction existed) pick up the text now.
+      if (document?.text !== undefined && !existing.hasText) {
+        this.db
+          .prepare(`UPDATE attachments SET text = ?, name = COALESCE(name, ?) WHERE id = ?`)
+          .run(document.text, document.name ?? null, existing.id);
+        return this.getAttachment(existing.id)!;
+      }
+      return existing;
+    }
 
     const id = newId("att");
     const size = data.length;
@@ -555,32 +815,42 @@ export class Store implements SecretStore {
     }
     this.db
       .prepare(
-        `INSERT INTO attachments (id, sha256, mime, size, width, height, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO attachments (id, sha256, mime, size, width, height, name, text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, sha256, mime, size, dimensions?.width ?? null, dimensions?.height ?? null, Date.now());
+      .run(
+        id,
+        sha256,
+        mime,
+        size,
+        dimensions?.width ?? null,
+        dimensions?.height ?? null,
+        document?.name ?? null,
+        document?.text ?? null,
+        Date.now(),
+      );
 
-    return {
-      id,
-      sha256,
-      mime,
-      size,
-      width: dimensions?.width,
-      height: dimensions?.height,
-      createdAt: Date.now(),
-    };
+    return this.getAttachment(id)!;
+  }
+
+  /** The extracted text of a document attachment, if one was stored. */
+  getAttachmentText(id: string): string | undefined {
+    const row = this.db.prepare(`SELECT text FROM attachments WHERE id = ?`).get(id) as
+      | { text: string | null }
+      | undefined;
+    return row?.text ?? undefined;
   }
 
   getAttachment(id: string): AttachmentRecord | undefined {
     const row = this.db
-      .prepare(`SELECT * FROM attachments WHERE id = ?`)
+      .prepare(`SELECT ${ATTACHMENT_COLUMNS} FROM attachments WHERE id = ?`)
       .get(id) as unknown as AttachmentRow | undefined;
     return row ? toAttachment(row) : undefined;
   }
 
   getAttachmentByHash(sha256: string): AttachmentRecord | undefined {
     const row = this.db
-      .prepare(`SELECT * FROM attachments WHERE sha256 = ?`)
+      .prepare(`SELECT ${ATTACHMENT_COLUMNS} FROM attachments WHERE sha256 = ?`)
       .get(sha256) as unknown as AttachmentRow | undefined;
     return row ? toAttachment(row) : undefined;
   }
@@ -813,6 +1083,9 @@ function toSession(row: SessionRow): SessionRecord {
     allowedTools: row.allowed_tools ? (JSON.parse(row.allowed_tools) as string[]) : [],
     reasoningEffort: (row.reasoning_effort as ReasoningEffort) ?? "low",
     titleSource: (row.title_source as TitleSource) ?? "derived",
+    instructions: row.instructions ?? "",
+    temperature: row.temperature ?? null,
+    maxTokens: row.max_tokens ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -826,6 +1099,8 @@ function toAttachment(row: AttachmentRow): AttachmentRecord {
     size: row.size,
     width: row.width ?? undefined,
     height: row.height ?? undefined,
+    ...(row.name ? { name: row.name } : {}),
+    ...(row.has_text ? { hasText: true } : {}),
     createdAt: row.created_at,
   };
 }

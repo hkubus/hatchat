@@ -12,3 +12,4 @@ export * from "./events.js";
 export * from "./sse.js";
 export * from "./plugin.js";
 export * from "./async-queue.js";
+export * from "./chat-view.js";

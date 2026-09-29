@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Logger, Plugin, Provider, Tool } from "@hat/core";
+import type { Logger, Plugin, PluginContext, Provider, Tool } from "@hat/core";
 import { DEFAULT_CAPABILITIES } from "@hat/core";
 import { z } from "zod";
 import { PluginHost } from "./plugin-host.js";
@@ -165,4 +165,32 @@ test("describes config schema as JSON schema", () => {
   const schema = host.get("desc")?.configSchema as Record<string, any>;
   assert.equal(schema.properties.flag.type, "boolean");
   assert.equal(schema.$schema, undefined);
+});
+
+test("fail() after activation rolls back; stale reports are ignored", async () => {
+  const { host, tools } = makeHost();
+  const contexts: PluginContext[] = [];
+  host.register({
+    id: "flaky",
+    name: "Flaky",
+    version: "1.0.0",
+    configJsonSchema: { type: "object", properties: {} },
+    activate(ctx) {
+      contexts.push(ctx);
+      ctx.register.tool(makeTool("flaky_tool"));
+    },
+  });
+  await host.activate("flaky");
+  assert.deepEqual(host.get("flaky")?.configSchema, { type: "object", properties: {} });
+
+  contexts[0].fail?.(new Error("process died"));
+  assert.equal(host.get("flaky")?.status, "error");
+  assert.equal(host.get("flaky")?.error, "process died");
+  assert.equal(tools.get("flaky_tool"), undefined);
+
+  await host.setEnabled("flaky", true);
+  assert.equal(host.get("flaky")?.status, "active");
+  contexts[0].fail?.(new Error("late report from the old activation"));
+  assert.equal(host.get("flaky")?.status, "active");
+  assert.equal(tools.get("flaky_tool")?.name, "flaky_tool");
 });

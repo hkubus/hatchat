@@ -1,5 +1,5 @@
 import type { ModelInfo, Provider, Tool, ToolSpec } from "@hat/core";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { toJsonSchema } from "./json-schema.js";
 
 export class ProviderRegistry {
   private readonly providers = new Map<string, Provider>();
@@ -83,14 +83,7 @@ export class ToolRegistry {
       .map((tool) => {
         let parameters: unknown = tool.parameters;
         if (parameters === undefined && tool.schema) {
-          const jsonSchema = zodToJsonSchema(tool.schema, {
-            // OpenAI-compatible providers expect JSON Schema (numeric exclusiveMinimum),
-            // not OpenAPI 3.0's boolean form, and inline refs.
-            target: "jsonSchema7",
-            $refStrategy: "none",
-          }) as Record<string, unknown>;
-          delete jsonSchema.$schema;
-          parameters = jsonSchema;
+          parameters = toJsonSchema(tool.schema);
         }
         return {
           name: tool.name,

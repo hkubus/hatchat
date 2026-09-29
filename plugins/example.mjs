@@ -1,6 +1,7 @@
 // Example external plugin. Files in HAT_PLUGINS_DIR (default ./plugins) that
-// default-export a Plugin are loaded on startup. Plugins run in-process and are
-// trusted: they can register providers and tools.
+// default-export a Plugin are loaded on startup. Each runs in its own sandboxed
+// child process (no server secrets or env, read-only filesystem access) and can
+// register providers and tools; HAT_PLUGINS_ISOLATION=off loads them in-process.
 import { definePlugin, z } from "@hat/plugin-sdk";
 
 export default definePlugin({

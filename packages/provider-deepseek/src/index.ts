@@ -24,6 +24,7 @@ const MODELS: DeepSeekModel[] = [
       reasoningEffort: false,
       jsonMode: true,
       systemPrompt: "native",
+      contextWindow: CONTEXT_WINDOW,
     },
   },
   {
@@ -39,6 +40,7 @@ const MODELS: DeepSeekModel[] = [
       reasoningEffort: false,
       jsonMode: false,
       systemPrompt: "native",
+      contextWindow: CONTEXT_WINDOW,
     },
   },
 ];

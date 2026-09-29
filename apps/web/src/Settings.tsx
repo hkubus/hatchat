@@ -14,6 +14,38 @@ import CreatorIcon from "./CreatorIcon";
 import { creatorName, creatorSlug } from "./creators";
 import McpConfigEditor from "./McpSettings";
 import { MemoriesSection, SchedulesSection } from "./AssistantSettings";
+import { notificationsEnabled, notificationsSupported, setNotificationsEnabled } from "./notifications";
+
+/** Opt-in desktop notifications; the browser asks for permission on first enable. */
+function NotificationsRow(): JSX.Element {
+  const [enabled, setEnabled] = useState(notificationsEnabled);
+  const [note, setNote] = useState<string | null>(null);
+  const supported = notificationsSupported();
+  return (
+    <div className="settings-row">
+      <div className="settings-row-head">
+        <span className="settings-name">Notifications</span>
+      </div>
+      <div className="settings-row-body">
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={!supported}
+            onChange={async (e) => {
+              const next = await setNotificationsEnabled(e.target.checked);
+              setEnabled(next);
+              setNote(e.target.checked && !next ? "The browser blocked notifications for this site." : null);
+            }}
+          />
+          Notify me when a reply is ready or a conversation needs me, while this tab is in the background
+        </label>
+        {!supported && <p className="settings-hint">This browser does not support notifications.</p>}
+        {note && <p className="settings-hint">{note}</p>}
+      </div>
+    </div>
+  );
+}
 
 interface SettingsProps {
   models: ModelInfo[];
@@ -426,6 +458,7 @@ export default function Settings({
             </select>
           </div>
         </div>
+        <NotificationsRow />
       </section>
 
       <section className="settings-section">
