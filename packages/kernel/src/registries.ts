@@ -73,12 +73,12 @@ export class ToolRegistry {
     return [...this.tools.values()];
   }
 
-  toToolSpecs(): ToolSpec[] {
+  toToolSpecs(exclude?: readonly string[]): ToolSpec[] {
     // Sorted by name: prompt caches are prefix-sensitive, and registration
     // order depends on plugin activation order, so an unstable order would
     // bust the cache (and reshuffle tool choice) without any user change.
     return this.list()
-      .slice()
+      .filter((tool) => !exclude?.includes(tool.name))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
       .map((tool) => {
         let parameters: unknown = tool.parameters;

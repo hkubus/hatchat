@@ -7,6 +7,8 @@ export type Part =
   | { type: "text"; text: string }
   | { type: "image"; source: ImageSource }
   | { type: "reasoning"; text: string }
+  /** A stored file (an artifact the assistant produced). Rendered by clients, described to models as text. */
+  | { type: "file"; id: string; name: string; mime: string; size: number }
   | { type: "tool_call"; id: string; name: string; args: unknown }
   | {
       type: "tool_result";

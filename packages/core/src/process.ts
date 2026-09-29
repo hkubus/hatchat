@@ -5,6 +5,10 @@ export interface SpawnRequest {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  /** Run inside this session's workspace (cwd relative to it) instead of the shared process dir. */
+  sessionId?: string;
+  /** Treat `command` as a shell command line (sandboxed like exec when the runner uses containers). */
+  shell?: boolean;
 }
 
 export interface SpawnedProcess {

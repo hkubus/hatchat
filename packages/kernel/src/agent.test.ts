@@ -449,3 +449,92 @@ test("does not persist the system prompt to history", async () => {
 
   assert.equal(persisted.some((m) => m.role === "system"), false);
 });
+
+test("ephemeral runs hide excluded tools, skip persistence and give tools their call context", async () => {
+  const providers = new ProviderRegistry();
+  const seenTools: string[][] = [];
+  const seenSystem: string[] = [];
+  let first = true;
+  providers.register({
+    id: "p",
+    label: "p",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true }),
+    listModels: async () => [],
+    async *chat(request) {
+      seenTools.push((request.tools ?? []).map((t) => t.name));
+      const system = request.messages.find((m) => m.role === "system");
+      seenSystem.push(system?.parts.map((p) => (p.type === "text" ? p.text : "")).join("") ?? "");
+      if (first) {
+        first = false;
+        yield { type: "toolcall", call: { id: "c1", name: "ctx_tool", args: {} } };
+        yield { type: "toolcall", call: { id: "c2", name: "hidden", args: {} } };
+        yield { type: "done", finishReason: "tool_calls" as const };
+        return;
+      }
+      yield { type: "text.delta", text: "done" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  });
+
+  const tools = new ToolRegistry();
+  const contexts: Array<{ callId?: string; messageId?: string }> = [];
+  const emitted: KernelEvent[] = [];
+  let hiddenRan = false;
+  tools.register({
+    name: "ctx_tool",
+    description: "records its context",
+    async execute(_args, ctx) {
+      contexts.push({ callId: ctx.callId, messageId: ctx.messageId });
+      ctx.emit?.({ type: "warning", message: "from tool" });
+      return [{ type: "text", text: "ok" }];
+    },
+  });
+  tools.register({
+    name: "hidden",
+    description: "must not run",
+    async execute() {
+      hiddenRan = true;
+      return [];
+    },
+  });
+
+  const persisted: ChatMessage[] = [];
+  const agent = new Agent({
+    providers,
+    tools,
+    resolveHost: async () => ({}) as ExecutionHost,
+    approval: { async request() { return "approve"; } },
+    secrets: { async get() { return undefined; } },
+    audit: { record() {} },
+    logger,
+    systemPrompt: "base",
+    systemContext: async () => "memories here",
+    onMessage: (_s, m) => persisted.push(m),
+  });
+
+  const events: KernelEvent[] = [];
+  for await (const event of agent.run({
+    sessionId: "s",
+    history: [],
+    model: "p/m",
+    userText: "go",
+    signal: new AbortController().signal,
+    toolPolicy: { ...DEFAULT_TOOL_POLICY, mode: "auto" },
+    excludeTools: ["hidden"],
+    persist: false,
+    emit: (event) => emitted.push(event),
+  })) {
+    events.push(event);
+  }
+
+  assert.deepEqual(seenTools[0], ["ctx_tool"]);
+  assert.match(seenSystem[0], /^base\n\nmemories here/);
+  assert.equal(hiddenRan, false);
+  const hiddenResult = events.find((e) => e.type === "tool.result" && e.callId === "c2");
+  assert.ok(hiddenResult && hiddenResult.type === "tool.result" && hiddenResult.isError);
+  assert.equal(contexts[0].callId, "c1");
+  const firstMessage = events.find((e) => e.type === "message.start");
+  assert.equal(contexts[0].messageId, firstMessage?.type === "message.start" ? firstMessage.messageId : "");
+  assert.deepEqual(emitted, [{ type: "warning", message: "from tool" }]);
+  assert.deepEqual(persisted, []);
+});

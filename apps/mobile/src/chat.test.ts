@@ -7,7 +7,12 @@ import {
   applyEffect,
   buildMessages,
   emptyAssistant,
+  formatBytes,
+  joinAnswer,
+  questionOf,
   readEvent,
+  todosOf,
+  toolResultOf,
   toolSummary,
 } from "./chat.js";
 
@@ -159,7 +164,7 @@ test("readEvent maps every event the turn stream emits", () => {
     ],
     [
       { type: "tool.result", callId: "c1", name: "shell_exec", parts: [text("done")], isError: false },
-      { kind: "tool-result", callId: "c1", result: "done", isError: false },
+      { kind: "tool-result", callId: "c1", result: "done", images: [], files: [], isError: false },
     ],
     [
       { type: "error", error: { code: "boom", message: "it broke" } },
@@ -208,6 +213,8 @@ test("a full turn folds into one assistant message", () => {
       args: { command: "ls" },
       approval: "requested",
       result: "a.txt",
+      images: [],
+      files: [],
       isError: false,
       running: false,
     },
@@ -306,4 +313,103 @@ test("toolSummary prefers the command and falls back to the first argument", () 
   assert.equal(toolSummary({ ...base, name: "n", args: "raw string" }), "raw string");
   assert.equal(toolSummary({ ...base, name: "n", args: {} }), "");
   assert.equal(toolSummary({ ...base, name: "n", args: null }), "");
+});
+
+test("toolSummary uses the key argument of known tools", () => {
+  const base = { callId: "c", approval: null, running: false } as const;
+  assert.equal(toolSummary({ ...base, name: "read_file", args: { path: "a.ts", limit: 5 } }), "a.ts");
+  assert.equal(toolSummary({ ...base, name: "web_fetch", args: { url: "https://x.y" } }), "https://x.y");
+  assert.equal(
+    toolSummary({ ...base, name: "python", args: { code: "\nimport os\nprint(1)" } }),
+    "import os",
+  );
+  assert.equal(toolSummary({ ...base, name: "ask_user", args: { question: "Why?" } }), "Why?");
+  assert.equal(toolSummary({ ...base, name: "spawn_subagent", args: { task: "Do A\nthen B" } }), "Do A");
+  assert.equal(toolSummary({ ...base, name: "schedule_create", args: { title: "Daily" } }), "Daily");
+  assert.equal(toolSummary({ ...base, name: "todo_write", args: { todos: [] } }), "");
+});
+
+// --- tool results with artifacts ------------------------------------------
+
+test("toolResultOf splits text, images and files", () => {
+  const out = toolResultOf([
+    text("saved"),
+    { type: "image", source: { kind: "data", mime: "image/png", data: "AAA" } },
+    { type: "file", id: "att_9", name: "report.csv", mime: "text/csv", size: 2048 },
+  ]);
+  assert.equal(out.result, "saved");
+  assert.deepEqual(out.images, [{ src: "data:image/png;base64,AAA" }]);
+  assert.deepEqual(out.files, [{ id: "att_9", name: "report.csv", mime: "text/csv", size: 2048 }]);
+});
+
+test("buildMessages and tool.result both carry result artifacts", () => {
+  const file: Part = { type: "file", id: "att_1", name: "a.txt", mime: "text/plain", size: 3 };
+  const stored = buildMessages([
+    message("assistant", [toolCall("c1", "create_artifact", { name: "a.txt" })]),
+    message("tool", [toolResult("c1", "create_artifact", [text("ok"), file])]),
+  ]);
+  assert.equal(stored[0].tools[0].files?.[0].id, "att_1");
+
+  let live = applyEffect([emptyAssistant("m")], {
+    kind: "tool-call",
+    messageId: "m",
+    callId: "c1",
+    name: "python",
+    args: {},
+  });
+  live = applyEffect(
+    live,
+    readEvent({ type: "tool.result", callId: "c1", name: "t", parts: [file], isError: false } as KernelEvent),
+  );
+  assert.equal(live[0].tools[0].files?.[0].name, "a.txt");
+  assert.equal(live[0].tools[0].running, false);
+});
+
+test("a result for an unknown callId (e.g. a subagent's) is ignored", () => {
+  const list = [emptyAssistant("m")];
+  const next = applyEffect(
+    list,
+    readEvent({ type: "tool.result", callId: "nope", name: "t", parts: [], isError: false } as KernelEvent),
+  );
+  assert.equal(next, list);
+});
+
+// --- todo_write / ask_user -------------------------------------------------
+
+test("todosOf keeps well-formed items and defaults unknown statuses", () => {
+  assert.deepEqual(
+    todosOf({
+      todos: [
+        { content: "a", status: "completed" },
+        { content: "b", status: "in_progress" },
+        { content: "c", status: "weird" },
+        { status: "pending" },
+      ],
+    }),
+    [
+      { content: "a", status: "completed" },
+      { content: "b", status: "in_progress" },
+      { content: "c", status: "pending" },
+    ],
+  );
+  assert.deepEqual(todosOf(null), []);
+  assert.deepEqual(todosOf({ todos: "x" }), []);
+});
+
+test("questionOf reads the prompt and joinAnswer joins choices", () => {
+  assert.deepEqual(questionOf({ question: "Pick", options: ["a", 1, "b"], multi_select: true }), {
+    question: "Pick",
+    options: ["a", "b"],
+    multiSelect: true,
+  });
+  assert.deepEqual(questionOf({ question: "Why?" }), { question: "Why?", options: [], multiSelect: false });
+  assert.equal(questionOf({}), undefined);
+  assert.equal(joinAnswer(["a", "b"], "  c "), "a, b, c");
+  assert.equal(joinAnswer([], "  "), "");
+});
+
+test("formatBytes", () => {
+  assert.equal(formatBytes(512), "512 B");
+  assert.equal(formatBytes(1536), "1.5 KB");
+  assert.equal(formatBytes(20 * 1024 * 1024), "20 MB");
 });

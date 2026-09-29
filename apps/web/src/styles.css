@@ -2251,3 +2251,214 @@ p.mcp-errors {
     font-size: 13px;
   }
 }
+
+/* ---- assistant tool extras ------------------------------------------------ */
+
+/* The checklist is live progress the user is meant to follow, so unlike other
+   tool calls it is shown open, as a quiet list rather than a folded aside. */
+.todo {
+  font-size: 13px;
+  color: var(--fg-muted);
+  margin: 2px 0;
+}
+
+.todo-head {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+
+.todo ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.todo-box {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 12px;
+  text-align: center;
+  transform: translateY(2px);
+}
+
+.todo-item.completed .todo-box {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.todo-item.completed .todo-text {
+  color: var(--fg-dim);
+  text-decoration: line-through;
+}
+
+.todo-item.in_progress .todo-box {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.todo-item.in_progress .todo-text {
+  color: var(--fg);
+}
+
+/* A question blocks the turn like an approval does, so it gets the same
+   colour and sits outside the fold. */
+.question {
+  margin: 6px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.question-text {
+  margin: 0 0 8px;
+  color: var(--fg);
+  white-space: pre-wrap;
+}
+
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.question-options button,
+.question-free button {
+  padding: 4px 12px;
+  font-size: 12.5px;
+  border-radius: 999px;
+}
+
+.chip.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.question-free {
+  display: flex;
+  gap: 6px;
+}
+
+.question-free input {
+  flex: 1;
+  min-width: 0;
+}
+
+.question-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.tool-outputs {
+  display: grid;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+/* Tool images are usually charts; give them room to be read. */
+.tool-outputs .msg-image {
+  max-width: min(100%, 560px);
+  max-height: 440px;
+  background: #fff;
+}
+
+.artifact {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 8px 10px;
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+}
+
+.artifact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.artifact-row button {
+  padding: 3px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.artifact-icon {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+
+.artifact-meta {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+}
+
+.artifact-name {
+  color: var(--fg);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-size {
+  color: var(--fg-dim);
+  font-size: 11.5px;
+}
+
+.artifact-frame {
+  width: 100%;
+  height: 360px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.artifact-text {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+}
+
+.memory-input,
+.memory-row input {
+  flex: 1;
+  min-width: 0;
+}

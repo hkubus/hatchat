@@ -156,6 +156,14 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
     if (approvalId) haptics.warning();
   }, [approvalId]);
 
+  // An `ask_user` question blocks the turn just as an approval does.
+  const questionId = chat.inFlight
+    .flatMap((m) => m.tools)
+    .find((t) => t.name === "ask_user" && t.running && !t.answered)?.callId;
+  useEffect(() => {
+    if (questionId) haptics.warning();
+  }, [questionId]);
+
   const wasBusy = useRef(chat.busy);
   useEffect(() => {
     if (wasBusy.current && !chat.busy && !chat.error) haptics.success();
@@ -425,6 +433,10 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
     else haptics.warning();
     void chatRef.current.decide(callId, decision);
   }, []);
+  const onAnswer = useCallback((callId: string, answer: string) => {
+    haptics.tap();
+    void chatRef.current.answer(callId, answer);
+  }, []);
 
   const renderItem = useCallback(
     ({ item }: { item: UiMessage }) => (
@@ -435,12 +447,13 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
         onEdit={onEdit}
         onSwitchBranch={onSwitchBranch}
         onDecide={onDecide}
+        onAnswer={onAnswer}
         onSelectText={setSelecting}
         onOpenImage={setViewing}
         busy={chat.busy}
       />
     ),
-    [chat.busy, onRegenerate, onEdit, onSwitchBranch, onDecide],
+    [chat.busy, onRegenerate, onEdit, onSwitchBranch, onDecide, onAnswer],
   );
 
   const renderScrollComponent = useCallback(

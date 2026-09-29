@@ -13,6 +13,7 @@ import { capTags, contextTag } from "./capTags";
 import CreatorIcon from "./CreatorIcon";
 import { creatorName, creatorSlug } from "./creators";
 import McpConfigEditor from "./McpSettings";
+import { MemoriesSection, SchedulesSection } from "./AssistantSettings";
 
 interface SettingsProps {
   models: ModelInfo[];
@@ -23,6 +24,7 @@ interface SettingsProps {
   /** Connection settings; only present in native shells. */
   config?: HatConfig | null;
   onModelChange: (model: string) => void;
+  onOpenSession?: (id: string) => void;
   onChanged: () => Promise<void>;
 }
 
@@ -351,6 +353,7 @@ export default function Settings({
   model,
   config,
   onModelChange,
+  onOpenSession,
   onChanged,
 }: SettingsProps) {
   const groups = useMemo(() => {
@@ -375,6 +378,10 @@ export default function Settings({
           <ProviderRow key={p.id} provider={p} onChanged={onChanged} />
         ))}
       </section>
+
+      <MemoriesSection />
+
+      <SchedulesSection onOpenSession={onOpenSession} />
 
       <section className="settings-section">
         <h2>Plugins ({plugins.length})</h2>

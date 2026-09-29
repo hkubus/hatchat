@@ -9,7 +9,9 @@
  * Long-pressing a message opens the system context menu (Copy, Select Text,
  * Share, Edit / Regenerate), the way Messages does. Reasoning and tool output
  * are collapsed by default: they are the parts of a turn that can run to
- * hundreds of lines, and left open they bury the answer.
+ * hundreds of lines, and left open they bury the answer. What a tool exists to
+ * *show* stays out of the fold: a `todo_write` checklist, a pending `ask_user`
+ * question, and the images and files a tool produced.
  */
 
 import { memo, useEffect, useRef, useState } from "react";
@@ -21,11 +23,13 @@ import {
   Share,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
-import type { UiImage, UiMessage, UiTool } from "../chat";
-import { toolSummary } from "../chat";
+import { fetchAttachmentBase64 } from "../api";
+import type { UiFile, UiImage, UiMessage, UiTool } from "../chat";
+import { formatBytes, joinAnswer, questionOf, todosOf, toolSummary } from "../chat";
 import * as haptics from "../haptics";
 import { useTheme } from "../theme";
 import { Badge, Button, Mono } from "./controls";
@@ -150,10 +154,12 @@ function Reasoning({ text, thinking }: { text: string; thinking: boolean }) {
 function ToolCard({
   tool,
   onDecide,
+  onAnswer,
   disabled,
 }: {
   tool: UiTool;
   onDecide: (callId: string, decision: "approve" | "deny") => void;
+  onAnswer: (callId: string, answer: string) => void;
   disabled: boolean;
 }) {
   const theme = useTheme();
@@ -161,6 +167,11 @@ function ToolCard({
   const status = statusOf(tool);
   const summary = toolSummary(tool);
   const awaiting = tool.running && tool.approval === "requested";
+  const todos = tool.name === "todo_write" ? todosOf(tool.args) : [];
+  const question =
+    tool.name === "ask_user" && tool.running && !tool.answered && !awaiting
+      ? questionOf(tool.args)
+      : undefined;
 
   return (
     <View
@@ -175,7 +186,12 @@ function ToolCard({
         onToggle={() => setOpen((v) => !v)}
         accessibilityLabel={`${tool.name}, ${status.label}. ${open ? "Hide" : "Show"} details`}
       >
-        <Icon name="terminal" size={13} weight="semibold" color={theme.color.textDim} />
+        <Icon
+          name={todos.length > 0 ? "checklist" : question ? "questionmark.bubble" : "terminal"}
+          size={13}
+          weight="semibold"
+          color={theme.color.textDim}
+        />
         <Text style={[styles.toolName, { color: theme.color.text }]} numberOfLines={1}>
           {tool.name}
         </Text>
@@ -189,6 +205,16 @@ function ToolCard({
         <Mono numberOfLines={open ? undefined : 1} style={styles.toolSummary}>
           {summary}
         </Mono>
+      ) : null}
+
+      {todos.length > 0 ? <Todos todos={todos} /> : null}
+
+      {question ? (
+        <Question
+          key={tool.callId}
+          question={question}
+          onAnswer={(answer) => onAnswer(tool.callId, answer)}
+        />
       ) : null}
 
       {awaiting ? (
@@ -216,6 +242,241 @@ function ToolCard({
         <Mono style={tool.isError ? { color: theme.color.danger } : undefined}>{tool.result}</Mono>
       ) : null}
     </View>
+  );
+}
+
+/** `todo_write` as a checklist: done items struck through, the current one bold. */
+function Todos({ todos }: { todos: ReturnType<typeof todosOf> }) {
+  const theme = useTheme();
+  return (
+    <View style={styles.todos}>
+      {todos.map((todo, index) => {
+        const done = todo.status === "completed";
+        const active = todo.status === "in_progress";
+        return (
+          <View key={index} style={styles.todo}>
+            <Icon
+              name={done ? "checkmark.circle.fill" : active ? "arrow.right.circle.fill" : "circle"}
+              size={15}
+              color={done ? theme.color.success : active ? theme.color.accent : theme.color.textFaint}
+              style={styles.todoMark}
+            />
+            <Text
+              style={[
+                styles.todoText,
+                { color: done ? theme.color.textFaint : theme.color.text },
+                done && styles.todoDone,
+                active && styles.todoActive,
+              ]}
+            >
+              {todo.content}
+            </Text>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+/**
+ * An `ask_user` prompt. A single-select option answers on tap; multi-select
+ * collects choices and sends them with any typed text on Send.
+ */
+function Question({
+  question,
+  onAnswer,
+}: {
+  question: NonNullable<ReturnType<typeof questionOf>>;
+  onAnswer: (answer: string) => void;
+}) {
+  const theme = useTheme();
+  const [selected, setSelected] = useState<string[]>([]);
+  const [text, setText] = useState("");
+  const answer = question.multiSelect ? joinAnswer(selected, text) : text.trim();
+
+  const toggle = (option: string) => {
+    haptics.selection();
+    if (!question.multiSelect) return onAnswer(option);
+    setSelected((current) =>
+      current.includes(option) ? current.filter((o) => o !== option) : [...current, option],
+    );
+  };
+
+  return (
+    <View style={[styles.question, { borderColor: theme.color.accent }]}>
+      <Text style={[styles.questionText, { color: theme.color.text }]}>{question.question}</Text>
+      {question.options.length > 0 ? (
+        <View style={styles.options}>
+          {question.options.map((option) => (
+            <Button
+              key={option}
+              label={question.multiSelect && selected.includes(option) ? `✓ ${option}` : option}
+              onPress={() => toggle(option)}
+              variant={selected.includes(option) ? "primary" : "secondary"}
+              compact
+            />
+          ))}
+        </View>
+      ) : null}
+      <View style={styles.answerRow}>
+        <TextInput
+          value={text}
+          onChangeText={setText}
+          placeholder={question.options.length > 0 ? "Or type an answer" : "Type an answer"}
+          placeholderTextColor={theme.color.textFaint}
+          onSubmitEditing={() => answer && onAnswer(answer)}
+          returnKeyType="send"
+          style={[
+            styles.answerInput,
+            { color: theme.color.text, backgroundColor: theme.color.surface },
+          ]}
+        />
+        <Button
+          label="Send"
+          onPress={() => onAnswer(answer)}
+          variant="primary"
+          compact
+          disabled={!answer}
+        />
+      </View>
+    </View>
+  );
+}
+
+/**
+ * Images and files a tool produced. Rendered outside the card so a plot or an
+ * artifact is visible without expanding the tool output.
+ */
+function ToolArtifacts({ tool, onOpenImage }: { tool: UiTool; onOpenImage: (src: string) => void }) {
+  const images = tool.images ?? [];
+  const files = tool.files ?? [];
+  if (images.length === 0 && files.length === 0) return null;
+  return (
+    <View style={styles.artifacts}>
+      {images.map((image, index) => (
+        <ArtifactImage
+          key={image.attachmentId ?? index}
+          src={image.src}
+          attachmentId={image.attachmentId}
+          onOpen={onOpenImage}
+        />
+      ))}
+      {files.map((file) =>
+        file.mime.startsWith("image/") ? (
+          <ArtifactImage key={`${file.id}-image`} attachmentId={file.id} onOpen={onOpenImage} />
+        ) : null,
+      )}
+      {files.map((file) => (
+        <FileCard key={file.id} file={file} />
+      ))}
+    </View>
+  );
+}
+
+/**
+ * A full-width tool image; tapping opens the full-screen viewer. An attachment
+ * is fetched as a data URL first, since `<Image>` cannot carry the bearer token.
+ */
+function ArtifactImage({
+  src,
+  attachmentId,
+  onOpen,
+}: {
+  src?: string;
+  attachmentId?: string;
+  onOpen: (src: string) => void;
+}) {
+  const theme = useTheme();
+  const [uri, setUri] = useState(src || "");
+  const [ratio, setRatio] = useState(4 / 3);
+
+  useEffect(() => {
+    if (src || !attachmentId) return;
+    let live = true;
+    fetchAttachmentBase64(attachmentId)
+      .then((data) => live && setUri(data))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [src, attachmentId]);
+
+  useEffect(() => {
+    if (!uri) return;
+    Image.getSize(uri, (w, h) => h > 0 && setRatio(w / h), () => undefined);
+  }, [uri]);
+
+  return (
+    <Pressable
+      accessibilityRole="imagebutton"
+      accessibilityLabel="Open image"
+      disabled={!uri}
+      onPress={() => onOpen(uri)}
+      style={[styles.artifactImage, { aspectRatio: ratio, backgroundColor: theme.color.surfaceAlt }]}
+    >
+      {uri ? (
+        <Image source={{ uri }} style={styles.flex} resizeMode="contain" />
+      ) : (
+        <ActivityIndicator style={styles.flex} color={theme.color.textFaint} />
+      )}
+    </Pressable>
+  );
+}
+
+/**
+ * A stored artifact. Tapping downloads it (with the bearer token) and hands the
+ * bytes to the share sheet, which covers Save to Files, Quick Look, and other
+ * apps without a native file-system dependency.
+ */
+function FileCard({ file }: { file: UiFile }) {
+  const theme = useTheme();
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const open = async () => {
+    setLoading(true);
+    setFailed(false);
+    try {
+      const url = await fetchAttachmentBase64(file.id);
+      await Share.share({ url, title: file.name });
+    } catch {
+      haptics.error();
+      setFailed(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${file.name}`}
+      onPress={() => void open()}
+      disabled={loading}
+      style={({ pressed }) => [
+        styles.file,
+        { backgroundColor: theme.color.surfaceAlt },
+        pressed && { opacity: 0.6 },
+      ]}
+    >
+      <Icon name="doc" size={20} color={theme.color.textDim} />
+      <View style={styles.flex}>
+        <Text style={[styles.fileName, { color: theme.color.text }]} numberOfLines={1}>
+          {file.name}
+        </Text>
+        <Text
+          style={[styles.fileMeta, { color: failed ? theme.color.danger : theme.color.textDim }]}
+          numberOfLines={1}
+        >
+          {failed ? "Couldn’t open — tap to retry" : `${formatBytes(file.size)} · ${file.mime}`}
+        </Text>
+      </View>
+      {loading ? (
+        <ActivityIndicator size="small" color={theme.color.textFaint} />
+      ) : (
+        <Icon name="square.and.arrow.up" size={17} color={theme.color.accent} />
+      )}
+    </Pressable>
   );
 }
 
@@ -256,6 +517,7 @@ export interface MessageRowProps {
    */
   onSwitchBranch: (siblingId: string) => void;
   onDecide: (callId: string, decision: "approve" | "deny") => void;
+  onAnswer: (callId: string, answer: string) => void;
   /** Opens the text in a sheet where it can be partially selected. */
   onSelectText: (text: string) => void;
   onOpenImage: (src: string) => void;
@@ -274,6 +536,7 @@ function MessageRowBase({
   onEdit,
   onSwitchBranch,
   onDecide,
+  onAnswer,
   onSelectText,
   onOpenImage,
   busy,
@@ -349,7 +612,15 @@ function MessageRowBase({
       {streaming && !message.text && !message.reasoning ? <StreamingPulse /> : null}
 
       {message.tools.map((tool) => (
-        <ToolCard key={tool.callId} tool={tool} onDecide={onDecide} disabled={busy && !tool.running} />
+        <View key={tool.callId} style={styles.toolGroup}>
+          <ToolCard
+            tool={tool}
+            onDecide={onDecide}
+            onAnswer={onAnswer}
+            disabled={busy && !tool.running}
+          />
+          <ToolArtifacts tool={tool} onOpenImage={onOpenImage} />
+        </View>
       ))}
     </View>
   );
@@ -524,4 +795,21 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   images: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   image: { width: 120, height: 120, borderRadius: 14 },
+  toolGroup: { gap: 8 },
+  todos: { gap: 4 },
+  todo: { flexDirection: "row", gap: 8, alignItems: "flex-start" },
+  todoMark: { marginTop: 2 },
+  todoText: { fontSize: 15, flex: 1 },
+  todoDone: { textDecorationLine: "line-through" },
+  todoActive: { fontWeight: "600" },
+  question: { gap: 10, borderLeftWidth: 3, paddingLeft: 10, paddingBottom: 4 },
+  questionText: { fontSize: 16, fontWeight: "600" },
+  options: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  answerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  answerInput: { flex: 1, minHeight: 36, borderRadius: 10, paddingHorizontal: 10, fontSize: 15 },
+  artifacts: { gap: 8 },
+  artifactImage: { width: "100%", maxHeight: 420, borderRadius: 12, overflow: "hidden" },
+  file: { flexDirection: "row", alignItems: "center", gap: 12, borderRadius: 12, padding: 12 },
+  fileName: { fontSize: 15, fontWeight: "600" },
+  fileMeta: { fontSize: 13 },
 });

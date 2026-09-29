@@ -57,6 +57,11 @@ const FALLBACK: Partial<Record<IconName, string>> = {
   terminal: "›_",
   "exclamationmark.shield.fill": "⚠︎",
   "character.cursor.ibeam": "I",
+  "checkmark.circle.fill": "✓",
+  "arrow.right.circle.fill": "▸",
+  circle: "○",
+  "questionmark.bubble": "?",
+  doc: "▤",
 };
 
 export default function Icon({
