@@ -382,7 +382,10 @@ export class RunnerRegistry {
           ws.close(4003, `protocol version mismatch (server v${PROTOCOL_VERSION})`);
           return;
         }
-        if (this.enrollToken && message.enrollToken !== this.enrollToken) {
+        // Strict equality (normalized): empty configured token only matches
+        // an empty hello, so tests with "" still pass but any mismatch rejects.
+        // Production must set a random HAT_ENROLL_TOKEN (warned in config).
+        if ((message.enrollToken ?? "") !== this.enrollToken) {
           ws.close(4004, "invalid enroll token");
           this.log.warn("runner rejected: invalid enroll token", message.runnerId);
           return;

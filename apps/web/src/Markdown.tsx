@@ -26,12 +26,24 @@ function PreBlock({ children }: { children?: ReactNode }): JSX.Element {
 
   return (
     <div className="code-block">
-      <button className="code-copy" onClick={copy}>
-        {copied ? "copied" : "copy"}
+      <button type="button" className="code-copy" onClick={copy} aria-label="Copy code to clipboard">
+        <span aria-hidden="true">{copied ? "copied" : "copy"}</span>
+        <span className="sr-only" role="status">{copied ? "Copied" : ""}</span>
       </button>
       <pre>{children}</pre>
     </div>
   );
+}
+
+/** Allow only safe URLs in model/tool output: http(s) + anchor + image data. */
+function safeUrl(url: string | undefined): string {
+  if (!url) return "";
+  const trimmed = url.trim();
+  if (trimmed.startsWith("#")) return trimmed;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (/^data:image\/(png|jpeg|gif|webp);base64,/i.test(trimmed)) return trimmed;
+  if (/^(mailto|tel):/i.test(trimmed)) return trimmed;
+  return "";
 }
 
 export default function Markdown({ children }: { children: string }): JSX.Element {
@@ -39,13 +51,24 @@ export default function Markdown({ children }: { children: string }): JSX.Elemen
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[[rehypeHighlight, { ignoreMissing: true, detect: false }]]}
+      urlTransform={safeUrl}
       components={{
         pre: PreBlock,
-        a: ({ node, children: linkChildren, ...props }) => (
-          <a {...props} target="_blank" rel="noreferrer noopener">
-            {linkChildren}
-          </a>
-        ),
+        a: ({ node, children: linkChildren, href, ...props }) => {
+          const safe = safeUrl(typeof href === "string" ? href : undefined);
+          if (!safe) return <span>{linkChildren}</span>;
+          return (
+            <a {...props} href={safe} target="_blank" rel="noreferrer noopener">
+              {linkChildren}
+            </a>
+          );
+        },
+        img: ({ node, src, alt, ...props }) => {
+          const safe = safeUrl(typeof src === "string" ? src : undefined);
+          if (!safe) return null;
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          return <img {...props} src={safe} alt={alt ?? "image"} loading="lazy" referrerPolicy="no-referrer" />;
+        },
       }}
     >
       {children}

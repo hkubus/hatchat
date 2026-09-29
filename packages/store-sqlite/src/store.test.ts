@@ -47,6 +47,54 @@ test("branches, selects and walks the message tree", () => {
   store.close();
 });
 
+test("a new session persists the auto/low defaults it reports", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const created = store.createSession("fake/fake-agent");
+  assert.equal(created.approvalMode, "auto");
+  assert.equal(created.reasoningEffort, "low");
+
+  // The persisted row, not the returned literal, is what later reads and the
+  // agent's tool policy use.
+  const reloaded = store.getSession(created.id);
+  assert.equal(reloaded?.approvalMode, "auto");
+  assert.equal(reloaded?.reasoningEffort, "low");
+  store.close();
+});
+
+test("reopening a legacy database realigns the old ask/off defaults once", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hat-store-")), "hat.db");
+  const store = new Store(file, crypto.randomBytes(32));
+  const legacy = store.createSession("fake/fake-agent");
+  const denied = store.createSession("fake/fake-agent");
+  store.close();
+
+  // Emulate a database written by the older build: rows at the legacy defaults
+  // and no migration marker yet.
+  const raw = new DatabaseSync(file);
+  raw.exec(
+    `UPDATE sessions SET approval_mode = 'ask', reasoning_effort = 'off' WHERE id = '${legacy.id}'`,
+  );
+  raw.exec(
+    `UPDATE sessions SET approval_mode = 'deny', reasoning_effort = 'high' WHERE id = '${denied.id}'`,
+  );
+  raw.exec("PRAGMA user_version = 0");
+  raw.close();
+
+  const reopened = new Store(file, crypto.randomBytes(32));
+  assert.equal(reopened.getSession(legacy.id)?.approvalMode, "auto");
+  assert.equal(reopened.getSession(legacy.id)?.reasoningEffort, "low");
+  assert.equal(reopened.getSession(denied.id)?.approvalMode, "deny");
+  assert.equal(reopened.getSession(denied.id)?.reasoningEffort, "high");
+
+  // The marker makes the realignment one-shot: an explicit ask chosen afterwards
+  // survives the next open.
+  reopened.setSessionPolicy(legacy.id, { approvalMode: "ask" });
+  reopened.close();
+  const again = new Store(file, crypto.randomBytes(32));
+  assert.equal(again.getSession(legacy.id)?.approvalMode, "ask");
+  again.close();
+});
+
 test("titles the session from the first user message", () => {
   const store = new Store(":memory:", crypto.randomBytes(32));
   const session = store.createSession("fake/fake-agent");

@@ -73,13 +73,16 @@ export default function ModelPicker({
       creatorName(m).toLowerCase().includes(q);
 
     const favModels = models.filter((m) => favorites.includes(m.id) && matches(m)).sort(byLabel);
+    const favIds = new Set(favModels.map((m) => m.id));
     const out: Section[] = [];
     if (favModels.length > 0) {
       out.push({ id: "favorites", heading: "Favorites", models: favModels });
     }
 
     for (const creator of groupByCreator(models)) {
-      const list = creator.models.filter(matches);
+      // Dedupe: favorites already have their own section — repeating them
+      // below caused double highlights via flat.findIndex.
+      const list = creator.models.filter((m) => matches(m) && !favIds.has(m.id));
       if (list.length === 0) continue;
       // OpenRouter's own router models have no lab behind them, and
       // "OpenRouter" is the one heading that only ever repeats the provider.
@@ -185,7 +188,13 @@ export default function ModelPicker({
               onKeyDown={onSearchKeyDown}
             />
             {query && (
-              <button type="button" className="picker-clear" onClick={() => setQuery("")} title="Clear search">
+              <button
+                type="button"
+                className="picker-clear"
+                onClick={() => setQuery("")}
+                title="Clear search"
+                aria-label="Clear search"
+              >
                 ×
               </button>
             )}
@@ -242,6 +251,7 @@ export default function ModelPicker({
                         type="button"
                         className="picker-fav"
                         title={isFavorite ? "Remove from favorites" : "Add to favorites"}
+                        aria-label={isFavorite ? `Remove ${modelName(m)} from favorites` : `Add ${modelName(m)} to favorites`}
                         aria-pressed={isFavorite}
                         onClick={() => onToggleFavorite(m.id)}
                       >

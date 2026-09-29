@@ -78,8 +78,9 @@ export async function generateTitle(options: TitleOptions): Promise<string | und
         messages: [
           chatMessage("system", TITLE_SYSTEM_PROMPT),
           // The raw subject, not an instruction wrapping it: providers that
-          // quote their input verbatim produce a far better title.
-          chatMessage("user", trimmedSubject.slice(0, 4000)),
+          // quote their input verbatim produce a far better title. Capped
+          // short — a title never needs 4k of context.
+          chatMessage("user", trimmedSubject.slice(0, 500)),
         ],
         maxTokens: 24,
         temperature: 0,

@@ -183,6 +183,57 @@ Settings → Plugins → MCP servers:
 - `search_listings` and the scan tools perform real marketplace scans over the
   network and can take a couple of minutes (Scout allows 120s per request).
 
+## Web search
+
+The `websearch` plugin adds a `web_search` tool (title, URL, snippet) backed by
+two keyless options, chosen in **Settings → Plugins → Web search**:
+
+- **duckduckgo** (default) — scrapes DuckDuckGo's HTML endpoint; no key or
+  account. It is best-effort, so markup changes can degrade or empty results.
+- **searxng** — set `searxngUrl` to a self-hosted instance with the `json`
+  output format enabled (`search.formats: [json]`).
+
+`maxResults` sets the default result count (the model can pass `limit` per call,
+max 20) and `requireApproval` gates each search (off by default — searches are
+read-only). The search request is made by the **server process** directly, like
+provider calls, so no key or query crosses the runner link.
+
+## System prompt
+
+Every turn is prefixed with a base system prompt that is never stored in
+history. The default (`packages/server/src/prompt.ts`) establishes that hat is a
+**general-purpose assistant** whose tools come from optional plugins — so the
+model does not mistake one connected integration (an MCP server, the shell, a
+search backend, …) for its identity or the point of the conversation. Override
+it verbatim with `HAT_SYSTEM_PROMPT`. Providers that cannot take a system role
+get it merged into the first user message instead.
+
+## Browser
+
+The `browser` plugin adds a `browser` tool backed by headless Chromium
+(Playwright, `playwright-core`). It runs on the **server**, not the runner, and
+keeps one page per conversation, closed after an idle timeout.
+
+| action | what it does | approval |
+|---|---|---|
+| `open` | navigate to `url`; return title, text, links | auto |
+| `read` | re-read the current page | auto |
+| `click` | click `selector` | ask |
+| `type` | fill `selector` with `text` | ask |
+| `press` | press `key` (optionally on `selector`) | ask |
+| `screenshot` | full-page PNG, returned as an image | auto |
+| `back` | history back | auto |
+| `close` | end the session | auto |
+
+`selector` is a Playwright selector, so CSS (`#id`, `button.submit`) and
+text/role selectors (`text=Sign in`, `role=button[name=Next]`) both work.
+
+Config (Settings → Plugins → Browser): `executablePath` (or `HAT_BROWSER_PATH`),
+`headless`, `maxTextChars`, `maxLinks`, `idleTimeoutMs`, `navigationTimeoutMs`,
+and `requireApproval` (override; default asks only for click/type/press). A
+Chromium build is required: the plugin uses the Playwright browser cache by
+default, or point `executablePath` at any Chromium/Chrome binary.
+
 ## Vision + attachments (M4)
 
 Attach images by button, paste, or drag-and-drop. Uploads are content-addressed
@@ -205,7 +256,10 @@ Each conversation has a **tool policy** (editable in the chat toolbar):
 
 Policies are persisted per session. The agent also has **loop guards**: it stops
 after N identical (name+args) calls and after N consecutive failures, so a model
-can't spin forever.
+can't spin forever. A turn is also capped at `HAT_MAX_TOOL_ITERATIONS`
+(default 100) tool steps; when the budget (or a guard) is hit, the agent makes one
+final call **with tools withheld** so the turn closes with a written answer
+instead of dangling on a tool result, and emits a `warning` explaining why.
 
 **Capability checks** compare the conversation's needs (vision from image
 parts, tool calls once tools are used) against the selected model. On a mismatch
@@ -228,7 +282,8 @@ plugin is disabled, errors, or is reconfigured.
 - **Secrets**: declare `requiresSecrets: ["OPENROUTER_API_KEY"]`; the plugin
   reads them through `ctx.secrets`. Values never leave the server.
 - **Built-in plugins**: `openrouter`, `deepseek` (providers), `shell` (the
-  `shell_exec` tool), `fake` (test provider).
+  `shell_exec` tool), `websearch` (the `web_search` tool), `browser` (the
+  `browser` tool), `mcp`, `fake` (test provider).
 
 ### External plugins
 
@@ -272,10 +327,17 @@ Secrets (provider keys) are encrypted with AES-256-GCM using a master key from
 `HAT_MASTER_KEY` or a generated key file.
 
 The browser keeps the open session in `localStorage` (`hat.session`) and
-reloads it on boot, so a refresh mid-conversation lands you back in it. While a
-turn streams, the send button becomes **Stop** (or `Esc`): it aborts the
-request, which the server turns into a real `AbortController.abort()` for the
-turn, so a runaway generation or a hung tool stops instead of only being hidden.
+reloads it on boot, so a refresh mid-conversation lands you back in it.
+
+**A turn outlives the connection.** Refreshing the tab or switching
+conversations closes the SSE stream but only *detaches* the viewer — the model
+keeps running on the server, messages keep persisting, and opening the session
+again reattaches to the live turn (`GET /api/sessions/:id/stream`, which
+replays the pending tail and then follows). The send button's **Stop** (or
+`Esc`) is a separate, explicit
+`POST /api/sessions/:id/turn/cancel` that really aborts the turn, so a runaway
+generation or a hung tool stops promptly instead of only being hidden.
+
 The view only follows the stream while you are already at the bottom — scroll
 up to read back without being yanked down on every delta.
 

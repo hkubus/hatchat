@@ -104,6 +104,9 @@ export class Store implements SecretStore {
       fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
     }
     this.db = new DatabaseSync(dbPath);
+    // WAL lets readers proceed during writes (turn streaming + polling);
+    // busy_timeout avoids SQLITE_BUSY on concurrent turns.
+    this.db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;`);
     this.db.exec(SCHEMA);
     this.migrate();
   }
@@ -111,9 +114,9 @@ export class Store implements SecretStore {
   /** Additive migrations for databases created before a column existed. */
   private migrate(): void {
     const columns = [
-      "approval_mode TEXT NOT NULL DEFAULT 'ask'",
+      "approval_mode TEXT NOT NULL DEFAULT 'auto'",
       "allowed_tools TEXT NOT NULL DEFAULT '[]'",
-      "reasoning_effort TEXT NOT NULL DEFAULT 'off'",
+      "reasoning_effort TEXT NOT NULL DEFAULT 'low'",
       "title_source TEXT NOT NULL DEFAULT 'derived'",
     ];
     for (const column of columns) {
@@ -131,6 +134,18 @@ export class Store implements SecretStore {
     } catch {
       /* already dropped, or unsupported */
     }
+    // One-time realignment: sessions created before the defaults were corrected
+    // were written as 'ask'/'off' by the column default even though the app
+    // reported and intended 'auto'/'low'. Only the exact legacy defaults are
+    // flipped; deny/allowlist and medium/high choices are preserved.
+    const { user_version: schemaVersion } = this.db
+      .prepare("PRAGMA user_version")
+      .get() as { user_version: number };
+    if (schemaVersion < 1) {
+      this.db.exec("UPDATE sessions SET approval_mode = 'auto' WHERE approval_mode = 'ask'");
+      this.db.exec("UPDATE sessions SET reasoning_effort = 'low' WHERE reasoning_effort = 'off'");
+      this.db.exec("PRAGMA user_version = 1");
+    }
   }
 
   close(): void {
@@ -144,8 +159,8 @@ export class Store implements SecretStore {
     const id = newId("sess");
     this.db
       .prepare(
-        `INSERT INTO sessions (id, title, title_source, model, active_leaf_id, created_at, updated_at)
-         VALUES (?, ?, 'derived', ?, NULL, ?, ?)`,
+        `INSERT INTO sessions (id, title, title_source, model, active_leaf_id, approval_mode, reasoning_effort, created_at, updated_at)
+         VALUES (?, ?, 'derived', ?, NULL, 'auto', 'low', ?, ?)`,
       )
       .run(id, title, model, now, now);
     return {
@@ -259,19 +274,26 @@ export class Store implements SecretStore {
 
   /**
    * Append a message as a child of `parentId` (defaults to the session's active
-   * leaf) and move the active leaf to it.
+   * leaf) and move the active leaf to it. Atomic: the insert + leaf move
+   * commit together so a crash can't orphan a message.
    */
   appendMessage(sessionId: string, message: ChatMessage, parentId?: string | null): void {
     const session = this.getSession(sessionId);
     if (!session) throw new Error(`unknown session ${sessionId}`);
     const parent = parentId === undefined ? session.activeLeafId : parentId;
     const now = Date.now();
-    this.db
-      .prepare(
-        `INSERT INTO messages (id, session_id, parent_id, role, parts, meta, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const insert = this.db.prepare(
+      `INSERT INTO messages (id, session_id, parent_id, role, parts, meta, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const touch = this.db.prepare(
+      `UPDATE sessions SET active_leaf_id = ?, updated_at = ?, title = ? WHERE id = ?`,
+    );
+    const title = deriveTitle(session, message);
+    // node:sqlite is sync; a simple exec transaction is enough.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      insert.run(
         message.id,
         sessionId,
         parent,
@@ -280,32 +302,51 @@ export class Store implements SecretStore {
         message.meta ? JSON.stringify(message.meta) : null,
         message.createdAt || now,
       );
-
-    const title = deriveTitle(session, message);
-    this.db
-      .prepare(`UPDATE sessions SET active_leaf_id = ?, updated_at = ?, title = ? WHERE id = ?`)
-      .run(message.id, now, title, sessionId);
+      touch.run(message.id, now, title, sessionId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw error;
+    }
   }
 
-  /** The active root→leaf conversation path. */
+  /** The active root→leaf conversation path — single query, no N+1. */
   getPath(sessionId: string): PathNode[] {
     const session = this.getSession(sessionId);
     if (!session?.activeLeafId) return [];
 
-    const chain: ChatMessage[] = [];
+    const rows = this.db
+      .prepare(`SELECT * FROM messages WHERE session_id = ? ORDER BY rowid ASC`)
+      .all(sessionId) as unknown as MessageRow[];
+    if (rows.length === 0) return [];
+    const byId = new Map<string, MessageRow>();
+    const childrenByParent = new Map<string | null, MessageRow[]>();
+    for (const row of rows) {
+      byId.set(row.id, row);
+      const key = row.parent_id ?? null;
+      const list = childrenByParent.get(key);
+      if (list) list.push(row);
+      else childrenByParent.set(key, [row]);
+    }
+    const chain: MessageRow[] = [];
     const seen = new Set<string>();
     let cursor: string | null = session.activeLeafId;
     while (cursor && !seen.has(cursor)) {
       seen.add(cursor);
-      const message = this.getMessage(cursor);
-      if (!message) break;
-      chain.unshift(message);
-      cursor = this.getParentId(cursor);
+      const row = byId.get(cursor);
+      if (!row) break;
+      chain.unshift(row);
+      cursor = row.parent_id ?? null;
     }
 
-    return chain.map((message) => {
-      const parentId = this.getParentId(message.id);
-      const siblings = this.children(sessionId, parentId);
+    return chain.map((row) => {
+      const message = toMessage(row);
+      const parentId = row.parent_id ?? null;
+      const siblings = childrenByParent.get(parentId) ?? [];
       const index = siblings.findIndex((s) => s.id === message.id);
       return {
         message,

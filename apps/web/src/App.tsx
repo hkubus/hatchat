@@ -104,13 +104,16 @@ function imagesOf(parts: Part[]): { src: string; attachmentId?: string }[] {
   return out;
 }
 
-/** The one-word state shown at the end of a tool call's summary line. */
-function toolStatus(t: UiTool): string {
+/**
+ * The one-word state shown at the end of a tool call's summary line.
+ * Running and plain success are deliberately silent — a spinner marks the
+ * former and a finished call needs no label.
+ */
+function toolStatus(t: UiTool): string | null {
   if (t.approval === "requested") return "awaiting approval";
-  if (t.running) return "running";
   if (t.approval === "denied") return "denied";
   if (t.isError) return "failed";
-  return "done";
+  return null;
 }
 
 /**
@@ -305,6 +308,12 @@ export default function App() {
   /** Mirrors `sessionId` for callbacks that must not re-subscribe on change. */
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  /**
+   * Monotonic id for `refreshSessions`. A slow, older list response must not
+   * clobber a newer one, or a just-created session briefly vanishes from the
+   * sidebar (concurrent refreshes happen after every turn and new chat).
+   */
+  const sessionsRequestRef = useRef(0);
 
   useEffect(() => {
     const el = scroller.current;
@@ -374,7 +383,13 @@ export default function App() {
   }
 
   function refreshSessions(): Promise<void> {
-    return api.listSessions().then(setSessions).catch(() => undefined);
+    const requestId = ++sessionsRequestRef.current;
+    return api
+      .listSessions()
+      .then((list) => {
+        if (requestId === sessionsRequestRef.current) setSessions(list);
+      })
+      .catch(() => undefined);
   }
 
   useEffect(() => {
@@ -436,10 +451,14 @@ export default function App() {
       .then((payload) => {
         // The user may have picked another session while this was in flight.
         if (cancelled || sessionIdRef.current !== stored) return;
+        sessionIdRef.current = payload.session.id;
         setSessionId(payload.session.id);
         setMessages(buildMessages(payload.path));
         applySession(payload.session);
         stickToBottom.current = true;
+        // If the model was mid-turn when the tab reloaded, keep watching it
+        // instead of showing a frozen partial answer.
+        void followActiveTurn(payload.session.id);
       })
       .catch((e: unknown) => {
         if (cancelled || sessionIdRef.current !== stored) return;
@@ -663,29 +682,77 @@ export default function App() {
     try {
       await fn(handleEvent, controller.signal);
     } catch (e) {
-      // A turn the user stopped is not a failure; the server already unwound it.
+      // A turn the user stopped is not a failure; detaching is not either.
       if (!api.isAbortError(e)) setError(String(e));
     } finally {
-      abortRef.current = null;
-      // Hand the streamed turn to the history *before* the refetch. `refresh`
-      // replaces the list wholesale from the server's branch path, so promoting
-      // first means the refetch is a quiet reconciliation instead of a swap that
-      // blanks the last few deltas — and if the refetch fails outright, the
-      // turn the user just watched stream in is still on screen.
-      const streamed = inFlightRef.current;
-      if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
-      setInFlight([]);
-      await refresh(id).catch(() => undefined);
-      await refreshSessions();
-      // Drop the live figure only once the persisted usage is in `messages`,
-      // otherwise the two would be added together and double-count.
-      setLiveUsage(undefined);
-      setBusy(false);
+      if (abortRef.current === controller) abortRef.current = null;
+      // If the user moved to another conversation, leave its view alone: the
+      // turn keeps running server-side and these messages are persisted anyway.
+      if (sessionIdRef.current === id) {
+        // Hand the streamed turn to the history *before* the refetch. `refresh`
+        // replaces the list wholesale from the server's branch path, so promoting
+        // first means the refetch is a quiet reconciliation instead of a swap that
+        // blanks the last few deltas — and if the refetch fails outright, the
+        // turn the user just watched stream in is still on screen.
+        const streamed = inFlightRef.current;
+        if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
+        setInFlight([]);
+        await refresh(id).catch(() => undefined);
+        await refreshSessions();
+        // Drop the live figure only once the persisted usage is in `messages`,
+        // otherwise the two would be added together and double-count.
+        setLiveUsage(undefined);
+        setBusy(false);
+      }
     }
   }
 
+  /**
+   * Attach to a turn already running for `id` — after a reload, or when
+   * switching back to a conversation the model is still working on. Does
+   * nothing when the session is idle.
+   */
+  async function followActiveTurn(id: string): Promise<void> {
+    if (sessionIdRef.current !== id) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    stickToBottom.current = true;
+    setBusy(true);
+    setError(null);
+    setInFlight([]);
+    setWarnings([]);
+    try {
+      const following = await api.followTurn(id, handleEvent, controller.signal);
+      if (!following) return;
+    } catch (e) {
+      if (!api.isAbortError(e)) setError(String(e));
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      if (sessionIdRef.current === id) {
+        const streamed = inFlightRef.current;
+        if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
+        setInFlight([]);
+        await refresh(id).catch(() => undefined);
+        await refreshSessions();
+        setLiveUsage(undefined);
+        setBusy(false);
+      }
+    }
+  }
+
+  /** Detach this tab from the stream without cancelling the turn. */
+  function detachStream(): void {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+  }
+
+  /** Stop button: really cancel the turn, then detach. */
   function stop(): void {
-    abortRef.current?.abort();
+    const id = sessionIdRef.current;
+    if (id) void api.cancelTurn(id).catch(() => undefined);
+    detachStream();
   }
 
   async function ensureSession(): Promise<string> {
@@ -750,7 +817,7 @@ export default function App() {
   }
 
   async function newChat(): Promise<void> {
-    stop();
+    detachStream();
     setMessages([]);
     setInFlight([]);
     setError(null);
@@ -765,7 +832,7 @@ export default function App() {
   }
 
   async function openSession(id: string): Promise<void> {
-    stop();
+    detachStream();
     setBusy(false);
     setError(null);
     setWarnings([]);
@@ -774,9 +841,13 @@ export default function App() {
     setView("chat");
     stickToBottom.current = true;
     const payload = await api.getSession(id);
+    // Update the ref synchronously: `followActiveTurn` guards on it and runs
+    // before React commits the state update.
+    sessionIdRef.current = payload.session.id;
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     applySession(payload.session);
+    void followActiveTurn(payload.session.id);
   }
 
   async function handleRename(id: string, title: string): Promise<void> {
@@ -807,7 +878,7 @@ export default function App() {
   }
 
   async function doLogout(): Promise<void> {
-    stop();
+    detachStream();
     await api.logout();
     setAuth({ required: true, authenticated: false });
     setSessionId(null);
@@ -839,13 +910,20 @@ export default function App() {
   }
 
   async function decide(callId: string, decision: "approve" | "deny"): Promise<void> {
+    const previous = inFlightRef.current;
     patchInFlight((list) =>
       patchTool(list, callId, (t) => ({
         ...t,
         approval: decision === "deny" ? "denied" : "approved",
       })),
     );
-    await api.resolveApproval(callId, decision);
+    try {
+      await api.resolveApproval(callId, decision, sessionId ?? undefined);
+    } catch (e) {
+      // Roll back the optimistic patch so the approval stays actionable.
+      setInFlight(previous);
+      setError(String(e));
+    }
   }
 
   const currentTitle =
@@ -950,57 +1028,64 @@ export default function App() {
               </div>
             )}
 
-            {m.tools.map((t) => (
-              <details
-                key={t.callId}
-                className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
-                // An approval is a blocking question, so it must be visible
-                // rather than folded away behind a click.
-                open={t.approval === "requested"}
-              >
-                <summary>
-                  <ChevronDownIcon className="disclosure" />
-                  <span className="tool-name">{t.name}</span>
-                  <span className="tool-brief">{toolBrief(t)}</span>
-                  <span className={`tool-status ${t.approval ?? ""}`}>{toolStatus(t)}</span>
-                </summary>
-                <div className="aside-body">
-                  <pre className="tool-args">{toolArgs(t)}</pre>
-                  {t.approval === "requested" && (
-                    <div className="approval">
-                      <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
-                      <button className="danger" onClick={() => void decide(t.callId, "deny")}>
-                        Deny
-                      </button>
-                    </div>
-                  )}
-                  {t.result && <pre className="tool-result">{t.result}</pre>}
-                </div>
-              </details>
-            ))}
+            {m.tools.map((t) => {
+              const status = toolStatus(t);
+              return (
+                <details
+                  key={t.callId}
+                  className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
+                  // An approval is a blocking question, so it must be visible
+                  // rather than folded away behind a click.
+                  open={t.approval === "requested"}
+                >
+                  <summary>
+                    <ChevronDownIcon className="disclosure" />
+                    <span className="tool-name">{t.name}</span>
+                    <span className="tool-brief">{toolBrief(t)}</span>
+                    {t.running && t.approval !== "requested" ? (
+                      <span className="tool-spinner" role="status" aria-label="Running" />
+                    ) : (
+                      status && <span className={`tool-status ${t.approval ?? ""}`}>{status}</span>
+                    )}
+                  </summary>
+                  <div className="aside-body">
+                    <pre className="tool-args">{toolArgs(t)}</pre>
+                    {t.approval === "requested" && (
+                      <div className="approval">
+                        <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
+                        <button className="danger" onClick={() => void decide(t.callId, "deny")}>
+                          Deny
+                        </button>
+                      </div>
+                    )}
+                    {t.result && <pre className="tool-result">{t.result}</pre>}
+                  </div>
+                </details>
+              );
+            })}
           </>
         )}
 
         {!streamingNow && !editing && (
           <div className="msg-actions">
             {m.branch && m.branch.count > 1 && (
-              <span className="branch">
+              <span className="branch" role="group" aria-label={`Version ${m.branch.index + 1} of ${m.branch.count}`}>
                 <button
                   className="icon-btn"
-                  title="Previous version"
-                  aria-label="Previous version"
+                  title="Previous version (regenerating creates versions)"
+                  aria-label={`Previous version, currently ${m.branch.index + 1} of ${m.branch.count}`}
                   disabled={m.branch.index <= 0 || busy}
                   onClick={() => void switchBranch(m.branch!.ids[m.branch!.index - 1])}
                 >
                   <ChevronLeftIcon />
                 </button>
-                <span className="branch-label">
+                <span className="branch-label" aria-hidden="true">
                   {m.branch.index + 1}/{m.branch.count}
                 </span>
                 <button
                   className="icon-btn"
-                  title="Next version"
-                  aria-label="Next version"
+                  title="Next version (regenerating creates versions)"
+                  aria-label={`Next version, currently ${m.branch.index + 1} of ${m.branch.count}`}
                   disabled={m.branch.index >= m.branch.count - 1 || busy}
                   onClick={() => void switchBranch(m.branch!.ids[m.branch!.index + 1])}
                 >
@@ -1134,11 +1219,15 @@ export default function App() {
                 ref={textareaRef}
                 value={input}
                 placeholder="Message hat…"
+                aria-label="Message"
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={(e) => {
-                  if (e.clipboardData.files.length > 0) {
+                  const files = [...e.clipboardData.files].filter((f) =>
+                    f.type.startsWith("image/"),
+                  );
+                  if (files.length > 0) {
                     e.preventDefault();
-                    addFiles(e.clipboardData.files);
+                    addFiles(files);
                   }
                 }}
                 onKeyDown={(e) => {

@@ -16,7 +16,8 @@ export interface SpawnPlan {
 /**
  * Turn a shell command into a spawn plan. In `container` mode the command runs
  * inside a throwaway container with the workspace bind-mounted, no network by
- * default, and cpu/memory/pids limits.
+ * default, and cpu/memory/pids limits. Hardened with cap-drop, no-new-
+ * privileges, read-only rootfs (workspace stays writable), and a non-root user.
  */
 export function spawnPlan(command: string, cwd: string, sandbox: SandboxConfig): SpawnPlan {
   if (sandbox.mode !== "container") {
@@ -37,6 +38,14 @@ export function spawnPlan(command: string, cwd: string, sandbox: SandboxConfig):
       sandbox.cpus,
       "--pids-limit",
       "512",
+      "--cap-drop=ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--read-only",
+      "--tmpfs",
+      "/tmp:rw,noexec,nosuid,size=64m",
+      "--user",
+      "65532:65532",
       "-v",
       `${cwd}:/workspace`,
       "-w",

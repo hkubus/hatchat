@@ -625,6 +625,30 @@ select {
   color: var(--danger);
 }
 
+/* A running call is shown with motion rather than a label, so the collapsed
+   line stays quiet once the call is done. */
+.tool-spinner {
+  flex-shrink: 0;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--fg-muted);
+  animation: tool-spin 0.7s linear infinite;
+}
+
+@keyframes tool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-spinner {
+    animation-duration: 2s;
+  }
+}
+
 .tool-args,
 .tool-result {
   margin: 0 0 4px;
@@ -1759,6 +1783,19 @@ select {
   gap: 10px;
 }
 
+/* Visually hidden but announced to screen readers (copy confirmations). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @media (max-width: 760px) {
   .sidebar {
     width: 210px;
@@ -1772,5 +1809,59 @@ select {
   }
   .composer-caps {
     display: none;
+  }
+}
+
+/* Touch + reduced-motion: larger targets, no hover-only hiding on touch. */
+@media (hover: none) {
+  .session-actions {
+    display: flex;
+  }
+  .code-copy {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg {
+    animation: none;
+  }
+  .caret {
+    animation: none;
+  }
+  .tool-spinner {
+    animation-duration: 2s;
+  }
+}
+
+@media (max-width: 560px) {
+  .shell {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    max-height: 32vh;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .composer-footer {
+    overflow-x: auto;
+  }
+  .icon-btn,
+  .send-btn {
+    min-width: 36px;
+    min-height: 36px;
+  }
+  .branch .icon-btn {
+    width: 32px;
+    height: 32px;
+  }
+  .chip-remove {
+    width: 24px;
+    height: 24px;
+  }
+  .approval button {
+    padding: 8px 16px;
+    font-size: 13px;
   }
 }
