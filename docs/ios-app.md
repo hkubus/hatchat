@@ -21,19 +21,22 @@ apps/mobile/
   src/
     api.ts                    typed HTTP + SSE client
     runtime.ts                connection config in the keychain
-    chat.ts                   transcript view-model (pure, tested)
-    chat.test.ts
     useChat.ts                chat state machine
+    search.ts                 search-snippet formatting (pure, tested)
     theme.ts                  colour + type tokens
     navigation.ts             route types + chat-store context
     Glass.tsx                 Liquid Glass with an expo-blur fallback
     haptics.ts                haptic feedback, named by intent
     tokens.ts / capTags.ts    formatting helpers
-    screens/                  Connect, Sessions, Chat, Model
+    screens/                  Connect, Sessions, Chat, Model, Conversation
       settings/               the Settings sheet: its own nested stack
     ui/                       controls, List, Menu, Icon (SF Symbols),
                               barItems, Sheets, Markdown, MessageRow
 ```
+
+The transcript view-model (`buildMessages`, `readEvent`, `applyEffect`,
+`contextFill`, `endsTruncated`) lives in `packages/core/src/chat-view.ts` and is
+shared with the web and desktop clients; the app imports it from `@hat/core`.
 
 ## Running it
 
@@ -164,24 +167,55 @@ and returns to the connect screen instead of failing on each screen in turn.
 - **Connect** — server URL + token, probed against `GET /api/health` before
   being saved, so a typo fails immediately and specifically.
 - **Chats** — the root: sessions grouped by date, search, swipe or
-  long-press to rename or delete (delete is confirmed).
+  long-press to rename or delete (delete is confirmed). Each row shows what
+  the conversation is doing: a blue dot and "Responding" while a turn runs,
+  an orange symbol and "Needs you" while one waits on a tool approval or an
+  `ask_user` question. The list refetches on focus and polls every few
+  seconds while anything is running or waiting.
+- **Search** — the bar's search field filters titles instantly and, once
+  typing pauses, also runs the server's full-text search (`GET /api/search`).
+  Matching messages appear in a Messages section with the matched terms in
+  bold. Tapping one selects the branch that holds it (`POST …/select`) and
+  opens the conversation there.
 - **Chat** — streaming transcript, markdown, collapsible tool cards and
   reasoning, approvals at the composer, branch navigation (`‹ n/m ›`),
-  regenerate, edit-and-resend, camera and library attachments, stop mid-turn.
+  regenerate, edit-and-resend, camera, library and document attachments,
+  stop mid-turn. A reply cut off at the output limit gets a **Continue**
+  button under it (`POST …/continue`), which streams the rest as a normal
+  turn. The server's "continue" nudge is a hidden user message, so the
+  continuation reads as the rest of the reply. Long-pressing a reply offers
+  **Fork from Here** (`POST …/fork`), which switches to a new conversation
+  holding the path up to that reply. Fork is offered on replies only,
+  because a fork that ends on a user message has nothing to regenerate or
+  continue. The options menu has **Export as Markdown…**, which fetches the
+  active branch as Markdown and hands the text to the share sheet.
+- **Context fill** — the title's subtitle shows the model and how full its
+  context window is (`· 42%`, orange from 80%). The figure is the last model
+  call's prompt plus reply over the selected model's `contextWindow`
+  (`contextFill`). The options menu's Usage section spells it out. The kernel
+  trims old context itself when it has to, and says so in a warning banner.
+- **Conversation** — instructions, temperature and max reply tokens for this
+  conversation (`PATCH /api/sessions/:id`), saved with the bar's Save button.
+  It opens as a sheet from the options menu (Instructions & Sampling…) and is
+  also pushed from Settings. An empty field means the provider default.
 - **Model** — a sheet, grouped by provider, with search.
 - **Settings** — a sheet with its own stack: conversation (reasoning, tool
-  approval, allowlist), then Providers, Plugins, Runners and Server, each
-  pushing its detail screen.
+  approval, instructions & sampling, allowlist), then Providers, Plugins,
+  Runners and Server, each pushing its detail screen.
 
 ### The state machine
 
 `src/useChat.ts` is the port of the state block in `apps/web/src/App.tsx`. Two
 invariants from the web client are load-bearing and preserved:
 
-- **Usage is not double-counted.** `liveUsage` accumulates the turn in flight
-  and is cleared only *after* the post-turn refresh has folded the server's
-  stored usage into `messages`. Clearing it earlier counts the same tokens
-  twice.
+- **Usage is counted once.** A `usage` event lands on the in-flight message
+  it belongs to, so a turn's cost moves with its messages: into `messages`
+  when they are promoted at the end of the turn, then replaced by the stored
+  figures on refresh. There is no separate running tally. (There used to be
+  `liveUsage`, which had to be cleared at exactly the right moment; with usage
+  on the messages as well it would count every token twice.) `message.done`
+  stamps the finish reason on its message, which is what `endsTruncated` reads
+  to offer Continue.
 - **A turn always ends in a refresh.** The streamed view is an optimistic
   projection; the server's path is the truth. Streamed messages are promoted
   into `messages` *before* the refetch, so the refetch is a reconciliation that
@@ -215,6 +249,20 @@ attachments are downloaded as data URLs and handed to `<Image>` directly. The
 server caps uploads at 25 MiB, and `fetchAttachmentBase64` encodes in 8 KB
 chunks to stay under Hermes' `String.fromCharCode` argument limit.
 
+**Documents** come from the composer's "+" → Choose File (`expo-document-picker`,
+no iCloud entitlement, so it works on a free Apple ID). The server takes text,
+code and PDFs with extractable text. It reads them to text on upload, inlines
+that for the model, and puts a file part on the user message. The app sends
+each document's name in `attachmentNames`, because stored content is keyed by
+hash and a repeated upload would otherwise keep its first name. Documents show
+as file cards above the user's bubble (`UiMessage.files`); tapping one
+downloads it and opens the share sheet. The picker checks only size and image
+format. Anything else the server cannot read (a scanned PDF, a binary file)
+comes back with the server's own reason.
+
+Adding `expo-document-picker` is a native change, so `app.json`'s `version` went
+to 0.2.0 and a new build is needed before an OTA update that uses it.
+
 The server only accepts **PNG, JPEG, GIF, and WebP** — it reads image dimensions
 from the file header with no native image dependency, so an unrecognised format
 comes back as a 415 rather than being stored unreadable. That matters on iOS
@@ -236,7 +284,8 @@ a lookalike:
   the `systemChromeMaterial` blur.
 - **Bar buttons are `UIBarButtonItem`s** (`src/ui/barItems.tsx`), with SF
   Symbol icons and native pull-down `UIMenu`s. The conversation's options
-  (reasoning effort, tool approval, usage) are one such menu. On iOS 26 the
+  (reasoning effort, tool approval, model, instructions & sampling, export,
+  usage and context) are one such menu. On iOS 26 the
   system puts these items in its grouped glass capsules. `unstable_header*Items`
   is iOS-only, so every item also renders as a plain button on web and Android.
   A menu falls back to opening Settings, which has the same controls.
@@ -244,9 +293,10 @@ a lookalike:
   stand-in off iOS.
 - **Menus are `UIMenu`s** (`src/ui/Menu.tsx` over `@react-native-menu/menu`).
   Long-pressing a message or a conversation opens the system context menu.
-  Messages offer Copy, Select Text, Share and Edit or Regenerate; a
-  conversation offers Rename and Delete. The composer's "+" is a pull-down
-  with Camera and Photo Library. The Settings pickers are pop-up buttons.
+  Messages offer Copy, Select Text, Share and Edit, or Regenerate and Fork
+  from Here; a conversation offers Rename and Delete. The composer's "+" is a
+  pull-down with Camera, Photo Library and Choose File. The Settings pickers
+  are pop-up buttons.
 - **Conversations swipe** (`ReanimatedSwipeable`) to reveal Rename and
   Delete, as in Mail. Delete is always confirmed in a destructive alert.
 - **The keyboard is tracked frame by frame** with
@@ -343,8 +393,14 @@ the protection app-wide.
 
 ## Known gaps
 
-- **Push notifications** (needs a paid team) — so a turn that finishes while the
-  app is suspended is noticed only on next foreground, not as a notification.
+- **Push notifications.** "Turn finished" and "needs approval" alerts while the
+  app is backgrounded would need push (APNs), which needs a paid Apple
+  Developer account. Not implemented. A turn that finishes, or starts
+  waiting on you, while the app is suspended shows up on the next
+  foreground: the chat reattaches, and the Chats list shows "Needs you".
+- **JSON import** (`POST /api/sessions/import`) is web-only. The app exports
+  Markdown for reading; moving a whole conversation tree between servers is
+  easier from a desktop.
 - **Offline / queued turns.** A turn needs a live stream, and the app has no
   retry: a send that fails on a dead connection surfaces as an error rather than
   being queued.

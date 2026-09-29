@@ -70,6 +70,15 @@ export interface SessionRecord {
   approvalMode: ApprovalMode;
   allowedTools: string[];
   reasoningEffort: ReasoningEffort;
+  /**
+   * Per-conversation instructions appended to the system prompt; "" for none.
+   * Optional only so an older server that predates them still parses.
+   */
+  instructions?: string;
+  /** Sampling temperature (0–2); null leaves the provider default. */
+  temperature?: number | null;
+  /** Reply-token cap per model call; null leaves the provider default. */
+  maxTokens?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -94,7 +103,26 @@ export interface SessionSummary {
   messageCount: number;
   /** Tokens spent on the active branch; null when nothing has been recorded. */
   usage: Usage | null;
+  /**
+   * What the conversation is doing right now: a turn `running`, or a turn
+   * `waiting` on the user (a tool approval or an `ask_user` question). Absent
+   * from servers that predate it.
+   */
+  status?: SessionStatus;
   updatedAt: number;
+}
+
+export type SessionStatus = "idle" | "running" | "waiting";
+
+/** One message matched by `GET /api/search`. */
+export interface SearchHit {
+  messageId: string;
+  sessionId: string;
+  sessionTitle: string;
+  role: "user" | "assistant";
+  /** Matched text, with each hit wrapped in « and ». */
+  snippet: string;
+  createdAt: number;
 }
 
 export interface RunnerSummary {
@@ -122,6 +150,13 @@ export interface AttachmentRecord {
   height?: number;
   createdAt: number;
   url: string;
+  /**
+   * `image` goes to the model as pixels; a `document` (text, code, PDF) is
+   * read as text on upload and shows as a file chip.
+   */
+  kind?: "image" | "document";
+  /** A document's file name, as uploaded. */
+  name?: string;
 }
 
 export interface JsonSchemaProperty {
@@ -266,6 +301,12 @@ export interface SessionPatch {
   approvalMode?: ApprovalMode;
   allowedTools?: string[];
   reasoningEffort?: ReasoningEffort;
+  /** "" clears them. */
+  instructions?: string;
+  /** 0–2, or null for the provider default. */
+  temperature?: number | null;
+  /** A positive integer, or null for the provider default. */
+  maxTokens?: number | null;
 }
 
 export async function updateSession(id: string, patch: SessionPatch): Promise<SessionRecord> {
@@ -285,6 +326,38 @@ export async function deleteSession(id: string): Promise<void> {
   await sendJson(`/api/sessions/${encodeURIComponent(id)}`, "DELETE");
 }
 
+/**
+ * Start a new conversation from this one's path up to and including
+ * `messageId`. The original is left as it is.
+ */
+export async function forkSession(sessionId: string, messageId: string): Promise<SessionPayload> {
+  return sendJson<SessionPayload>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/fork`,
+    "POST",
+    { messageId },
+  );
+}
+
+/** The active branch as a readable Markdown transcript. */
+export async function exportMarkdown(sessionId: string): Promise<string> {
+  const url = `/api/sessions/${encodeURIComponent(sessionId)}/export?format=markdown`;
+  const res = await authFetch(url);
+  if (!res.ok) throw new HttpError(res.status, url);
+  return res.text();
+}
+
+/** Full-text search over every conversation's messages. */
+export async function searchMessages(query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const url = `/api/search?q=${encodeURIComponent(query)}`;
+  const res = await authFetch(url, { signal });
+  if (!res.ok) throw new HttpError(res.status, url);
+  return ((await res.json()) as { hits: SearchHit[] }).hits;
+}
+
+/**
+ * Make the branch through `messageId` the active one. The server follows it
+ * down to its newest leaf, so any message on a branch will do.
+ */
 export async function selectBranch(sessionId: string, messageId: string): Promise<SessionPayload> {
   return sendJson<SessionPayload>(
     `/api/sessions/${encodeURIComponent(sessionId)}/select`,
@@ -358,9 +431,15 @@ export function isAcceptedImageType(type: string | undefined): boolean {
   return ACCEPTED_IMAGE_TYPES.includes((type ?? "") as (typeof ACCEPTED_IMAGE_TYPES)[number]);
 }
 
+/** The server's upload cap. Checked up front so a huge file fails before the upload. */
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
 /**
- * Upload an image picked on-device. The server reads the bytes, dedupes them by
- * sha256, and answers with an id that the turn refers to.
+ * Upload an image or a document picked on-device. The server reads the bytes,
+ * dedupes them by sha256, and answers with an id that the turn refers to.
+ * Images must be one of `ACCEPTED_IMAGE_TYPES`; anything else is treated as a
+ * document, which the server accepts when it is text, code or a PDF with
+ * extractable text.
  *
  * `content-type` is deliberately *not* set: React Native's `FormData` knows the
  * part's own type, and setting the header by hand would drop the multipart
@@ -371,18 +450,26 @@ export async function uploadAttachment(file: {
   name: string;
   type: string;
 }): Promise<AttachmentRecord> {
-  if (!isAcceptedImageType(file.type)) {
+  if (file.type.startsWith("image/") && !isAcceptedImageType(file.type)) {
     // Caught here rather than as a 415 round trip, so the message can say what
     // to do about it.
     throw new Error(
-      `${file.name} is ${file.type || "an unrecognised type"}. The server accepts PNG, JPEG, GIF, and WebP — re-share the photo as JPEG.`,
+      `${file.name} is ${file.type}. The server accepts PNG, JPEG, GIF, and WebP — re-share the photo as JPEG.`,
     );
   }
   const form = new FormData();
   form.append("file", file as unknown as Blob);
   const res = await authFetch("/api/attachments", { method: "POST", body: form });
-  if (res.status === 415) throw new Error("The server rejected that image format.");
-  if (!res.ok) throw new HttpError(res.status, "/api/attachments");
+  if (!res.ok) {
+    // 413 / 415 / 422 carry a sentence worth showing ("this PDF has no
+    // extractable text", "binary files are not supported").
+    const reason = await res
+      .json()
+      .then((body: { error?: unknown }) => (typeof body.error === "string" ? body.error : ""))
+      .catch(() => "");
+    if (reason) throw new Error(`${file.name}: ${reason}`);
+    throw new HttpError(res.status, "/api/attachments");
+  }
   return (await res.json()).attachment as AttachmentRecord;
 }
 
@@ -511,17 +598,40 @@ export async function cancelTurn(sessionId: string): Promise<void> {
   await sendJson(`/api/sessions/${encodeURIComponent(sessionId)}/turn/cancel`, "POST");
 }
 
+/**
+ * Send a user message and stream the turn. `attachmentNames` carries each
+ * document's file name by id: the server stores content by hash, so a
+ * deduplicated upload would otherwise show the name it was first uploaded as.
+ */
 export function sendTurn(
   sessionId: string,
   text: string,
   model: string,
-  attachmentIds: string[],
+  attachments: { ids: string[]; names: Record<string, string> },
   onEvent: (event: KernelEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   return postSSE(
     `/api/sessions/${encodeURIComponent(sessionId)}/turn`,
-    { text, model, attachmentIds },
+    { text, model, attachmentIds: attachments.ids, attachmentNames: attachments.names },
+    onEvent,
+    signal,
+  );
+}
+
+/**
+ * Continue a reply that was cut off at the output limit. The server sends a
+ * hidden "continue" message on the user's behalf and streams the rest as a
+ * normal turn.
+ */
+export function continueTurn(
+  sessionId: string,
+  onEvent: (event: KernelEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return postSSE(
+    `/api/sessions/${encodeURIComponent(sessionId)}/continue`,
+    {},
     onEvent,
     signal,
   );

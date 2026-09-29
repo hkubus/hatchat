@@ -72,7 +72,14 @@ export default function SettingsHomeScreen({
     .filter(Boolean)
     .join(" ");
 
-  const providersSet = data?.providers.filter((p) => p.configured).length ?? 0;
+  const tuned = [
+    chat.session?.instructions ? "instructions" : null,
+    chat.session?.temperature != null ? "temperature" : null,
+    chat.session?.maxTokens != null ? "max tokens" : null,
+  ].filter(Boolean).length;
+  const tuningSummary = tuned === 0 ? "Default" : tuned === 1 ? "1 set" : `${tuned} set`;
+
+  const providersSet =data?.providers.filter((p) => p.configured).length ?? 0;
   const pluginIssues =
     data?.plugins.filter((p) => p.status === "error" || p.status === "needs-config").length ?? 0;
   const runnersOnline = data?.runners.length ?? 0;
@@ -99,6 +106,14 @@ export default function SettingsHomeScreen({
           value={chat.policyMode}
           options={POLICIES}
           onChange={chat.setPolicyMode}
+        />
+        <ListRow
+          title="Instructions & Sampling"
+          icon="text.bubble.fill"
+          iconColor={TILE.orange}
+          value={tuningSummary}
+          accessory="chevron"
+          onPress={() => navigation.navigate("Conversation")}
         />
         {chat.policyMode === "allowlist" ? (
           <ListRow

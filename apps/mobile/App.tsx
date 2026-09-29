@@ -40,6 +40,7 @@ import type { HatConfig } from "./src/runtime";
 import { clearConfig, loadConfig } from "./src/runtime";
 import ChatScreen from "./src/screens/ChatScreen";
 import ConnectScreen from "./src/screens/ConnectScreen";
+import ConversationScreen from "./src/screens/ConversationScreen";
 import ModelScreen from "./src/screens/ModelScreen";
 import SessionsScreen from "./src/screens/SessionsScreen";
 import SettingsNavigator from "./src/screens/settings/SettingsNavigator";
@@ -178,6 +179,17 @@ function Shell({ onDisconnect }: { onDisconnect: () => Promise<void> }) {
               title: "Model",
               presentation: "pageSheet",
               headerTransparent: false,
+              headerStyle: { backgroundColor: theme.color.grouped },
+            }}
+          />
+          <Stack.Screen
+            name="Conversation"
+            component={ConversationScreen}
+            options={{
+              title: "Conversation",
+              presentation: "pageSheet",
+              headerTransparent: false,
+              headerShadowVisible: false,
               headerStyle: { backgroundColor: theme.color.grouped },
             }}
           />

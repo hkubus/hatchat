@@ -30,6 +30,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -45,13 +46,15 @@ import { useHeaderHeight } from "@react-navigation/elements";
 import { KeyboardChatScrollView, KeyboardStickyView } from "react-native-keyboard-controller";
 import { useSharedValue } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import type { ApprovalMode, ReasoningEffort } from "@hat/core";
 import { usageTotal } from "@hat/core";
-import { isAcceptedImageType } from "../api";
+import * as api from "../api";
+import { isAcceptedImageType, MAX_UPLOAD_BYTES } from "../api";
 import { capSummary } from "../capTags";
 import type { UiMessage, UiTool } from "@hat/core";
-import { toolSummary } from "@hat/core";
+import { formatBytes, toolSummary } from "@hat/core";
 import { Glass, GlassGroup } from "../Glass";
 import * as haptics from "../haptics";
 import { useChatStore } from "../navigation";
@@ -88,6 +91,13 @@ const POLICIES: { value: ApprovalMode; label: string; description: string }[] = 
 
 type ScrollRef = { scrollToEnd?: (options: { animated: boolean }) => void };
 
+/** At or above this share of the context window, the readout turns orange. */
+const CONTEXT_WARN = 0.8;
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** The first tool call in the turn that is waiting on the user. */
 function pendingApproval(messages: UiMessage[]): UiTool | undefined {
   for (const message of messages) {
@@ -105,6 +115,10 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
   const headerHeight = useHeaderHeight();
   const listRef = useRef<FlatList<UiMessage>>(null);
   const stickToBottom = useRef(true);
+  // The latest store, for callbacks that must stay stable across renders (row
+  // actions, bar items) without capturing a stale one.
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
 
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -200,6 +214,7 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
             name: asset.fileName ?? `image-${Date.now()}.jpg`,
             type: asset.mimeType ?? "image/jpeg",
             previewUri: asset.uri,
+            kind: "image" as const,
           })),
         ]);
       }
@@ -229,6 +244,58 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
       setPicking(false);
     }
   }, [addAssets]);
+
+  /**
+   * Documents from Files: text, code and PDFs, which the server reads as text
+   * for the model. An image picked here is sent as an image, same as from the
+   * library. The server decides what it can read (a scanned PDF or a binary
+   * file comes back with a reason), so only size and image format are
+   * checked up front.
+   */
+  const pickDocuments = useCallback(async () => {
+    setPicking(true);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "*/*",
+        multiple: true,
+        // The upload reads the file from the app's cache; a security-scoped
+        // URL from another provider may not stay readable that long.
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) return;
+
+      const accepted: PendingAttachment[] = [];
+      const problems: string[] = [];
+      for (const asset of result.assets) {
+        const type = asset.mimeType || "application/octet-stream";
+        const image = type.startsWith("image/");
+        if (asset.size !== undefined && asset.size > MAX_UPLOAD_BYTES) {
+          problems.push(`${asset.name} is larger than the server's 25 MB limit.`);
+        } else if (image && !isAcceptedImageType(type)) {
+          problems.push(`${asset.name} is ${type}; the server accepts PNG, JPEG, GIF, and WebP images.`);
+        } else {
+          accepted.push({
+            uri: asset.uri,
+            name: asset.name,
+            type,
+            previewUri: asset.uri,
+            kind: image ? "image" : "document",
+            size: asset.size,
+          });
+        }
+      }
+
+      if (problems.length > 0) chat.reportError(problems.join(" "));
+      if (accepted.length > 0) {
+        haptics.tap();
+        setAttachments((prev) => [...prev, ...accepted]);
+      }
+    } catch (e) {
+      chat.reportError(`Could not open the file: ${describe(e)}`);
+    } finally {
+      setPicking(false);
+    }
+  }, [chat.reportError]);
 
   const takePhoto = useCallback(async () => {
     setPicking(true);
@@ -285,14 +352,39 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
 
   // The bar is rebuilt from these fields only. Depending on the whole store
   // would rebuild the native menu on every streamed token.
-  const { reasoningEffort, policyMode, setEffort, setPolicyMode, newChat, sessionUsage } = chat;
+  const { reasoningEffort, policyMode, setEffort, setPolicyMode, newChat, sessionUsage, contextUsage } =
+    chat;
+  const canExport = Boolean(chat.sessionId) && chat.messages.length > 0;
+
+  // Context fill, beside the model name: how much of the window the next call
+  // starts from. Quiet until it matters, then orange.
+  const contextPercent = contextUsage ? Math.round(contextUsage.fraction * 100) : undefined;
+  const contextHigh = (contextUsage?.fraction ?? 0) >= CONTEXT_WARN;
+  const contextLabel = contextUsage
+    ? `${formatTokens(contextUsage.tokens)} of ${formatTokens(contextUsage.window)} context`
+    : "";
+
+  const exportMarkdown = useCallback(async () => {
+    const id = chatRef.current.sessionId;
+    if (!id) return;
+    try {
+      const markdown = await api.exportMarkdown(id);
+      // `message` rather than a file: the share sheet offers Copy, Notes,
+      // Mail and Save to Files for plain text without a file-system module.
+      await Share.share({ message: markdown, title: chatRef.current.session?.title });
+    } catch (e) {
+      chatRef.current.reportError(`Could not export: ${describe(e)}`);
+    }
+  }, []);
 
   useLayoutEffect(() => {
     navigation.setOptions({
       headerTitle: () => (
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`${sessionTitle}. Model: ${modelLabel}. Change model`}
+          accessibilityLabel={`${sessionTitle}. Model: ${modelLabel}.${
+            contextPercent !== undefined ? ` Context ${contextPercent} percent full.` : ""
+          } Change model`}
           onPress={() => navigation.navigate("Model")}
           hitSlop={8}
           style={({ pressed }) => [styles.title, pressed && { opacity: 0.5 }]}
@@ -312,6 +404,19 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
             >
               {modelLabel}
             </Text>
+            {contextPercent !== undefined ? (
+              <Text
+                style={[
+                  styles.subtitleFill,
+                  { color: contextHigh ? theme.color.warn : theme.color.textFaint },
+                ]}
+                numberOfLines={1}
+                maxFontSizeMultiplier={1.3}
+                accessibilityLabel={`Context ${contextPercent} percent full`}
+              >
+                · {contextPercent}%
+              </Text>
+            ) : null}
             <Icon name="chevron.down" size={9} weight="bold" color={theme.color.textDim} />
           </View>
         </Pressable>
@@ -365,6 +470,22 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
                 onPress: () => navigation.navigate("Model"),
               },
               {
+                type: "action",
+                label: "Instructions & Sampling…",
+                icon: { type: "sfSymbol", name: "slider.horizontal.3" },
+                onPress: () => navigation.navigate("Conversation"),
+              },
+              ...(canExport
+                ? [
+                    {
+                      type: "action" as const,
+                      label: "Export as Markdown…",
+                      icon: { type: "sfSymbol" as const, name: "square.and.arrow.up" as const },
+                      onPress: () => void exportMarkdown(),
+                    },
+                  ]
+                : []),
+              {
                 type: "submenu",
                 label: "Usage",
                 inline: true,
@@ -377,6 +498,18 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
                     disabled: true,
                     onPress: () => undefined,
                   },
+                  ...(contextPercent !== undefined
+                    ? [
+                        {
+                          type: "action" as const,
+                          label: `Context ${contextPercent}% full`,
+                          description: contextLabel,
+                          icon: { type: "sfSymbol" as const, name: "gauge.with.dots.needle.33percent" as const },
+                          disabled: true,
+                          onPress: () => undefined,
+                        },
+                      ]
+                    : []),
                 ],
               },
             ],
@@ -407,14 +540,17 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
     supportsEffort,
     capabilities,
     sessionTokens,
+    canExport,
+    exportMarkdown,
+    contextPercent,
+    contextHigh,
+    contextLabel,
   ]);
 
   // --- transcript ----------------------------------------------------------
   // Row callbacks are stable across renders so `memo(MessageRow)` holds: a
   // streamed token re-renders only the message it lands in. The latest store
-  // is read through a ref instead of being captured.
-  const chatRef = useRef(chat);
-  chatRef.current = chat;
+  // is read through `chatRef` instead of being captured.
 
   const onEdit = useCallback((messageId: string) => {
     setEditingId(messageId);
@@ -437,6 +573,22 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
     haptics.tap();
     void chatRef.current.answer(callId, answer);
   }, []);
+  const onContinue = useCallback(() => {
+    haptics.tap();
+    stickToBottom.current = true;
+    void chatRef.current.continueReply();
+  }, []);
+  const onFork = useCallback((messageId: string) => {
+    // The chat screen shows whichever conversation the store has open, so
+    // switching the store to the fork is what opens it.
+    chatRef.current.forkAt(messageId).then(
+      () => {
+        haptics.success();
+        stickToBottom.current = true;
+      },
+      (e: unknown) => chatRef.current.reportError(`Could not fork: ${describe(e)}`),
+    );
+  }, []);
 
   const renderItem = useCallback(
     ({ item }: { item: UiMessage }) => (
@@ -445,6 +597,7 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
         streaming={item.streaming === true}
         onRegenerate={onRegenerate}
         onEdit={onEdit}
+        onFork={onFork}
         onSwitchBranch={onSwitchBranch}
         onDecide={onDecide}
         onAnswer={onAnswer}
@@ -453,7 +606,7 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
         busy={chat.busy}
       />
     ),
-    [chat.busy, onRegenerate, onEdit, onSwitchBranch, onDecide, onAnswer],
+    [chat.busy, onRegenerate, onEdit, onFork, onSwitchBranch, onDecide, onAnswer],
   );
 
   const renderScrollComponent = useCallback(
@@ -508,7 +661,7 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
           chat.ready ? (
             <Empty
               title="Start a Conversation"
-              detail="Ask something, or attach an image for a vision-capable model."
+              detail="Ask something, or attach a document, or an image for a vision-capable model."
             />
           ) : (
             <ActivityIndicator color={theme.color.textFaint} />
@@ -516,6 +669,16 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
         }
         ListFooterComponent={
           <View style={styles.footer}>
+            {/* Directly under the reply it would extend, and only once nothing
+                is running: the continuation streams in as a normal turn. */}
+            {chat.canContinue ? (
+              <View style={styles.continueRow}>
+                <Text style={[styles.continueNote, { color: theme.color.textDim }]}>
+                  The reply stopped at the length limit.
+                </Text>
+                <Button label="Continue" compact onPress={onContinue} />
+              </View>
+            ) : null}
             {chat.error ? (
               <Banner tone="error" title="Something went wrong" detail={chat.error} onDismiss={chat.clearError} />
             ) : null}
@@ -619,12 +782,35 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
               keyboardShouldPersistTaps="handled"
             >
               {attachments.map((attachment) => (
-                <View key={attachment.uri} style={styles.thumbWrap}>
-                  <Image
-                    source={{ uri: attachment.previewUri }}
-                    style={[styles.thumb, { backgroundColor: theme.color.surfaceAlt }]}
-                    accessibilityLabel={attachment.name}
-                  />
+                <View
+                  key={attachment.uri}
+                  style={attachment.kind === "document" ? styles.docWrap : styles.thumbWrap}
+                >
+                  {attachment.kind === "document" ? (
+                    <Glass style={styles.doc}>
+                      <Icon name="doc" size={18} color={theme.color.textDim} />
+                      <View style={styles.flex}>
+                        <Text
+                          style={[styles.docName, { color: theme.color.text }]}
+                          numberOfLines={2}
+                          accessibilityLabel={`Document ${attachment.name}`}
+                        >
+                          {attachment.name}
+                        </Text>
+                        {attachment.size ? (
+                          <Text style={[styles.docMeta, { color: theme.color.textDim }]} numberOfLines={1}>
+                            {formatBytes(attachment.size)}
+                          </Text>
+                        ) : null}
+                      </View>
+                    </Glass>
+                  ) : (
+                    <Image
+                      source={{ uri: attachment.previewUri }}
+                      style={[styles.thumb, { backgroundColor: theme.color.surfaceAlt }]}
+                      accessibilityLabel={attachment.name}
+                    />
+                  )}
                   <Pressable
                     accessibilityRole="button"
                     accessibilityLabel={`Remove ${attachment.name}`}
@@ -664,13 +850,20 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
                       icon: "photo.on.rectangle",
                       onPress: () => void pickImages(),
                     },
+                    {
+                      id: "files",
+                      title: "Choose File",
+                      subtitle: "Text, code or PDF",
+                      icon: "doc",
+                      onPress: () => void pickDocuments(),
+                    },
                   ]}
                 >
                   <View
                     style={styles.fill}
                     accessible
                     accessibilityRole="button"
-                    accessibilityLabel="Attach a photo"
+                    accessibilityLabel="Attach a photo or file"
                   >
                     {picking ? (
                       <ActivityIndicator size="small" color={theme.color.textDim} />
@@ -740,11 +933,14 @@ const styles = StyleSheet.create({
   list: { paddingHorizontal: 16, gap: 14 },
   listEmpty: { flexGrow: 1, justifyContent: "center" },
   footer: { gap: 8, paddingTop: 8 },
+  continueRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 2 },
+  continueNote: { flex: 1, fontSize: 13 },
 
   title: { alignItems: "center", maxWidth: 240 },
   titleText: { fontSize: 17, fontWeight: "600", letterSpacing: -0.4 },
   subtitleRow: { flexDirection: "row", alignItems: "center", gap: 3 },
   subtitleText: { fontSize: 12, fontWeight: "500", flexShrink: 1 },
+  subtitleFill: { fontSize: 12, fontWeight: "500", fontVariant: ["tabular-nums"] },
 
   composerDock: { position: "absolute", left: 0, right: 0, bottom: 0 },
   composer: { paddingHorizontal: 12, paddingTop: 8, gap: 8 },
@@ -764,6 +960,17 @@ const styles = StyleSheet.create({
   tray: { gap: 8, paddingTop: 6, paddingRight: 6 },
   thumbWrap: { width: 64, height: 64 },
   thumb: { width: 64, height: 64, borderRadius: 14 },
+  docWrap: { width: 176, height: 64 },
+  doc: {
+    flex: 1,
+    borderRadius: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+  },
+  docName: { fontSize: 13, fontWeight: "600" },
+  docMeta: { fontSize: 12 },
   thumbRemove: { position: "absolute", top: -6, right: -6 },
   thumbRemoveGlass: {
     width: 22,
