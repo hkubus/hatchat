@@ -1,14 +1,14 @@
 /**
  * Design tokens.
  *
- * The web app styles itself with a `styles.css` of custom properties. React
- * Native has no cascade and no `prefers-color-scheme` media query in the same
- * form, so the palette is resolved once here from the OS appearance and handed
- * to the styles as plain objects.
+ * iOS-native system palette. Colours are the iOS system colours
+ * (systemBackground, systemGroupedBackground, separator, systemBlue, …)
+ * resolved once here from the OS appearance, so every screen reads as a
+ * first-party iOS app in both light and dark mode.
  *
- * Colours are deliberately close to the web app's so the two clients read as
- * one product, but the radii and spacing are tuned for touch: nothing tappable
- * is under 44pt, and the type scale starts a step larger.
+ * Type scale and radii follow the Human Interface Guidelines: 17pt body,
+ * 15pt subhead, 13pt footnote, 10–12pt continuous corners, 44pt minimum
+ * touch targets.
  */
 
 import { useColorScheme } from "react-native";
@@ -16,28 +16,42 @@ import { useColorScheme } from "react-native";
 export interface Theme {
   dark: boolean;
   color: {
-    /** Screen background, behind everything. */
+    /** Detail background — `systemBackground`. White / black. */
     bg: string;
-    /** Cards, tool results, list rows. */
+    /** Grouped background — `systemGroupedBackground`. Sidebar, settings. */
+    grouped: string;
+    /** Cells, cards, sheets — `secondarySystemGroupedBackground`. */
     surface: string;
+    /** Fills: text-field + segmented backgrounds — `systemGray5/6`. */
     surfaceAlt: string;
+    /** Tracks, pressed states — `systemGray4/5`. */
+    fill: string;
     border: string;
+    /** `separator`. */
+    separator: string;
+    /** `label`. */
     text: string;
+    /** `secondaryLabel`. */
     textDim: string;
+    /** `tertiaryLabel`. */
     textFaint: string;
-    /** Bubbles for the user's own messages. */
+    /** iMessage blue, both appearances. */
     userBubble: string;
     userBubbleText: string;
+    /** Incoming-message grey. */
     assistantBubble: string;
+    /** `systemBlue`. */
     accent: string;
     accentText: string;
-    /** Approval prompt. */
+    /** Approval prompt — `systemOrange`. */
     warn: string;
     warnSurface: string;
+    /** `systemRed`. */
     danger: string;
     dangerSurface: string;
+    /** `systemGreen`. */
     success: string;
-    /** Hairline used to separate the composer from the transcript. */
+    /** Hairline used to separate chrome from content — `separator`. */
     hairline: string;
     /** Translucent fill laid over the glass chrome. */
     glassTint: string;
@@ -59,53 +73,59 @@ const MONO =
   'ui-monospace, "SF Mono", Menlo, monospace';
 
 const light: Theme["color"] = {
-  bg: "#f6f6f7",
+  bg: "#ffffff",
+  grouped: "#f2f2f7",
   surface: "#ffffff",
-  surfaceAlt: "#f0f0f2",
-  border: "#e0e0e4",
-  text: "#16161a",
-  textDim: "#5c5c66",
-  textFaint: "#8e8e98",
-  userBubble: "#16161a",
+  surfaceAlt: "#f2f2f7",
+  fill: "#e9e9eb",
+  border: "#e5e5ea",
+  separator: "#e5e5ea",
+  text: "#000000",
+  textDim: "#636366",
+  textFaint: "#8e8e93",
+  userBubble: "#007aff",
   userBubbleText: "#ffffff",
-  assistantBubble: "#ffffff",
-  accent: "#0a58d6",
+  assistantBubble: "#e9e9eb",
+  accent: "#007aff",
   accentText: "#ffffff",
-  warn: "#8a5a00",
-  warnSurface: "#fff4d6",
-  danger: "#b3261e",
-  dangerSurface: "#fce8e6",
-  success: "#1c7a4a",
-  hairline: "#e6e6ea",
+  warn: "#ff9500",
+  warnSurface: "#fff4e0",
+  danger: "#ff3b30",
+  dangerSurface: "#fee9e7",
+  success: "#248a3d",
+  hairline: "#e5e5ea",
   glassTint: "rgba(255,255,255,0.72)",
 };
 
 const dark: Theme["color"] = {
-  bg: "#0b0b0d",
-  surface: "#17171a",
-  surfaceAlt: "#202024",
-  border: "#2c2c33",
-  text: "#f2f2f5",
-  textDim: "#a5a5b0",
-  textFaint: "#74747f",
-  userBubble: "#f2f2f5",
-  userBubbleText: "#0b0b0d",
-  assistantBubble: "#17171a",
-  accent: "#4c94ff",
-  accentText: "#06121f",
-  warn: "#e8b64c",
-  warnSurface: "#33280c",
-  danger: "#ff6b6b",
+  bg: "#000000",
+  grouped: "#000000",
+  surface: "#1c1c1e",
+  surfaceAlt: "#2c2c2e",
+  fill: "#48484a",
+  border: "#38383a",
+  separator: "#38383a",
+  text: "#ffffff",
+  textDim: "#98989d",
+  textFaint: "#636366",
+  userBubble: "#0a84ff",
+  userBubbleText: "#ffffff",
+  assistantBubble: "#262629",
+  accent: "#0a84ff",
+  accentText: "#ffffff",
+  warn: "#ff9f0a",
+  warnSurface: "#33270a",
+  danger: "#ff453a",
   dangerSurface: "#3a1a1a",
-  success: "#4ec98a",
-  hairline: "#26262c",
-  glassTint: "rgba(22,22,26,0.72)",
+  success: "#30d158",
+  hairline: "#38383a",
+  glassTint: "rgba(28,28,30,0.72)",
 };
 
 const base = {
   space: (n: number) => n * 4,
-  radius: { sm: 8, md: 12, lg: 20, pill: 999 },
-  font: { body: 16, small: 14, tiny: 12, title: 20, mono: MONO },
+  radius: { sm: 10, md: 12, lg: 16, pill: 999 },
+  font: { body: 17, small: 15, tiny: 13, title: 22, mono: MONO },
 };
 
 export const lightTheme: Theme = { dark: false, color: light, ...base };

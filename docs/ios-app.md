@@ -13,16 +13,11 @@ secrets, plugin configuration, approvals — lives on the server.
 
 ```
 apps/mobile/
-  App.tsx                     shell: connect gate + three tabs
+  App.tsx                     shell: connect gate + native stack navigator
   index.ts                    Expo entry point
   app.json                    native config (bundle id, permissions, plugins)
   eas.json                    EAS build profiles
   metro.config.js             monorepo resolution (read this one)
-  modules/liquid-glass/       local Expo module: real UIGlassEffect
-    ios/LiquidGlassModule.swift
-    ios/LiquidGlassModule.podspec
-    expo-module.config.json
-    index.ts                  JS binding
   src/
     api.ts                    typed HTTP + SSE client
     runtime.ts                connection config in the keychain
@@ -30,10 +25,14 @@ apps/mobile/
     chat.test.ts
     useChat.ts                chat state machine
     theme.ts                  colour + type tokens
-    Glass.tsx                 glass with an expo-blur fallback
+    navigation.ts             route types + chat-store context
+    Glass.tsx                 Liquid Glass with an expo-blur fallback
+    haptics.ts                haptic feedback, named by intent
     tokens.ts / capTags.ts    formatting helpers
-    screens/                  Connect, Chat, Sessions, Settings
-    ui/                       controls, Markdown, MessageRow, ModelPickerBar
+    screens/                  Connect, Sessions, Chat, Model
+      settings/               the Settings sheet: its own nested stack
+    ui/                       controls, List, Menu, Icon (SF Symbols),
+                              barItems, Sheets, Markdown, MessageRow
 ```
 
 ## Running it
@@ -55,8 +54,9 @@ HAT_HOST=0.0.0.0 HAT_AUTH_TOKEN=$(openssl rand -hex 32) pnpm dev:server
 app is a bearer client with no cookies. Put the server on Tailscale or behind
 TLS rather than exposing it — see "Transport" below.
 
-The local `liquid-glass` module is native code, so it only exists in a **dev
-build**, not in Expo Go. `expo-dev-client` is already a devDependency:
+Liquid Glass only renders in a binary built with the **iOS 26 SDK** (Xcode 26)
+and running on iOS 26. To check that, use a **dev build** built with Xcode 26.
+`expo-dev-client` is already a devDependency:
 
 ```sh
 cd apps/mobile
@@ -64,6 +64,43 @@ npx expo run:ios                      # builds and launches a dev client
 npx expo prebuild --platform ios --clean
 npx expo run:ios --device             # physical device
 ```
+
+## Shipping JavaScript without a build
+
+Builds are the scarce resource (EAS quota, or the free-Apple-ID sideload
+cycle), so the app ships with `expo-updates`. After one build that contains
+it, any change that is only JavaScript or assets reaches installed apps
+over the air. You don't need to rebuild for it.
+
+One-time setup, **before the next build**. Without the update URL,
+`expo-updates` is compiled in but disabled, and that build can never receive
+an update:
+
+```sh
+cd apps/mobile
+eas login
+eas update:configure     # writes expo.updates.url and the project id into app.json
+```
+
+The `ios-ipa` workflow refuses to build while `expo.updates.url` is missing.
+
+Publishing an update:
+
+```sh
+cd apps/mobile
+eas update --channel production --message "what changed"
+```
+
+The app checks on launch and applies the update on the *next* launch
+(`fallbackToCacheTimeout: 0`, so startup never waits on the network).
+`app.json` pins the channel through `updates.requestHeaders`, because the
+GitHub-built IPA is not built by EAS and so gets no channel from `eas.json`.
+
+`runtimeVersion` uses the `appVersion` policy: an update only applies to
+binaries with the same `version`. **Bump `version` in `app.json` whenever
+native code changes** (a new native dependency, a config plugin, `app.json`
+native settings). Then build once. Otherwise an update could be sent to a
+binary that lacks the native code it expects.
 
 ## Three things that are not obvious
 
@@ -126,11 +163,15 @@ and returns to the connect screen instead of failing on each screen in turn.
 
 - **Connect** — server URL + token, probed against `GET /api/health` before
   being saved, so a typo fails immediately and specifically.
-- **Chat** — streaming transcript, markdown, tool cards with inline
-  approve/deny, reasoning behind a disclosure, branch navigation (`‹ n/m ›`),
-  regenerate, edit-and-resend, image attachments, stop mid-turn.
-- **Chats** — the session list, with in-place rename and a two-step delete.
-- **Settings** — tool policy, provider keys, plugins, runners, connection.
+- **Chats** — the root: sessions grouped by date, search, swipe or
+  long-press to rename or delete (delete is confirmed).
+- **Chat** — streaming transcript, markdown, collapsible tool cards and
+  reasoning, approvals at the composer, branch navigation (`‹ n/m ›`),
+  regenerate, edit-and-resend, camera and library attachments, stop mid-turn.
+- **Model** — a sheet, grouped by provider, with search.
+- **Settings** — a sheet with its own stack: conversation (reasoning, tool
+  approval, allowlist), then Providers, Plugins, Runners and Server, each
+  pushing its detail screen.
 
 ### The state machine
 
@@ -181,28 +222,75 @@ specifically: `expo-image-picker` returns HEIC for most camera-roll photos. The
 picker filters against `isAcceptedImageType` and says so before the upload,
 rather than failing with a 415 after the user has composed a message.
 
-## Liquid Glass
+## Native chrome and Liquid Glass
 
-`modules/liquid-glass` is a local Expo module exposing a view whose backing is
-`UIGlassEffect` on iOS 26+ and `UIBlurEffect(.systemMaterial)` below that.
+The app uses the system's own chrome wherever there is one, rather than drawing
+a lookalike:
 
-`src/Glass.tsx` picks between it and a plain `expo-blur` pane. The availability
-probe has to be `requireOptionalNativeModule`, checked *before*
-`requireNativeViewManager`: the latter does not fail when a view is
-unregistered, it returns a host component pointing at a view that does not
-exist, which renders as a red box rather than falling back.
+- **Navigation is a native stack** (`@react-navigation/native-stack` on
+  `react-native-screens`, i.e. `UINavigationController`). The layout matches
+  Messages: the conversation list is the root, with a large title and the
+  system search field. The conversation is pushed on top. Settings and the
+  model picker are page sheets. Bars are transparent over scrolling content,
+  so on iOS 26 the system draws the scroll-edge effect. Below iOS 26 they use
+  the `systemChromeMaterial` blur.
+- **Bar buttons are `UIBarButtonItem`s** (`src/ui/barItems.tsx`), with SF
+  Symbol icons and native pull-down `UIMenu`s. The conversation's options
+  (reasoning effort, tool approval, usage) are one such menu. On iOS 26 the
+  system puts these items in its grouped glass capsules. `unstable_header*Items`
+  is iOS-only, so every item also renders as a plain button on web and Android.
+  A menu falls back to opening Settings, which has the same controls.
+- **Icons are SF Symbols** via `expo-symbols` (`src/ui/Icon.tsx`), with a text
+  stand-in off iOS.
+- **Menus are `UIMenu`s** (`src/ui/Menu.tsx` over `@react-native-menu/menu`).
+  Long-pressing a message or a conversation opens the system context menu.
+  Messages offer Copy, Select Text, Share and Edit or Regenerate; a
+  conversation offers Rename and Delete. The composer's "+" is a pull-down
+  with Camera and Photo Library. The Settings pickers are pop-up buttons.
+- **Conversations swipe** (`ReanimatedSwipeable`) to reveal Rename and
+  Delete, as in Mail. Delete is always confirmed in a destructive alert.
+- **The keyboard is tracked frame by frame** with
+  `react-native-keyboard-controller`. The composer is pinned to the keyboard
+  through interactive dismissal, and the transcript's inset grows with it.
+  Insets are owned explicitly (header on top, composer plus keyboard as a real
+  `contentInset` below) so that the *native* `scrollToEnd` lands on the last
+  message. FlatList's JS `scrollToEnd` ignores insets.
+- **Haptics** (`src/haptics.ts`) mark send, selection changes, a tool asking
+  for approval, a reply finishing, and failures.
 
-Real Liquid Glass needs the **iOS 26 SDK** (Xcode 26). The Swift `#available`
-guard keeps the module compiling against older SDKs, where it just never takes
-the iOS 26 branch.
+Liquid Glass drawn in JS (`src/Glass.tsx`, over `expo-glass-effect`) is limited
+to the controls that float over content, which is where the HIG puts it. That
+means the composer (an attach button and the input capsule, merged by
+`GlassContainer`), the tool-approval and edit panels above it, attachment
+thumbnails, the jump-to-latest button, and the image viewer's buttons. Content stays solid: message bubbles, tool cards, settings rows, and
+the connect form.
 
-### Known gap: the tab bar is not native
+`Glass.tsx` checks both `isLiquidGlassAvailable()` and
+`isGlassEffectAPIAvailable()`. Some iOS 26 betas shipped without the runtime
+API and crash if you use it. Everywhere else it renders an `expo-blur` pane
+with a tint, laid out as siblings behind the children so that the caller's
+layout style applies the same way in both paths. Settings shows which material
+is active.
 
-The tab bar in `App.tsx` is drawn in JS. A real `UITabBarController` gets the
-Liquid Glass treatment from the system for free, and a JS-drawn bar will never
-match it. Moving to Expo Router's native tabs is the open follow-up here; it is
-the one place this app knowingly trades the platform idiom for simplicity.
-Settings reports which material is active, so it is visible at runtime.
+## Transcript details
+
+- **Tool approvals surface at the composer.** A call waiting for approval
+  shows a glass Approve/Deny panel above the input, so it cannot be scrolled
+  out of reach, and the approval buttons on the tool card stay enabled for
+  the whole wait.
+- **Reasoning and tool output are collapsed** by default ("Thought process",
+  or the tool name with its status). Either can run to hundreds of lines.
+- **Code blocks scroll sideways** instead of wrapping, and have a Copy button.
+- **Streaming renders at about 12 fps.** Markdown is re-parsed on every render,
+  so rendering every token makes long replies stutter. Row callbacks are
+  stable, so a token re-renders only the message it lands in.
+- **Images** are thumbnails in the composer and open full-screen from the
+  transcript, with pinch to zoom.
+- **HEIC** is avoided at the source: the photo picker asks iOS for the
+  compatible (JPEG) representation. The type check stays as a backstop.
+- **Select Text** opens the message in a sheet with real selection handles. A
+  long press in the transcript opens the context menu, so selection can't live
+  there.
 
 ## Building
 
@@ -260,14 +348,16 @@ the protection app-wide.
 - **Offline / queued turns.** A turn needs a live stream, and the app has no
   retry: a send that fails on a dead connection surfaces as an error rather than
   being queued.
-- **Expo Router with native tabs**, for the system Liquid Glass tab bar (see
-  above). The JS tab bar wraps the native module, so it is translucent, but it
-  is not the system control.
+- **iPad split view.** iPad uses the same stack as iPhone; a sidebar split
+  (`UISplitViewController`) would suit the larger screen better.
+- **The app icon is Expo's template placeholder.** Dark and tinted variants are
+  generated from it (`assets/icon-dark.png`, `assets/icon-tinted.png`), but
+  real icon art — ideally an Icon Composer `.icon` for iOS 26 — is still to do.
 - **Syntax highlighting** in the transcript. `highlight.js` is ~1 MB of
   grammars, which is not worth the bundle on a phone; fenced blocks get a
   monospace surface instead.
 - **Android and web** are configured but unverified; only iOS was bundled.
-- **No device has run this.** Everything here has been typechecked, unit-tested,
-  and bundled, and the server contract is verified against `packages/server`
-  by hand — but no simulator or hardware pass has been done, so the Liquid Glass
-  path in particular is compile-time-guarded and unexercised.
+- **No device has run this.** Everything here has been typechecked,
+  unit-tested, bundled and prebuilt, and the server contract has been checked
+  against `packages/server` by hand. No simulator or hardware pass has been
+  done yet.

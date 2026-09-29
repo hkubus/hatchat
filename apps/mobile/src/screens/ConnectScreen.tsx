@@ -21,11 +21,13 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Glass, hasNativeGlass } from "../Glass";
+import { hasNativeGlass } from "../Glass";
+import * as haptics from "../haptics";
 import type { HatConfig } from "../runtime";
 import { normalizeServerUrl, probeConnection, saveConfig } from "../runtime";
 import { useTheme } from "../theme";
-import { Banner, Button, Field } from "../ui/controls";
+import { Banner, Button, Field, SECTION_RADIUS } from "../ui/controls";
+import Icon from "../ui/Icon";
 
 export default function ConnectScreen({ onConnected }: { onConnected: () => void }) {
   const theme = useTheme();
@@ -41,8 +43,10 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
       const config: HatConfig = { serverUrl, token };
       await probeConnection(config);
       await saveConfig(config);
+      haptics.success();
       onConnected();
     } catch (e) {
+      haptics.error();
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -52,7 +56,7 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
   const normalized = normalizeServerUrl(serverUrl);
 
   return (
-    <SafeAreaView style={[styles.root, { backgroundColor: theme.color.bg }]}>
+    <SafeAreaView style={[styles.root, { backgroundColor: theme.color.grouped }]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -63,17 +67,18 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
           keyboardDismissMode="interactive"
         >
           <View style={styles.hero}>
-            <Text style={[styles.wordmark, { color: theme.color.text }]}>hat</Text>
+            <View style={[styles.appIcon, { backgroundColor: theme.color.accent }]}>
+              <Icon name="server.rack" size={34} weight="medium" color={theme.color.accentText} />
+            </View>
+            <Text style={[styles.wordmark, { color: theme.color.text }]}>Connect to hat</Text>
             <Text style={[styles.tagline, { color: theme.color.textDim }]}>
-              Connect to your hat server to continue.
+              Enter the address of your hat server and its access token.
             </Text>
           </View>
 
-          <Glass
-            style={[styles.card, { borderColor: theme.color.border }]}
-            intensity={60}
-          >
-            <View style={styles.cardBody}>
+          {/* The form is content, not chrome, so it is a solid inset-grouped
+              card: Liquid Glass is for controls floating over content. */}
+          <View style={[styles.card, { backgroundColor: theme.color.surface }]}>
               <Field
                 label="Server URL"
                 value={serverUrl}
@@ -104,13 +109,12 @@ export default function ConnectScreen({ onConnected }: { onConnected: () => void
                 loading={busy}
                 disabled={!normalized}
               />
-            </View>
-          </Glass>
+          </View>
 
           <Text style={[styles.footnote, { color: theme.color.textFaint }]}>
             {hasNativeGlass()
               ? "Liquid Glass is active on this device."
-              : "Running without the native Liquid Glass module; chrome uses a material blur."}
+              : "Liquid Glass is unavailable here; chrome uses a material blur."}
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -127,10 +131,18 @@ const styles = StyleSheet.create({
     padding: 20,
     gap: 24,
   },
-  hero: { gap: 6 },
-  wordmark: { fontSize: 40, fontWeight: "800", letterSpacing: -1 },
-  tagline: { fontSize: 16, lineHeight: 22 },
-  card: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth },
-  cardBody: { padding: 20, gap: 18 },
+  hero: { gap: 8, alignItems: "center" },
+  appIcon: {
+    width: 72,
+    height: 72,
+    borderRadius: 18,
+    borderCurve: "continuous",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 8,
+  },
+  wordmark: { fontSize: 28, fontWeight: "700", letterSpacing: 0.3, textAlign: "center" },
+  tagline: { fontSize: 17, lineHeight: 22, textAlign: "center" },
+  card: { borderRadius: SECTION_RADIUS, padding: 16, gap: 18 },
   footnote: { fontSize: 12, textAlign: "center" },
 });

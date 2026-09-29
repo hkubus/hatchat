@@ -414,9 +414,10 @@ transpile it out of `node_modules` and rewrite the `.js` extensions its ESM-styl
 relative imports carry. If the app stops bundling, that file is the first thing
 to check.
 
-Real Liquid Glass comes from a local Expo module
-(`apps/mobile/modules/liquid-glass`) that uses `UIGlassEffect` on iOS 26 and
-falls back to `expo-blur` elsewhere, including in Expo Go.
+The chrome is native: a `react-native-screens` stack (large titles, system
+search, `UIBarButtonItem`s with SF Symbols and pull-down menus). The floating
+composer uses Liquid Glass through `expo-glass-effect` on iOS 26 and falls back
+to `expo-blur` elsewhere. See [docs/ios-app.md](docs/ios-app.md).
 
 EAS device builds need a paid Apple Developer account. For a free Apple ID,
 [`.github/workflows/ios-ipa.yml`](.github/workflows/ios-ipa.yml) builds an

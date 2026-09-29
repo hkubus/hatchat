@@ -9,44 +9,54 @@
  *   2. With no server URL, the user has never connected: show the connect
  *      screen. This is the same gate the desktop shell uses, and for the same
  *      reason — the app is a thin client that has to be pointed at a server.
- *   3. Otherwise mount the chat state machine and the three tabs.
+ *   3. Otherwise mount the chat state machine above a native stack navigator.
  *
- * The tab bar is drawn in JS rather than using a native tab controller. That is
- * the one place this app knowingly gives up automatic iOS 26 glass: a native
- * `UITabBarController` gets the Liquid Glass treatment from the system for
- * free, and moving this onto Expo Router's native tabs is the follow-up noted
- * in docs/ios-app.md. The `Glass` wrapper is used here so the bar still picks
- * up the real material wherever it does exist.
+ * The navigator is `react-native-screens`' native stack, i.e. a real
+ * `UINavigationController`. That is what makes the chrome native rather than a
+ * lookalike: large titles that collapse on scroll, the system search field,
+ * edge-swipe back, `UIBarButtonItem`s with SF Symbols and pull-down menus, and —
+ * built with the iOS 26 SDK — Liquid Glass bar buttons and the scroll-edge
+ * effect, with no code here to draw any of it.
+ *
+ * The layout is the one Messages and Mail use on iPhone: a list of
+ * conversations at the root, the conversation pushed on top, Settings and the
+ * model picker presented as sheets.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Platform, StyleSheet, View } from "react-native";
+import { DarkTheme, DefaultTheme, NavigationContainer } from "@react-navigation/native";
+import type { Theme as NavigationTheme } from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { KeyboardProvider } from "react-native-keyboard-controller";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { setUnauthorizedHandler } from "./src/api";
-import { Glass } from "./src/Glass";
+import { hasNativeGlass } from "./src/Glass";
+import { ChatContext } from "./src/navigation";
+import type { RootStackParamList } from "./src/navigation";
 import type { HatConfig } from "./src/runtime";
 import { clearConfig, loadConfig } from "./src/runtime";
 import ChatScreen from "./src/screens/ChatScreen";
 import ConnectScreen from "./src/screens/ConnectScreen";
+import ModelScreen from "./src/screens/ModelScreen";
 import SessionsScreen from "./src/screens/SessionsScreen";
-import SettingsScreen from "./src/screens/SettingsScreen";
+import SettingsNavigator from "./src/screens/settings/SettingsNavigator";
 import { useTheme } from "./src/theme";
 import { useChat } from "./src/useChat";
 
-type Tab = "chat" | "sessions" | "settings";
-
-const TABS: { id: Tab; label: string; glyph: string }[] = [
-  { id: "chat", label: "Chat", glyph: "💬" },
-  { id: "sessions", label: "Chats", glyph: "🗂" },
-  { id: "settings", label: "Settings", glyph: "⚙︎" },
-];
+const Stack = createNativeStackNavigator<RootStackParamList>();
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <Root />
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={styles.fill}>
+      <SafeAreaProvider>
+        <KeyboardProvider>
+          <Root />
+        </KeyboardProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
@@ -65,7 +75,7 @@ function Root() {
     // server's `HAT_AUTH_TOKEN` was rotated. Dropping the config returns the
     // user to the connect screen instead of letting every screen fail on its
     // own. Registered here, above the chat state, so it fires no matter which
-    // tab is mounted.
+    // screen is mounted.
     setUnauthorizedHandler(() => {
       void clearConfig().then(() => setGeneration((n) => n + 1));
     });
@@ -77,101 +87,107 @@ function Root() {
     setGeneration((n) => n + 1);
   }, []);
 
+  let body;
+  if (!config) {
+    body = (
+      <View style={[styles.boot, { backgroundColor: theme.color.grouped }]}>
+        <ActivityIndicator color={theme.color.textFaint} />
+      </View>
+    );
+  } else if (!config.serverUrl) {
+    body = <ConnectScreen onConnected={() => setGeneration((n) => n + 1)} />;
+  } else {
+    body = <Shell onDisconnect={disconnect} />;
+  }
+
   // Every screen sets its own background, so the status bar has to follow the
   // appearance or the clock and battery are unreadable in one of the two modes.
   return (
     <>
       <StatusBar style={theme.dark ? "light" : "dark"} />
-      <RootBody config={config} onDisconnect={disconnect} setGeneration={setGeneration} />
+      {body}
     </>
   );
-}
-
-function RootBody({
-  config,
-  onDisconnect,
-  setGeneration,
-}: {
-  config: HatConfig | null;
-  onDisconnect: () => Promise<void>;
-  setGeneration: (updater: (n: number) => number) => void;
-}) {
-  const theme = useTheme();
-
-  if (!config) {
-    return (
-      <View style={[styles.boot, { backgroundColor: theme.color.bg }]}>
-        <ActivityIndicator color={theme.color.textFaint} />
-      </View>
-    );
-  }
-
-  if (!config.serverUrl) {
-    return <ConnectScreen onConnected={() => setGeneration((n) => n + 1)} />;
-  }
-
-  return <Shell onDisconnect={onDisconnect} />;
 }
 
 function Shell({ onDisconnect }: { onDisconnect: () => Promise<void> }) {
   const theme = useTheme();
   const chat = useChat();
-  const [tab, setTab] = useState<Tab>("chat");
 
-  const openChat = useCallback(() => setTab("chat"), []);
+  const navigationTheme = useMemo<NavigationTheme>(() => {
+    const base = theme.dark ? DarkTheme : DefaultTheme;
+    return {
+      ...base,
+      colors: {
+        ...base.colors,
+        primary: theme.color.accent,
+        background: theme.color.grouped,
+        card: theme.color.bg,
+        text: theme.color.text,
+        border: theme.color.separator,
+      },
+    };
+  }, [theme]);
+
+  // On iOS the bar is transparent and the content scrolls underneath it. Below
+  // iOS 26 the system blur gives the classic translucent bar; on iOS 26 the
+  // system draws the scroll-edge effect itself, and a blur here would fight it.
+  const translucent = Platform.OS === "ios";
+  const barBlur = translucent && !hasNativeGlass() ? ("systemChromeMaterial" as const) : undefined;
 
   return (
-    <View style={[styles.root, { backgroundColor: theme.color.bg }]}>
-      <SafeAreaView style={styles.body} edges={["top", "left", "right"]}>
-        {tab === "chat" ? <ChatScreen chat={chat} /> : null}
-        {tab === "sessions" ? <SessionsScreen chat={chat} onOpenChat={openChat} /> : null}
-        {tab === "settings" ? <SettingsScreen chat={chat} onDisconnect={onDisconnect} /> : null}
-      </SafeAreaView>
-
-      <Glass style={[styles.tabBar, { borderTopColor: theme.color.hairline }]} intensity={70}>
-        {TABS.map((item) => {
-          const selected = item.id === tab;
-          return (
-            <Pressable
-              key={item.id}
-              accessibilityRole="tab"
-              accessibilityState={{ selected }}
-              accessibilityLabel={item.label}
-              onPress={() => setTab(item.id)}
-              style={styles.tab}
-            >
-              <Text style={[styles.glyph, selected && styles.glyphSelected]}>{item.glyph}</Text>
-              <Text
-                style={[
-                  styles.tabLabel,
-                  { color: selected ? theme.color.accent : theme.color.textFaint },
-                ]}
-              >
-                {item.label}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </Glass>
-    </View>
+    <ChatContext.Provider value={chat}>
+      <NavigationContainer theme={navigationTheme}>
+        <Stack.Navigator
+          initialRouteName="Chats"
+          screenOptions={{
+            headerTransparent: translucent,
+            headerBlurEffect: barBlur,
+            headerShadowVisible: false,
+            headerLargeTitleShadowVisible: false,
+            headerBackButtonDisplayMode: "minimal",
+            headerTintColor: theme.color.accent,
+            contentStyle: { backgroundColor: theme.color.grouped },
+          }}
+        >
+          <Stack.Screen
+            name="Chats"
+            component={SessionsScreen}
+            options={{ title: "Chats", headerLargeTitle: true }}
+          />
+          <Stack.Screen
+            name="Chat"
+            component={ChatScreen}
+            options={{ title: "", contentStyle: { backgroundColor: theme.color.bg } }}
+          />
+          <Stack.Screen
+            name="Settings"
+            options={{
+              presentation: "pageSheet",
+              // Settings is a stack of its own inside the sheet, so it can push
+              // detail screens; that inner stack draws the bars.
+              headerShown: false,
+            }}
+          >
+            {() => <SettingsNavigator onDisconnect={onDisconnect} />}
+          </Stack.Screen>
+          <Stack.Screen
+            name="Model"
+            component={ModelScreen}
+            options={{
+              title: "Model",
+              presentation: "pageSheet",
+              headerTransparent: false,
+              headerStyle: { backgroundColor: theme.color.grouped },
+            }}
+          />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </ChatContext.Provider>
   );
 }
 
 const styles = StyleSheet.create({
+  fill: { flex: 1 },
   boot: { flex: 1, alignItems: "center", justifyContent: "center" },
-  root: { flex: 1 },
-  body: { flex: 1 },
-  tabBar: { flexDirection: "row", borderTopWidth: StyleSheet.hairlineWidth },
-  tab: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 2,
-    paddingTop: 10,
-    paddingBottom: 6,
-    minHeight: 52,
-  },
-  glyph: { fontSize: 20, opacity: 0.55 },
-  glyphSelected: { opacity: 1 },
-  tabLabel: { fontSize: 11, fontWeight: "600" },
 });
