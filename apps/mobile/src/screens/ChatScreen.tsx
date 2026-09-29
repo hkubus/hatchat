@@ -1,9 +1,10 @@
 /**
- * The conversation: transcript above, composer below.
+ * The conversation: iOS navigation bar on top, transcript in the middle,
+ * Messages-style composer at the bottom.
  *
- * The composer deliberately lives outside the scrolling list. On a phone the
- * keyboard takes most of the screen, and a composer that scrolls away with the
- * transcript is unusable — you would be re-focusing it after every reply.
+ * The composer lives outside the scrolling list. On a phone the keyboard takes
+ * most of the screen, and a composer that scrolls away with the transcript is
+ * unusable — you would be re-focusing it after every reply.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,6 +14,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -23,17 +25,29 @@ import * as ImagePicker from "expo-image-picker";
 import { usageTotal } from "@hat/core";
 import { isAcceptedImageType } from "../api";
 import { capSummary, capTags } from "../capTags";
+import { Glass } from "../Glass";
 import { useTheme } from "../theme";
 import { formatTokens, usageDetail } from "../tokens";
 import type { ChatStore, PendingAttachment } from "../useChat";
 import { Badge, Banner, Button, Empty, Segmented } from "../ui/controls";
 import MessageRow from "../ui/MessageRow";
 import ModelPickerBar from "../ui/ModelPickerBar";
+import NavBar, { NavButton } from "../ui/NavBar";
 
 /** How close to the bottom the list has to be to keep following the stream. */
 const NEAR_BOTTOM_PX = 96;
 
-export default function ChatScreen({ chat }: { chat: ChatStore }) {
+export default function ChatScreen({
+  chat,
+  showMenuButton,
+  onMenu,
+  onNewChat,
+}: {
+  chat: ChatStore;
+  showMenuButton: boolean;
+  onMenu: () => void;
+  onNewChat: () => void;
+}) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const listRef = useRef<FlatList>(null);
@@ -44,6 +58,7 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
   const [picking, setPicking] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
+  const [modelOpen, setModelOpen] = useState(false);
 
   // In-flight messages sit after the stored ones. There is more than one when
   // the turn called tools: the model emits a separate assistant message per
@@ -135,6 +150,11 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
     await chat.editMessage(id, body);
   }, [editingId, editingText, chat]);
 
+  const newChat = useCallback(() => {
+    void chat.newChat().catch(() => undefined);
+    onNewChat();
+  }, [chat, onNewChat]);
+
   const capabilitiesLabel = chat.selectedModel ? capSummary(chat.selectedModel) : undefined;
 
   // Capability chips for the selected model, shown in the composer the way the
@@ -168,8 +188,26 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
   // whole branch's cost with no extra bookkeeping here.
   const sessionTokens = formatTokens(usageTotal(chat.sessionUsage));
 
+  const sessionTitle =
+    chat.sessions.find((s) => s.id === chat.sessionId)?.title ??
+    chat.session?.title ??
+    "New Chat";
+  const modelLabel = chat.selectedModel?.label ?? chat.model;
+
   return (
     <View style={[styles.root, { backgroundColor: theme.color.bg }]}>
+      <NavBar
+        title={sessionTitle}
+        subtitle={modelLabel}
+        onTitlePress={() => setModelOpen(true)}
+        leading={
+          showMenuButton ? (
+            <NavButton label="☰" accessibilityLabel="Open chats" onPress={onMenu} />
+          ) : undefined
+        }
+        trailing={<NavButton label="✎" accessibilityLabel="New chat" onPress={newChat} />}
+      />
+
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -188,7 +226,7 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
           contentContainerStyle={[
             styles.list,
             data.length === 0 && styles.listEmpty,
-            { paddingBottom: insets.bottom + 12 },
+            { paddingBottom: 12 },
           ]}
           ListEmptyComponent={
             chat.ready ? (
@@ -212,11 +250,15 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
           }
         />
 
+        {/* Bottom chrome — Messages-style toolbar. The glass sits behind the
+            controls (which stay solid) so the transcript blurs through the
+            gaps, including over the home-indicator area. */}
+        <Glass intensity={70} style={[styles.chrome, { borderTopColor: theme.color.hairline }]}>
         {editingId ? (
           <View
             style={[
               styles.editBar,
-              { backgroundColor: theme.color.surface, borderColor: theme.color.border },
+              { backgroundColor: theme.color.surface, borderColor: theme.color.hairline },
             ]}
           >
             <Text style={[styles.editLabel, { color: theme.color.textDim }]}>Editing message</Text>
@@ -271,58 +313,88 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
           style={[
             styles.composer,
             {
-              backgroundColor: theme.color.surface,
-              borderTopColor: theme.color.hairline,
               paddingBottom: Math.max(insets.bottom, 8),
             },
           ]}
         >
           <View style={styles.inputRow}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Attach an image"
+              onPress={() => void pickImages()}
+              disabled={picking}
+              hitSlop={8}
+              style={({ pressed }) => [styles.attachHit, pressed && { opacity: 0.5 }]}
+            >
+              {picking ? (
+                <ActivityIndicator size="small" color={theme.color.textDim} />
+              ) : (
+                <View style={[styles.attachCircle, { backgroundColor: theme.color.surfaceAlt }]}>
+                  <Text style={[styles.attachGlyph, { color: theme.color.textDim }]}>＋</Text>
+                </View>
+              )}
+            </Pressable>
             <TextInput
               value={text}
               onChangeText={setText}
               placeholder="Message"
               placeholderTextColor={theme.color.textFaint}
               multiline
-              style={[styles.input, { color: theme.color.text }]}
+              style={[styles.input, { color: theme.color.text, backgroundColor: theme.color.surfaceAlt }]}
+              returnKeyType="send"
               onSubmitEditing={() => void submit()}
             />
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Attach an image"
-              onPress={() => void pickImages()}
-              disabled={picking}
-              style={({ pressed }) => [styles.iconButton, pressed && { opacity: 0.6 }]}
-            >
-              {picking ? (
-                <ActivityIndicator size="small" color={theme.color.textDim} />
-              ) : (
-                <Text style={[styles.icon, { color: theme.color.textDim }]}>＋</Text>
-              )}
-            </Pressable>
             {chat.busy ? (
-              <Button label="Stop" variant="danger" compact onPress={chat.stop} />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Stop generating"
+                onPress={chat.stop}
+                hitSlop={8}
+                style={styles.sendHit}
+              >
+                <View style={[styles.sendCircle, { backgroundColor: theme.color.danger }]}>
+                  <Text style={styles.stopGlyph}>■</Text>
+                </View>
+              </Pressable>
             ) : (
-              <Button
-                label="Send"
-                variant="primary"
-                compact
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Send message"
                 onPress={() => void submit()}
                 disabled={!canSend}
-              />
+                hitSlop={8}
+                style={styles.sendHit}
+              >
+                <View
+                  style={[
+                    styles.sendCircle,
+                    { backgroundColor: canSend ? theme.color.accent : theme.color.surfaceAlt },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.sendGlyph,
+                      { color: canSend ? "#ffffff" : theme.color.textFaint },
+                    ]}
+                  >
+                    ↑
+                  </Text>
+                </View>
+              </Pressable>
             )}
           </View>
 
-          <View style={styles.bar}>
-            <ModelPickerBar
-              models={chat.models}
-              value={chat.model}
-              onChange={chat.setModel}
-            />
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.toolbar}
+            keyboardShouldPersistTaps="handled"
+          >
             {chat.selectedModel?.capabilities.reasoningEffort ? (
               <Segmented
                 value={chat.reasoningEffort}
                 onChange={chat.setEffort}
+                style={styles.toolbarSegment}
                 options={[
                   { value: "off", label: "off" },
                   { value: "low", label: "low" },
@@ -334,10 +406,11 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
             <Segmented
               value={chat.policyMode}
               onChange={chat.setPolicyMode}
+              style={styles.toolbarSegmentWide}
               options={[
                 { value: "ask", label: "ask" },
                 { value: "auto", label: "auto" },
-                { value: "allowlist", label: "allowlist" },
+                { value: "allowlist", label: "allow" },
                 { value: "deny", label: "deny" },
               ]}
             />
@@ -356,9 +429,19 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
                 {sessionTokens} · {usageDetail(chat.sessionUsage)}
               </Text>
             ) : null}
-          </View>
+          </ScrollView>
         </View>
+        </Glass>
       </KeyboardAvoidingView>
+
+      <ModelPickerBar
+        models={chat.models}
+        value={chat.model}
+        onChange={chat.setModel}
+        open={modelOpen}
+        onOpenChange={setModelOpen}
+        showTrigger={false}
+      />
     </View>
   );
 }
@@ -366,10 +449,10 @@ export default function ChatScreen({ chat }: { chat: ChatStore }) {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   flex: { flex: 1 },
-  list: { padding: 12, gap: 14 },
+  list: { paddingHorizontal: 16, paddingTop: 12, gap: 14 },
   listEmpty: { flexGrow: 1, justifyContent: "center" },
   footer: { gap: 8, paddingTop: 8 },
-  chips: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 12, paddingBottom: 8 },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 16, paddingBottom: 8 },
   chip: {
     flexDirection: "row",
     alignItems: "center",
@@ -382,20 +465,38 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 13, flexShrink: 1 },
   chipX: { fontSize: 12 },
   editBar: { gap: 8, padding: 12, borderTopWidth: StyleSheet.hairlineWidth },
-  editLabel: { fontSize: 12, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.6 },
-  editInput: { minHeight: 72, fontSize: 16, textAlignVertical: "top" },
+  editLabel: { fontSize: 13, fontWeight: "600" },
+  editInput: { minHeight: 72, fontSize: 17, textAlignVertical: "top" },
   editActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
-  composer: {
+  chrome: {
     borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  composer: {
     paddingHorizontal: 12,
-    paddingTop: 10,
+    paddingTop: 8,
     gap: 8,
   },
   inputRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
-  input: { flex: 1, minHeight: 40, maxHeight: 140, fontSize: 16, paddingTop: 10, paddingBottom: 10 },
-  iconButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
-  icon: { fontSize: 24 },
-  bar: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 8 },
-  caps: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6 },
+  attachHit: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  attachCircle: { width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center" },
+  attachGlyph: { fontSize: 20, lineHeight: 22 },
+  input: {
+    flex: 1,
+    minHeight: 38,
+    maxHeight: 130,
+    fontSize: 17,
+    borderRadius: 19,
+    paddingHorizontal: 14,
+    paddingTop: 9,
+    paddingBottom: 9,
+  },
+  sendHit: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  sendCircle: { width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center" },
+  sendGlyph: { fontSize: 17, fontWeight: "700", lineHeight: 20 },
+  stopGlyph: { fontSize: 12, fontWeight: "700", color: "#ffffff", lineHeight: 16 },
+  toolbar: { flexDirection: "row", alignItems: "center", gap: 8, paddingRight: 4 },
+  toolbarSegment: { width: 190 },
+  toolbarSegmentWide: { width: 250 },
+  caps: { flexDirection: "row", alignItems: "center", gap: 6 },
   tokens: { fontSize: 12, fontVariant: ["tabular-nums"] },
 });

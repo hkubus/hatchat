@@ -1,10 +1,11 @@
 /**
- * Small shared primitives.
+ * Small shared primitives, drawn in the iOS idiom.
  *
- * The web app reaches for raw elements and utility classes; React Native has
- * neither, so the handful of controls that recur — a pressable that reads as a
- * button, a labelled field, a status dot — live here so the screens do not each
- * re-derive them.
+ * iOS does not use bordered cards with 20pt radii for everything — it uses
+ * inset-grouped lists (rounded 10–12pt white cards on a grey ground),
+ * `UISegmentedControl`-style segmented picks, tinted pills, and filled
+ * system-blue buttons. These primitives match that language so every screen
+ * reads as first-party.
  */
 
 import type { ReactNode } from "react";
@@ -32,7 +33,7 @@ export interface ButtonProps {
   disabled?: boolean;
   loading?: boolean;
   style?: StyleProp<ViewStyle>;
-  /** Renders at 44pt minimum height, for anything in the main flow. */
+  /** Compact height for inline / toolbar use. */
   compact?: boolean;
 }
 
@@ -48,15 +49,11 @@ export function Button({
   const theme = useTheme();
   const inactive = disabled || loading;
 
-  const palette: Record<NonNullable<ButtonProps["variant"]>, { bg: string; fg: string; border: string }> = {
-    primary: { bg: theme.color.accent, fg: theme.color.accentText, border: "transparent" },
-    secondary: {
-      bg: theme.color.surfaceAlt,
-      fg: theme.color.text,
-      border: theme.color.border,
-    },
-    danger: { bg: theme.color.dangerSurface, fg: theme.color.danger, border: "transparent" },
-    ghost: { bg: "transparent", fg: theme.color.accent, border: "transparent" },
+  const palette: Record<NonNullable<ButtonProps["variant"]>, { bg: string; fg: string }> = {
+    primary: { bg: theme.color.accent, fg: theme.color.accentText },
+    secondary: { bg: theme.color.surfaceAlt, fg: theme.color.text },
+    danger: { bg: `${theme.color.danger}1f`, fg: theme.color.danger },
+    ghost: { bg: "transparent", fg: theme.color.accent },
   };
   const tone = palette[variant];
 
@@ -69,7 +66,7 @@ export function Button({
       style={({ pressed }) => [
         styles.button,
         compact && styles.buttonCompact,
-        { backgroundColor: tone.bg, borderColor: tone.border },
+        { backgroundColor: tone.bg },
         pressed && styles.pressed,
         inactive && styles.disabled,
         style,
@@ -78,7 +75,7 @@ export function Button({
       {loading ? (
         <ActivityIndicator color={tone.fg} size="small" />
       ) : (
-        <Text style={[styles.buttonLabel, { color: tone.fg }]} numberOfLines={1}>
+        <Text style={[styles.buttonLabel, compact && styles.buttonLabelCompact, { color: tone.fg }]} numberOfLines={1}>
           {label}
         </Text>
       )}
@@ -131,7 +128,10 @@ export function Field({
         style={[
           styles.input,
           multiline && styles.inputMultiline,
-          { color: theme.color.text, backgroundColor: theme.color.surface },
+          {
+            color: theme.color.text,
+            backgroundColor: theme.dark ? theme.color.surfaceAlt : "#f2f2f7",
+          },
         ]}
       />
       {hint ? (
@@ -141,7 +141,7 @@ export function Field({
   );
 }
 
-/** A row of mutually exclusive options, rendered as a wrapping chip row. */
+/** iOS `UISegmentedControl` idiom: one track, sliding selected segment. */
 export interface SegmentedProps<T extends string> {
   label?: string;
   value: T;
@@ -163,7 +163,7 @@ export function Segmented<T extends string>({
       {label ? (
         <Text style={[styles.fieldLabel, { color: theme.color.textDim }]}>{label}</Text>
       ) : null}
-      <View style={styles.chipRow}>
+      <View style={[styles.segmentTrack, { backgroundColor: theme.color.surfaceAlt }]}>
         {options.map((option) => {
           const selected = option.value === value;
           return (
@@ -173,19 +173,25 @@ export function Segmented<T extends string>({
               accessibilityState={{ selected }}
               onPress={() => onChange(option.value)}
               style={({ pressed }) => [
-                styles.chip,
-                {
-                  backgroundColor: selected ? theme.color.accent : theme.color.surfaceAlt,
-                  borderColor: selected ? theme.color.accent : theme.color.border,
-                },
-                pressed && styles.pressed,
+                styles.segment,
+                selected && [
+                  styles.segmentSelected,
+                  {
+                    backgroundColor: theme.color.surface,
+                    borderColor: theme.color.separator,
+                    shadowColor: "#000",
+                  },
+                ],
+                pressed && !selected && styles.pressed,
               ]}
             >
               <Text
                 style={[
-                  styles.chipLabel,
-                  { color: selected ? theme.color.accentText : theme.color.text },
+                  styles.segmentLabel,
+                  { color: selected ? theme.color.text : theme.color.textDim },
+                  selected && styles.segmentLabelSelected,
                 ]}
+                numberOfLines={1}
               >
                 {option.label}
               </Text>
@@ -212,20 +218,20 @@ export function ToggleRow({ label, detail, value, onValueChange, disabled }: Tog
       <View style={styles.toggleLabels}>
         <Text style={[styles.toggleLabel, { color: theme.color.text }]}>{label}</Text>
         {detail ? (
-          <Text style={[styles.hint, { color: theme.color.textFaint }]}>{detail}</Text>
+          <Text style={[styles.hint, { color: theme.color.textFaint }]} numberOfLines={2}>{detail}</Text>
         ) : null}
       </View>
       <Switch
         value={value}
         onValueChange={onValueChange}
         disabled={disabled}
-        trackColor={{ true: theme.color.accent, false: theme.color.border }}
+        trackColor={{ true: theme.color.accent, false: theme.dark ? "#48484a" : "#e9e9eb" }}
       />
     </View>
   );
 }
 
-/** A small coloured pill, used for capability and status readouts. */
+/** A small tinted pill, used for capability and status readouts. */
 export function Badge({
   label,
   tone = "neutral",
@@ -245,7 +251,7 @@ export function Badge({
 
   return (
     <View
-      style={[styles.badge, { borderColor: color }]}
+      style={[styles.badge, { backgroundColor: `${color}1f` }]}
       accessibilityLabel={title ? `${label}. ${title}` : undefined}
     >
       <Text style={[styles.badgeLabel, { color }]}>{label}</Text>
@@ -266,8 +272,8 @@ export function Banner({
 }) {
   const theme = useTheme();
   const surface = {
-    error: theme.color.dangerSurface,
-    warn: theme.color.warnSurface,
+    error: theme.dark ? theme.color.dangerSurface : "#fee9e7",
+    warn: theme.dark ? theme.color.warnSurface : "#fff4e0",
     info: theme.color.surfaceAlt,
   }[tone];
   const accent = {
@@ -277,9 +283,9 @@ export function Banner({
   }[tone];
 
   return (
-    <View style={[styles.banner, { backgroundColor: surface, borderColor: accent }]}>
+    <View style={[styles.banner, { backgroundColor: surface }]}>
       <View style={styles.bannerBody}>
-        <Text style={[styles.bannerTitle, { color: accent }]}>{title}</Text>
+        <Text style={[styles.bannerTitle, { color: theme.color.text }]}>{title}</Text>
         {detail ? (
           <Text style={[styles.bannerDetail, { color: theme.color.textDim }]}>{detail}</Text>
         ) : null}
@@ -298,11 +304,12 @@ export function Banner({
   );
 }
 
+/** Inset-grouped section header, as in iOS Settings. */
 export function SectionHeader({ title, detail }: { title: string; detail?: string }) {
   const theme = useTheme();
   return (
     <View style={styles.sectionHeader}>
-      <Text style={[styles.sectionTitle, { color: theme.color.text }]}>{title}</Text>
+      <Text style={[styles.sectionTitle, { color: theme.color.textDim }]}>{title.toUpperCase()}</Text>
       {detail ? (
         <Text style={[styles.hint, { color: theme.color.textFaint }]}>{detail}</Text>
       ) : null}
@@ -314,7 +321,7 @@ export function Empty({ title, detail }: { title: string; detail?: string }) {
   const theme = useTheme();
   return (
     <View style={styles.empty}>
-      <Text style={[styles.emptyTitle, { color: theme.color.text }]}>{title}</Text>
+      <Text style={[styles.emptyTitle, { color: theme.color.textDim }]}>{title}</Text>
       {detail ? (
         <Text style={[styles.emptyDetail, { color: theme.color.textFaint }]}>{detail}</Text>
       ) : null}
@@ -344,21 +351,23 @@ export function Mono({
 
 const styles = StyleSheet.create({
   button: {
-    minHeight: 48,
+    minHeight: 50,
     paddingHorizontal: 20,
     borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
     alignItems: "center",
     justifyContent: "center",
   },
   buttonCompact: {
-    minHeight: 36,
+    minHeight: 34,
     paddingHorizontal: 14,
-    borderRadius: 10,
+    borderRadius: 9,
   },
   buttonLabel: {
-    fontSize: 16,
+    fontSize: 17,
     fontWeight: "600",
+  },
+  buttonLabelCompact: {
+    fontSize: 15,
   },
   pressed: {
     opacity: 0.6,
@@ -370,43 +379,52 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   fieldLabel: {
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: "600",
-    textTransform: "uppercase",
-    letterSpacing: 0.6,
   },
   input: {
-    minHeight: 48,
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "transparent",
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 16,
+    minHeight: 44,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 17,
   },
   inputMultiline: {
     minHeight: 96,
     textAlignVertical: "top",
   },
   hint: {
-    fontSize: 12,
-    lineHeight: 16,
+    fontSize: 13,
+    lineHeight: 18,
   },
-  chipRow: {
+  segmentTrack: {
     flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
+    borderRadius: 9,
+    padding: 2,
+    gap: 2,
   },
-  chip: {
-    minHeight: 36,
-    paddingHorizontal: 14,
-    borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
+  segment: {
+    flex: 1,
+    minHeight: 32,
+    paddingHorizontal: 10,
+    borderRadius: 7,
     alignItems: "center",
     justifyContent: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "transparent",
   },
-  chipLabel: {
-    fontSize: 14,
+  segmentSelected: {
+    borderWidth: StyleSheet.hairlineWidth,
+    shadowOpacity: 0.12,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  segmentLabel: {
+    fontSize: 13,
+    fontWeight: "500",
+  },
+  segmentLabelSelected: {
     fontWeight: "600",
   },
   toggleRow: {
@@ -421,16 +439,15 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   toggleLabel: {
-    fontSize: 16,
+    fontSize: 17,
   },
   badge: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
+    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
   },
   badgeLabel: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: "600",
   },
   banner: {
@@ -438,20 +455,19 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     gap: 12,
     borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    padding: 12,
+    padding: 14,
   },
   bannerBody: {
     flex: 1,
     gap: 2,
   },
   bannerTitle: {
-    fontSize: 14,
-    fontWeight: "700",
+    fontSize: 15,
+    fontWeight: "600",
   },
   bannerDetail: {
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 14,
+    lineHeight: 19,
   },
   bannerDismiss: {
     fontSize: 14,
@@ -460,17 +476,20 @@ const styles = StyleSheet.create({
   },
   sectionHeader: {
     gap: 2,
-    paddingTop: 8,
-    paddingBottom: 4,
+    paddingTop: 16,
+    paddingBottom: 6,
+    paddingHorizontal: 16,
   },
   sectionTitle: {
-    fontSize: 17,
-    fontWeight: "700",
+    fontSize: 13,
+    fontWeight: "600",
+    letterSpacing: 0.4,
   },
   empty: {
     alignItems: "center",
     justifyContent: "center",
     paddingVertical: 48,
+    paddingHorizontal: 32,
     gap: 6,
   },
   emptyTitle: {
@@ -479,8 +498,9 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   emptyDetail: {
-    fontSize: 14,
+    fontSize: 15,
     textAlign: "center",
+    lineHeight: 20,
   },
   mono: {
     fontFamily: "ui-monospace",
