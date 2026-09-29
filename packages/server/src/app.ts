@@ -460,9 +460,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     // the title is still the derived placeholder. It never gates turn.done:
     // a slow titling model must not hold the stream open.
     const titleModel = config.titleModel ?? model;
+    // The subject is what the user typed; a turn with attachments carries it
+    // in its parts, and the synthetic "Continue" nudge is not the user's words.
+    const subject = options.userMeta?.synthetic
+      ? ""
+      : (options.userText ??
+        (options.userParts ?? []).map((part) => (part.type === "text" ? part.text : "")).join(" ")
+      ).trim();
     const titling =
-      session && session.titleSource === "derived" && options.userText?.trim()
-        ? generateTitle({ providers, model: titleModel, subject: options.userText, logger })
+      session && session.titleSource === "derived" && subject
+        ? generateTitle({ providers, model: titleModel, subject, logger })
             .then((title) => {
               if (title && store.setGeneratedTitle(options.sessionId, title)) {
                 turn.push({ type: "session.title", sessionId: options.sessionId, title });

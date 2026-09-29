@@ -1,257 +1,50 @@
-import type { KernelEvent, ModelInfo, Part, ReasoningEffort, Usage } from "@hat/core";
-import { REASONING_EFFORTS, addUsage, sumUsage, usageTotal } from "@hat/core";
-import { Fragment, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Connect from "./Connect";
+import type { KernelEvent, ModelInfo, ReasoningEffort, UiMessage } from "@hat/core";
 import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  CopyIcon,
-  EditIcon,
-  RegenerateIcon,
-} from "./icons";
-import MessageImage from "./MessageImage";
-import { QuestionCard, TodoList, ToolOutputs, argBrief, questionOf, todosOf } from "./ToolExtras";
+  REASONING_EFFORTS,
+  applyEffect,
+  approvalForDecision,
+  buildMessages,
+  contextFill,
+  endsTruncated,
+  readEvent,
+  sumUsage,
+  usageTotal,
+} from "@hat/core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ChatSettings from "./ChatSettings";
+import Connect from "./Connect";
+import { DownloadIcon, SlidersIcon } from "./icons";
+import MessageView, { type MessageActions } from "./MessageView";
 import ModelPicker from "./ModelPicker";
 import Settings from "./Settings";
 import Sidebar from "./Sidebar";
 import * as api from "./api";
-import type { PathNode, PluginDescriptor, ProviderStatus, RunnerSummary, SessionSummary } from "./api";
+import type { PluginDescriptor, ProviderStatus, RunnerSummary, SearchHit, SessionSummary } from "./api";
 import { capSummary, capTags, contextTag } from "./capTags";
 import CreatorIcon from "./CreatorIcon";
 import { creatorName, creatorSlug } from "./creators";
+import { notify } from "./notifications";
 import { formatTokens, cacheHitLabel, usageDetail } from "./tokens";
 import type { HatConfig } from "./runtime";
 import { isNativeShell, loadConfig } from "./runtime";
 
-const Markdown = lazy(() => import("./Markdown"));
-
-interface UiTool {
-  callId: string;
-  name: string;
-  args: unknown;
-  approval: "requested" | "approved" | "denied" | null;
-  result?: string;
-  /** Full result parts, for images and files the result carries. */
-  parts?: Part[];
-  isError?: boolean;
-  running: boolean;
-}
-
-interface UiBranch {
-  index: number;
-  count: number;
-  ids: string[];
-}
-
-interface UiMessage {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  reasoning: string;
-  tools: UiTool[];
-  branch?: UiBranch;
-  images: { src: string; attachmentId?: string }[];
-  usage?: Usage;
-}
-
 interface PendingAttachment {
   file: File;
-  previewUrl: string;
+  /** Object URL for image previews; documents show their name instead. */
+  previewUrl?: string;
 }
+
+/** Pasting more than this much text attaches it as a file instead. */
+const PASTE_AS_FILE_CHARS = 8_000;
+
+type SessionSettings = Pick<api.SessionRecord, "instructions" | "temperature" | "maxTokens">;
+
+const NO_SETTINGS: SessionSettings = { instructions: "", temperature: null, maxTokens: null };
 
 const DEFAULT_MODEL = "fake/fake-agent";
 
 /** How close to the bottom the scroller has to be to keep following the stream. */
 const NEAR_BOTTOM_PX = 72;
-
-function textOf(parts: Part[]): string {
-  return parts
-    .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
-    .map((p) => p.text)
-    .join("");
-}
-
-function reasoningOf(parts: Part[]): string {
-  return parts
-    .filter((p): p is Extract<Part, { type: "reasoning" }> => p.type === "reasoning")
-    .map((p) => p.text)
-    .join("");
-}
-
-function toolsOf(parts: Part[]): UiTool[] {
-  return parts
-    .filter((p): p is Extract<Part, { type: "tool_call" }> => p.type === "tool_call")
-    .map((p) => ({
-      callId: p.id,
-      name: p.name,
-      args: p.args,
-      approval: null,
-      running: true,
-    }));
-}
-
-function imagesOf(parts: Part[]): { src: string; attachmentId?: string }[] {
-  const out: { src: string; attachmentId?: string }[] = [];
-  for (const part of parts) {
-    if (part.type !== "image") continue;
-    if (part.source.kind === "attachment") {
-      out.push({ src: "", attachmentId: part.source.id });
-    } else if (part.source.kind === "url") {
-      out.push({ src: part.source.url });
-    } else {
-      out.push({ src: `data:${part.source.mime};base64,${part.source.data}` });
-    }
-  }
-  return out;
-}
-
-/**
- * The one-word state shown at the end of a tool call's summary line.
- * Running and plain success are deliberately silent — a spinner marks the
- * former and a finished call needs no label.
- */
-function toolStatus(t: UiTool): string | null {
-  if (t.approval === "requested") return "awaiting approval";
-  if (t.approval === "denied") return "denied";
-  if (t.isError) return "failed";
-  return null;
-}
-
-/**
- * The single line that identifies a tool call while collapsed. Shell calls get
- * their command, everything else gets the first line of whatever the tool
- * returned — the two things that actually tell you what the call was doing.
- */
-function toolBrief(t: UiTool): string {
-  const brief = argBrief(t.name, t.args);
-  if (brief) return brief;
-  if (t.args && typeof t.args === "object" && "command" in t.args) {
-    return String((t.args as { command: unknown }).command);
-  }
-  const first = (t.result ?? "").split("\n").find((line) => line.trim().length > 0);
-  return first?.trim() ?? "";
-}
-
-/** The full argument payload, formatted for the expanded body. */
-function toolArgs(t: UiTool): string {
-  if (t.args && typeof t.args === "object" && "command" in t.args) {
-    return `$ ${String((t.args as { command: unknown }).command)}`;
-  }
-  return JSON.stringify(t.args, null, 2) ?? "";
-}
-
-/** Replace the in-flight message with `messageId`, or the newest one if unknown. */
-function patchMessage(
-  list: UiMessage[],
-  messageId: string | undefined,
-  fn: (m: UiMessage) => UiMessage,
-): UiMessage[] {
-  const known = messageId ? list.findIndex((m) => m.id === messageId) : -1;
-  const index = known === -1 ? list.length - 1 : known;
-  if (index < 0) return list;
-  const next = [...list];
-  next[index] = fn(next[index]);
-  return next;
-}
-
-/**
- * Replace a tool by `callId`, searching newest message first. `tool.approval`
- * and `tool.result` carry no message id, so the call id is the only handle.
- */
-function patchTool(
-  list: UiMessage[],
-  callId: string,
-  fn: (t: UiTool) => UiTool,
-): UiMessage[] {
-  for (let i = list.length - 1; i >= 0; i--) {
-    const index = list[i].tools.findIndex((t) => t.callId === callId);
-    if (index === -1) continue;
-    const tools = [...list[i].tools];
-    tools[index] = fn(tools[index]);
-    const next = [...list];
-    next[i] = { ...next[i], tools };
-    return next;
-  }
-  return list;
-}
-
-function CopyButton({ text, title }: { text: string; title: string }): JSX.Element {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  useEffect(() => () => clearTimeout(timer.current), []);
-
-  function copy(): void {
-    void navigator.clipboard?.writeText(text);
-    setCopied(true);
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => setCopied(false), 1500);
-  }
-
-  return (
-    <button
-      className="icon-btn"
-      onClick={copy}
-      title={title}
-      aria-label={title}
-      aria-live="polite"
-    >
-      {copied ? <CheckIcon /> : <CopyIcon />}
-    </button>
-  );
-}
-
-/** Rebuild the visible conversation from the server's active branch path. */
-function buildMessages(path: PathNode[]): UiMessage[] {
-  const out: UiMessage[] = [];
-  for (const node of path) {
-    const { message } = node;
-    const branch: UiBranch = {
-      index: node.siblingIndex,
-      count: node.siblingCount,
-      ids: node.siblingIds,
-    };
-    if (message.role === "user") {
-      out.push({
-        id: message.id,
-        role: "user",
-        text: textOf(message.parts),
-        reasoning: "",
-        tools: [],
-        images: imagesOf(message.parts),
-        branch,
-      });
-    } else if (message.role === "assistant") {
-      out.push({
-        id: message.id,
-        role: "assistant",
-        text: textOf(message.parts),
-        reasoning: reasoningOf(message.parts),
-        tools: toolsOf(message.parts),
-        images: imagesOf(message.parts),
-        branch,
-        usage: message.meta?.usage,
-      });
-    } else if (message.role === "tool") {
-      for (const part of message.parts) {
-        if (part.type !== "tool_result") continue;
-        for (let i = out.length - 1; i >= 0; i--) {
-          const tool = out[i].tools.find((t) => t.callId === part.id);
-          if (tool) {
-            tool.result = textOf(part.content);
-            tool.parts = part.content;
-            tool.isError = part.isError;
-            tool.running = false;
-            break;
-          }
-        }
-      }
-    }
-  }
-  return out;
-}
 
 export default function App() {
   const [view, setView] = useState<"chat" | "settings">("chat");
@@ -303,9 +96,10 @@ export default function App() {
   const [editing, setEditing] = useState<{ messageId: string; text: string } | null>(null);
   const [pending, setPending] = useState<PendingAttachment[]>([]);
   const [restoring, setRestoring] = useState(false);
-  // Usage for the turn currently in flight. The server persists it onto the
-  // assistant message, so this only exists to keep the readout moving live.
-  const [liveUsage, setLiveUsage] = useState<Usage | undefined>(undefined);
+  const [sessionSettings, setSessionSettings] = useState<SessionSettings>(NO_SETTINGS);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** A message opened from search, briefly highlighted and scrolled to. */
+  const [highlightId, setHighlightId] = useState<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -322,6 +116,8 @@ export default function App() {
    * sidebar (concurrent refreshes happen after every turn and new chat).
    */
   const sessionsRequestRef = useRef(0);
+  /** Last status seen per session, to notice a turn finishing or needing the user. */
+  const statusRef = useRef(new Map<string, SessionSummary["status"]>());
 
   useEffect(() => {
     const el = scroller.current;
@@ -332,8 +128,27 @@ export default function App() {
     };
     el.addEventListener("scroll", measure, { passive: true });
     measure();
-    return () => el.removeEventListener("scroll", measure);
-  }, []);
+    // Content also grows without any state change (images decoding, the
+    // lazily loaded Markdown renderer, action rows appearing once a turn
+    // settles). While pinned to the bottom, follow it.
+    const resize = new ResizeObserver(() => {
+      if (stickToBottom.current) el.scrollTop = el.scrollHeight;
+    });
+    const observeChildren = (): void => {
+      resize.disconnect();
+      for (const child of Array.from(el.children)) resize.observe(child);
+    };
+    observeChildren();
+    const mutations = new MutationObserver(observeChildren);
+    mutations.observe(el, { childList: true });
+    return () => {
+      el.removeEventListener("scroll", measure);
+      resize.disconnect();
+      mutations.disconnect();
+    };
+    // The scroller only exists in the chat view, and is a new element each
+    // time that view mounts.
+  }, [view, auth]);
 
   /**
    * Events arrive one at a time off a single SSE reader, so a ref is the
@@ -361,8 +176,10 @@ export default function App() {
   function addFiles(files: Iterable<File>): void {
     const next: PendingAttachment[] = [];
     for (const file of files) {
-      if (!file.type.startsWith("image/")) continue;
-      next.push({ file, previewUrl: URL.createObjectURL(file) });
+      // Anything else is sent as a document; the server reads text, code and
+      // PDFs and rejects what it cannot, with a message saying so.
+      const previewable = /^image\/(png|jpeg|gif|webp)$/.test(file.type);
+      next.push({ file, previewUrl: previewable ? URL.createObjectURL(file) : undefined });
     }
     if (next.length > 0) setPending((prev) => [...prev, ...next]);
   }
@@ -370,7 +187,7 @@ export default function App() {
   function removePending(index: number): void {
     setPending((prev) => {
       const target = prev[index];
-      if (target) URL.revokeObjectURL(target.previewUrl);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
       return prev.filter((_, i) => i !== index);
     });
   }
@@ -395,9 +212,30 @@ export default function App() {
     return api
       .listSessions()
       .then((list) => {
-        if (requestId === sessionsRequestRef.current) setSessions(list);
+        if (requestId !== sessionsRequestRef.current) return;
+        noticeTransitions(list);
+        setSessions(list);
       })
       .catch(() => undefined);
+  }
+
+  /**
+   * Notify (when enabled and the tab is hidden) as a conversation finishes a
+   * turn or starts waiting on the user — for any conversation, not only the
+   * one on screen, since turns keep running server-side.
+   */
+  function noticeTransitions(list: SessionSummary[]): void {
+    const seen = statusRef.current;
+    for (const session of list) {
+      const before = seen.get(session.id);
+      const now = session.status ?? "idle";
+      if (before !== undefined && before !== now) {
+        const open = (): void => void openSession(session.id);
+        if (now === "waiting") notify(session.title, "Needs your input", `hat-${session.id}`, open);
+        else if (now === "idle" && before === "running") notify(session.title, "Reply ready", `hat-${session.id}`, open);
+      }
+      seen.set(session.id, now);
+    }
   }
 
   useEffect(() => {
@@ -425,6 +263,26 @@ export default function App() {
     return () => clearInterval(poll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authenticated]);
+
+  // Keep sidebar status (and notifications) moving while any conversation is
+  // busy; idle servers are not polled.
+  const anyActive = busy || sessions.some((s) => s.status && s.status !== "idle");
+  useEffect(() => {
+    if (!authenticated || !anyActive) return;
+    const poll = setInterval(() => void refreshSessions(), 4000);
+    return () => clearInterval(poll);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticated, anyActive]);
+
+  // `openSession` sets the messages and the highlight in one render, so the
+  // target is in the DOM by the time this runs. Keyed on the id alone: later
+  // message updates (a turn streaming in) must not pull the view back.
+  useEffect(() => {
+    if (!highlightId) return;
+    document.getElementById(`msg-${highlightId}`)?.scrollIntoView({ block: "center" });
+    const timer = setTimeout(() => setHighlightId(null), 2500);
+    return () => clearTimeout(timer);
+  }, [highlightId]);
 
   useEffect(() => {
     localStorage.setItem("hat.model", model);
@@ -506,7 +364,11 @@ export default function App() {
     if (!el || !stickToBottom.current) return;
     // Smooth for a new message, instant while tokens stream in: animating every
     // delta makes the view lag behind the text.
-    el.scrollTo({ top: el.scrollHeight, behavior: inFlight.length > 0 ? "auto" : "smooth" });
+    // A long way off (e.g. after jumping to a search hit) jumps too: the scroll
+    // events of a long animation would read as the user scrolling away.
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const jump = inFlight.length > 0 || distance > el.clientHeight;
+    el.scrollTo({ top: el.scrollHeight, behavior: jump ? "auto" : "smooth" });
   }, [messages, inFlight]);
 
   const selectedModel = models.find((m) => m.id === model);
@@ -515,99 +377,49 @@ export default function App() {
   // pushed the model past it.
   const effortRaised = reasoningEffort === "medium" || reasoningEffort === "high";
 
-  // Everything the visible branch has cost so far, plus the turn in flight.
-  const sessionUsage = useMemo(
-    () => sumUsage([...messages.map((m) => m.usage), liveUsage]),
-    [messages, liveUsage],
-  );
+  // Everything the visible branch has cost so far, plus the turn in flight
+  // (in-flight messages accumulate their usage as it streams).
+  const visibleMessages = useMemo(() => [...messages, ...inFlight], [messages, inFlight]);
+  const sessionUsage = useMemo(() => sumUsage(visibleMessages.map((m) => m.usage)), [visibleMessages]);
+  const fill = contextFill(visibleMessages, selectedModel?.contextWindow);
+  const canContinue = !busy && inFlight.length === 0 && endsTruncated(messages);
   const sessionTokens = usageTotal(sessionUsage);
   const sessionTokensLabel = formatTokens(sessionTokens);
   const sessionCacheLabel = cacheHitLabel(sessionUsage);
 
   function handleEvent(event: KernelEvent): void {
-    switch (event.type) {
-      case "turn.start":
-        setLiveUsage(undefined);
-        break;
-      case "usage":
-        setLiveUsage((prev) => addUsage(prev, event.usage));
-        break;
-      case "message.start":
-        // Append rather than replace: a tool-using turn emits one of these per
-        // model iteration, and the previous ones stay on screen.
-        patchInFlight((list) => [
-          ...list,
-          {
-            id: event.messageId,
-            role: "assistant",
-            text: "",
-            reasoning: "",
-            tools: [],
-            images: [],
-          },
-        ]);
-        break;
-      case "text.delta":
-        patchInFlight((list) =>
-          patchMessage(list, event.messageId, (m) => ({ ...m, text: m.text + event.text })),
-        );
-        break;
-      case "session.title":
+    const effect = readEvent(event);
+    switch (effect.kind) {
+      case "session-title":
         // The header and the sidebar both read from `sessions`, so one update
         // covers both without waiting for the post-turn refetch.
         setSessions((prev) =>
-          prev.map((s) => (s.id === event.sessionId ? { ...s, title: event.title } : s)),
-        );
-        break;
-      case "reasoning.delta":
-        patchInFlight((list) =>
-          patchMessage(list, event.messageId, (m) => ({
-            ...m,
-            reasoning: m.reasoning + event.text,
-          })),
-        );
-        break;
-      case "tool.call":
-        patchInFlight((list) =>
-          patchMessage(list, event.messageId, (m) => ({
-            ...m,
-            tools: [
-              ...m.tools,
-              {
-                callId: event.callId,
-                name: event.name,
-                args: event.args,
-                approval: null,
-                running: true,
-              },
-            ],
-          })),
-        );
-        break;
-      case "tool.approval":
-        patchInFlight((list) =>
-          patchTool(list, event.callId, (t) => ({ ...t, approval: event.status })),
-        );
-        break;
-      case "tool.result":
-        patchInFlight((list) =>
-          patchTool(list, event.callId, (t) => ({
-            ...t,
-            running: false,
-            isError: event.isError,
-            result: textOf(event.parts),
-            parts: event.parts,
-          })),
+          prev.map((s) => (s.id === effect.sessionId ? { ...s, title: effect.title } : s)),
         );
         break;
       case "error":
-        setError(event.error.message);
+        setError(effect.message);
         break;
       case "warning":
-        setWarnings((prev) => [...prev, event.message]);
+        setWarnings((prev) => [...prev, effect.message]);
+        break;
+      case "none":
+      case "reset-usage":
         break;
       default:
+        // Append rather than replace on message.start: a tool-using turn emits
+        // one per model iteration, and the previous ones stay on screen.
+        patchInFlight((list) => applyEffect(list, effect));
         break;
+    }
+    // A blocked turn is worth a notification straight away, not on the next poll.
+    const id = sessionIdRef.current;
+    const needsYou =
+      (event.type === "tool.approval" && event.status === "requested") ||
+      (event.type === "tool.call" && event.name === "ask_user");
+    if (id && needsYou) {
+      const title = sessions.find((s) => s.id === id)?.title ?? "hat";
+      notify(title, event.type === "tool.call" ? "The assistant has a question" : "A tool call needs approval", `hat-${id}`);
     }
   }
 
@@ -616,6 +428,11 @@ export default function App() {
     setPolicyMode(session.approvalMode);
     setAllowedToolsText(session.allowedTools.join(", "));
     setReasoningEffort(session.reasoningEffort);
+    setSessionSettings({
+      instructions: session.instructions ?? "",
+      temperature: session.temperature ?? null,
+      maxTokens: session.maxTokens ?? null,
+    });
     // The header and sidebar both read from `sessions`, and the record we just
     // fetched is fresher than whatever the list was holding.
     setSessions((prev) =>
@@ -709,9 +526,6 @@ export default function App() {
         setInFlight([]);
         await refresh(id).catch(() => undefined);
         await refreshSessions();
-        // Drop the live figure only once the persisted usage is in `messages`,
-        // otherwise the two would be added together and double-count.
-        setLiveUsage(undefined);
         setBusy(false);
       }
     }
@@ -744,7 +558,6 @@ export default function App() {
         setInFlight([]);
         await refresh(id).catch(() => undefined);
         await refreshSessions();
-        setLiveUsage(undefined);
         setBusy(false);
       }
     }
@@ -790,14 +603,16 @@ export default function App() {
     setPending([]);
     setError(null);
 
-    let attachmentIds: string[] = [];
+    const revoke = (): void =>
+      attachments.forEach((a) => a.previewUrl && URL.revokeObjectURL(a.previewUrl));
+    let uploaded: api.AttachmentRecord[] = [];
     try {
-      attachmentIds = await Promise.all(
-        attachments.map(async (a) => (await api.uploadAttachment(a.file)).id),
-      );
+      uploaded = await Promise.all(attachments.map((a) => api.uploadAttachment(a.file)));
     } catch (e) {
-      setError(String(e));
-      attachments.forEach((a) => URL.revokeObjectURL(a.previewUrl));
+      // Nothing was sent, so give the user their draft back.
+      setInput(text);
+      setPending(attachments);
+      setError(e instanceof Error ? e.message : String(e));
       return;
     }
 
@@ -809,21 +624,79 @@ export default function App() {
         text,
         reasoning: "",
         tools: [],
-        images: attachments.map((a) => ({ src: a.previewUrl })),
+        images: attachments.flatMap((a) => (a.previewUrl ? [{ src: a.previewUrl }] : [])),
+        files: uploaded.flatMap((record, index) =>
+          record.kind === "document"
+            ? [{ id: record.id, name: attachments[index].file.name, mime: record.mime, size: record.size }]
+            : [],
+        ),
       },
     ]);
 
     try {
       const id = await ensureSession();
       await runStream(id, (onEvent, signal) =>
-        api.sendTurn(id, text, model, attachmentIds, onEvent, signal),
+        api.sendTurn(
+          id,
+          text,
+          model,
+          uploaded.map((record, index) => ({ id: record.id, name: attachments[index].file.name })),
+          onEvent,
+          signal,
+        ),
       );
     } catch (e) {
       if (!api.isAbortError(e)) setError(String(e));
       setBusy(false);
     } finally {
-      attachments.forEach((a) => URL.revokeObjectURL(a.previewUrl));
+      revoke();
     }
+  }
+
+  /** Finish a reply that stopped at the output limit. */
+  async function continueReply(): Promise<void> {
+    if (!sessionId || busy) return;
+    await runStream(sessionId, (onEvent, signal) => api.continueTurn(sessionId, onEvent, signal));
+  }
+
+  async function forkFrom(messageId: string): Promise<void> {
+    if (!sessionId) return;
+    try {
+      const payload = await api.forkSession(sessionId, messageId);
+      await refreshSessions();
+      await openSession(payload.session.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function saveChatSettings(patch: SessionSettings): Promise<void> {
+    if (!sessionId) return;
+    applySession(await api.updateSession(sessionId, patch));
+  }
+
+  async function exportChat(format: "markdown" | "json"): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await api.exportSession(sessionId, format);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function importChat(file: File): Promise<void> {
+    try {
+      const payload = await api.importSession(file);
+      await refreshSessions();
+      await openSession(payload.session.id);
+    } catch (e) {
+      setView("chat");
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openHit(hit: SearchHit): Promise<void> {
+    await openSession(hit.sessionId, hit.messageId);
   }
 
   async function newChat(): Promise<void> {
@@ -834,6 +707,7 @@ export default function App() {
     setWarnings([]);
     setEditing(null);
     setView("chat");
+    setSettingsOpen(false);
     stickToBottom.current = true;
     const payload = await api.createSession(model);
     setSessionId(payload.session.id);
@@ -841,7 +715,11 @@ export default function App() {
     await refreshSessions();
   }
 
-  async function openSession(id: string): Promise<void> {
+  /**
+   * Open a conversation. With `messageId`, make sure the branch holding that
+   * message is the active one and bring the message into view.
+   */
+  async function openSession(id: string, messageId?: string): Promise<void> {
     detachStream();
     setBusy(false);
     setError(null);
@@ -850,7 +728,15 @@ export default function App() {
     setEditing(null);
     setView("chat");
     stickToBottom.current = true;
-    const payload = await api.getSession(id);
+    setSettingsOpen(false);
+    let payload = await api.getSession(id);
+    if (messageId && !payload.path.some((node) => node.message.id === messageId)) {
+      payload = await api.selectBranch(id, messageId).catch(() => payload);
+    }
+    if (messageId) {
+      stickToBottom.current = false;
+      setHighlightId(messageId);
+    }
     // Update the ref synchronously: `followActiveTurn` guards on it and runs
     // before React commits the state update.
     sessionIdRef.current = payload.session.id;
@@ -922,10 +808,7 @@ export default function App() {
   async function decide(callId: string, decision: "approve" | "deny"): Promise<void> {
     const previous = inFlightRef.current;
     patchInFlight((list) =>
-      patchTool(list, callId, (t) => ({
-        ...t,
-        approval: decision === "deny" ? "denied" : "approved",
-      })),
+      applyEffect(list, { kind: "tool-approval", callId, status: approvalForDecision(decision) }),
     );
     try {
       await api.resolveApproval(callId, decision, sessionId ?? undefined);
@@ -983,169 +866,24 @@ export default function App() {
     );
   }
 
-  function renderMessage(m: UiMessage, streamingNow = false): JSX.Element {
-    // An optimistic user message has no server id yet, so the actions that need
-    // one (regenerate, edit, branch) stay off it.
-    const persisted = !m.id.startsWith("local-");
-
-    return (
-      <div key={m.id} className={`msg ${m.role}${streamingNow ? " streaming" : ""}`}>
-        {editing?.messageId === m.id ? (
-          <div className="edit-box">
-            <textarea
-              value={editing.text}
-              onChange={(e) => setEditing({ messageId: m.id, text: e.target.value })}
-              rows={3}
-            />
-            <div className="edit-actions">
-              <button onClick={() => void submitEdit()} disabled={busy}>
-                Save & resend
-              </button>
-              <button className="ghost" onClick={() => setEditing(null)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        ) : (
-          <>
-            {m.reasoning && (
-              <details className="reasoning">
-                <summary>
-                  <ChevronDownIcon className="disclosure" />
-                  <span>reasoning</span>
-                </summary>
-                <pre className="aside-body">{m.reasoning}</pre>
-              </details>
-            )}
-
-            {m.text && (
-              <div className={`markdown ${m.role}`}>
-                <Suspense fallback={<span className="md-fallback">{m.text}</span>}>
-                  <Markdown>{m.text}</Markdown>
-                </Suspense>
-                {/* The caret lives inside the markdown block, not beside it:
-                    as a sibling it would be a block-level flex item of `.msg`
-                    and drop onto a line of its own. */}
-                {streamingNow && <span className="caret" />}
-              </div>
-            )}
-
-            {m.images.length > 0 && (
-              <div className="msg-images">
-                {m.images.map((img, index) => (
-                  <MessageImage key={index} attachmentId={img.attachmentId} src={img.src} />
-                ))}
-              </div>
-            )}
-
-            {m.tools.map((t) => {
-              const status = toolStatus(t);
-              const todos = t.name === "todo_write" ? todosOf(t.args) : null;
-              if (todos) return <TodoList key={t.callId} todos={todos} />;
-              const question = t.name === "ask_user" ? questionOf(t.args) : null;
-              const asking = question && t.running && !answered.has(t.callId) && sessionId;
-              return (
-                <Fragment key={t.callId}>
-                  <details
-                    className={`tool ${t.isError ? "err" : ""} ${t.approval === "requested" ? "awaiting" : ""}`}
-                    // An approval is a blocking question, so it must be visible
-                    // rather than folded away behind a click.
-                    open={t.approval === "requested"}
-                  >
-                    <summary>
-                      <ChevronDownIcon className="disclosure" />
-                      <span className="tool-name">{t.name}</span>
-                      <span className="tool-brief">{toolBrief(t)}</span>
-                      {t.running && t.approval !== "requested" ? (
-                        <span className="tool-spinner" role="status" aria-label="Running" />
-                      ) : (
-                        status && <span className={`tool-status ${t.approval ?? ""}`}>{status}</span>
-                      )}
-                    </summary>
-                    <div className="aside-body">
-                      <pre className="tool-args">{toolArgs(t)}</pre>
-                      {t.approval === "requested" && (
-                        <div className="approval">
-                          <button onClick={() => void decide(t.callId, "approve")}>Approve</button>
-                          <button className="danger" onClick={() => void decide(t.callId, "deny")}>
-                            Deny
-                          </button>
-                        </div>
-                      )}
-                      {t.result && <pre className="tool-result">{t.result}</pre>}
-                    </div>
-                  </details>
-                  {asking && (
-                    <QuestionCard
-                      question={question}
-                      onAnswer={async (answer) => {
-                        await api.answerQuestion(t.callId, sessionId, answer);
-                        setAnswered((prev) => new Set(prev).add(t.callId));
-                      }}
-                    />
-                  )}
-                  {t.parts && <ToolOutputs parts={t.parts} />}
-                </Fragment>
-              );
-            })}
-          </>
-        )}
-
-        {!streamingNow && !editing && (
-          <div className="msg-actions">
-            {m.branch && m.branch.count > 1 && (
-              <span className="branch" role="group" aria-label={`Version ${m.branch.index + 1} of ${m.branch.count}`}>
-                <button
-                  className="icon-btn"
-                  title="Previous version (regenerating creates versions)"
-                  aria-label={`Previous version, currently ${m.branch.index + 1} of ${m.branch.count}`}
-                  disabled={m.branch.index <= 0 || busy}
-                  onClick={() => void switchBranch(m.branch!.ids[m.branch!.index - 1])}
-                >
-                  <ChevronLeftIcon />
-                </button>
-                <span className="branch-label" aria-hidden="true">
-                  {m.branch.index + 1}/{m.branch.count}
-                </span>
-                <button
-                  className="icon-btn"
-                  title="Next version (regenerating creates versions)"
-                  aria-label={`Next version, currently ${m.branch.index + 1} of ${m.branch.count}`}
-                  disabled={m.branch.index >= m.branch.count - 1 || busy}
-                  onClick={() => void switchBranch(m.branch!.ids[m.branch!.index + 1])}
-                >
-                  <ChevronRightIcon />
-                </button>
-              </span>
-            )}
-            {m.text && <CopyButton text={m.text} title="Copy message" />}
-            {m.role === "assistant" && persisted && (
-              <button
-                className="icon-btn"
-                title="Regenerate"
-                aria-label="Regenerate"
-                disabled={busy}
-                onClick={() => void regenerate(m.id)}
-              >
-                <RegenerateIcon />
-              </button>
-            )}
-            {m.role === "user" && persisted && (
-              <button
-                className="icon-btn"
-                title="Edit"
-                aria-label="Edit"
-                disabled={busy}
-                onClick={() => setEditing({ messageId: m.id, text: m.text })}
-              >
-                <EditIcon />
-              </button>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
+  const messageActions: MessageActions = {
+    busy,
+    sessionId,
+    editing,
+    answered,
+    onEditChange: (messageId, text) => setEditing({ messageId, text }),
+    onEditSubmit: () => void submitEdit(),
+    onEditCancel: () => setEditing(null),
+    onRegenerate: (messageId) => void regenerate(messageId),
+    onFork: (messageId) => void forkFrom(messageId),
+    onSwitchBranch: (messageId) => void switchBranch(messageId),
+    onDecide: (callId, decision) => void decide(callId, decision),
+    onAnswer: async (callId, answer) => {
+      if (!sessionId) return;
+      await api.answerQuestion(callId, sessionId, answer);
+      setAnswered((prev) => new Set(prev).add(callId));
+    },
+  };
 
   return (
     <div className="shell">
@@ -1159,12 +897,40 @@ export default function App() {
         onDelete={(id) => void handleDelete(id)}
         onView={setView}
         onLogout={auth?.required ? () => void doLogout() : undefined}
+        onOpenHit={(hit) => void openHit(hit)}
+        onImport={(file) => void importChat(file)}
       />
       <div className="app">
       <header className="header">
         <div className="header-title">
           <h1>{currentTitle}</h1>
         </div>
+        {view === "chat" && sessionId && (
+          <div className="header-actions">
+            <button
+              className={`icon-btn ${settingsOpen ? "on" : ""} ${sessionSettings.instructions ? "dot" : ""}`}
+              onClick={() => setSettingsOpen((open) => !open)}
+              title="Conversation settings: instructions, temperature, reply length"
+              aria-label="Conversation settings"
+              aria-expanded={settingsOpen}
+            >
+              <SlidersIcon />
+            </button>
+            <details className="menu">
+              <summary className="icon-btn" title="Export this conversation" aria-label="Export">
+                <DownloadIcon />
+              </summary>
+              <div className="menu-items" role="menu">
+                <button role="menuitem" onClick={(e) => { e.currentTarget.closest("details")?.removeAttribute("open"); void exportChat("markdown"); }}>
+                  Markdown (this branch)
+                </button>
+                <button role="menuitem" onClick={(e) => { e.currentTarget.closest("details")?.removeAttribute("open"); void exportChat("json"); }}>
+                  JSON (everything, re-importable)
+                </button>
+              </div>
+            </details>
+          </div>
+        )}
       </header>
 
       {view === "settings" ? (
@@ -1183,6 +949,14 @@ export default function App() {
         />
       ) : (
         <>
+          {settingsOpen && sessionId && (
+            <ChatSettings
+              settings={sessionSettings}
+              onSave={saveChatSettings}
+              onClose={() => setSettingsOpen(false)}
+            />
+          )}
+
           {warnings.length > 0 && (
             <div className="warnings">
               {warnings.map((warning, index) => (
@@ -1208,10 +982,20 @@ export default function App() {
               </div>
             )}
 
-            {messages.map((m) => renderMessage(m))}
+            {messages.map((m) => (
+              <MessageView key={m.id} m={m} highlighted={m.id === highlightId} actions={messageActions} />
+            ))}
             {/* The caret belongs to the message still being written, not to every
                 one the turn has produced so far. */}
-            {inFlight.map((m, i) => renderMessage(m, i === inFlight.length - 1))}
+            {inFlight.map((m, i) => (
+              <MessageView key={m.id} m={m} streamingNow={i === inFlight.length - 1} actions={messageActions} />
+            ))}
+            {canContinue && (
+              <div className="continue-row">
+                <button onClick={() => void continueReply()}>Continue</button>
+                <span>The reply stopped at the output limit.</span>
+              </div>
+            )}
             {error && <div className="error">{error}</div>}
           </div>
 
@@ -1227,8 +1011,21 @@ export default function App() {
               {pending.length > 0 && (
                 <div className="chips">
                   {pending.map((attachment, index) => (
-                    <span key={attachment.previewUrl} className="chip">
-                      <img src={attachment.previewUrl} alt="pending" />
+                    <span
+                      key={`${attachment.file.name}-${attachment.file.size}-${index}`}
+                      className={`chip ${attachment.previewUrl ? "" : "doc"}`}
+                      title={attachment.file.name}
+                    >
+                      {attachment.previewUrl ? (
+                        <img src={attachment.previewUrl} alt={attachment.file.name} />
+                      ) : (
+                        <span className="chip-doc">
+                          <span className="chip-ext">
+                            {attachment.file.name.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE"}
+                          </span>
+                          <span className="chip-name">{attachment.file.name}</span>
+                        </span>
+                      )}
                       <button
                         className="chip-remove"
                         onClick={() => removePending(index)}
@@ -1248,12 +1045,18 @@ export default function App() {
                 aria-label="Message"
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={(e) => {
-                  const files = [...e.clipboardData.files].filter((f) =>
-                    f.type.startsWith("image/"),
-                  );
+                  const files = [...e.clipboardData.files];
                   if (files.length > 0) {
                     e.preventDefault();
                     addFiles(files);
+                    return;
+                  }
+                  // A wall of pasted text (a log, a file's contents) reads better
+                  // as an attachment than as a composer the height of the screen.
+                  const text = e.clipboardData.getData("text/plain");
+                  if (text.length > PASTE_AS_FILE_CHARS) {
+                    e.preventDefault();
+                    addFiles([new File([text], "pasted-text.txt", { type: "text/plain" })]);
                   }
                 }}
                 onKeyDown={(e) => {
@@ -1273,8 +1076,8 @@ export default function App() {
                 <button
                   className="icon-btn"
                   onClick={() => fileInput.current?.click()}
-                  title="Attach images"
-                  aria-label="Attach images"
+                  title="Attach images, PDFs, text or code files"
+                  aria-label="Attach files"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M21.4 11.05 12.5 20a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />
@@ -1379,6 +1182,18 @@ export default function App() {
                   </span>
                 )}
 
+                {fill && (
+                  <span
+                    className={`ctx-fill ${fill.fraction >= 0.8 ? "warn" : ""}`}
+                    title={`The last request used ${formatTokens(fill.tokens)} of ${formatTokens(selectedModel?.contextWindow ?? 0)} context tokens. Near the limit, older tool output and messages are left out of requests.`}
+                  >
+                    <span className="ctx-bar" aria-hidden="true">
+                      <span style={{ width: `${Math.round(fill.fraction * 100)}%` }} />
+                    </span>
+                    {Math.round(fill.fraction * 100)}% context
+                  </span>
+                )}
+
                 {sessionTokensLabel && (
                   <span
                     className="token-count"
@@ -1393,7 +1208,6 @@ export default function App() {
             <input
               ref={fileInput}
               type="file"
-              accept="image/*"
               multiple
               hidden
               onChange={(e) => {
