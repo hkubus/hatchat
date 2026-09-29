@@ -41,6 +41,8 @@ class Runner {
   constructor(
     private readonly config: RunnerConfig,
     private readonly sandbox: SandboxConfig,
+    /** Tier for shell-mode processes; may be `host` while `sandbox` is `container`. */
+    private readonly processSandbox: SandboxConfig,
   ) {
     this.workspace = new WorkspaceManager(config.workspaceRoot, config.maxOutputBytes);
   }
@@ -229,7 +231,7 @@ class Runner {
         args: message.args,
         cwd,
         env: message.env,
-        shell: message.shell ? this.sandbox : undefined,
+        shell: message.shell ? this.processSandbox : undefined,
       },
       (out) => this.send(out),
       (procId) => this.processes.delete(procId),
@@ -327,17 +329,19 @@ async function runFetch(
   }
 }
 
-/** Load config and settle the sandbox tier once, before the first hello. */
+/** Load config and settle the sandbox tiers once, before the first hello. */
 async function createRunner(): Promise<Runner> {
   const config = loadConfig();
-  const { sandbox, reason } = await resolveSandbox(config.sandbox);
+  const { sandbox, reason, processes, processReason } = await resolveSandbox(config.sandbox);
   const tier =
     sandbox.mode === "container" ? `container (${sandbox.runtime}, image ${sandbox.image})` : "host";
   log(`sandbox tier: ${tier}, because ${reason}`);
-  if (sandbox.mode === "host") {
-    log("warning: shell commands run directly on this host with the runner's privileges");
+  log(`process tier (background processes, python): ${processes.mode}, because ${processReason}`);
+  if (processes.mode === "host") {
+    const what = sandbox.mode === "host" ? "shell commands" : "background processes and python";
+    log(`warning: ${what} run directly on this host with the runner's privileges`);
   }
-  return new Runner(config, sandbox);
+  return new Runner(config, sandbox, processes);
 }
 
 let runner: Runner;

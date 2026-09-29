@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { parseSandboxMode, type SandboxSettings } from "./sandbox.js";
+import { parseProcessTier, parseSandboxMode, type SandboxSettings } from "./sandbox.js";
 
 export interface RunnerConfig {
   serverUrl: string;
@@ -45,6 +45,7 @@ export function loadConfig(): RunnerConfig {
     sandbox: {
       mode: parseSandboxMode(envStr("HAT_EXEC_SANDBOX", "auto")),
       runtime: process.env.HAT_SANDBOX_RUNTIME?.trim() || undefined,
+      processes: parseProcessTier(process.env.HAT_SANDBOX_PROCESSES),
       image: envStr("HAT_SANDBOX_IMAGE", "node:22-slim"),
       network: envStr("HAT_SANDBOX_NETWORK", "none"),
       memory: envStr("HAT_SANDBOX_MEMORY", "512m"),

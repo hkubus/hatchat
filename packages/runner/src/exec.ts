@@ -32,24 +32,12 @@ export function startJob(
   let finished = false;
   let timedOut = false;
 
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    HOME: spec.cwd,
-  };
-  // Allowlist caller env: never let the model override loader / runtime knobs.
-  if (spec.env) {
-    for (const [key, value] of Object.entries(spec.env)) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-      if (/^(LD_|DYLD_|NODE_OPTIONS|NODE_PATH|PATH|HOME|IFS)$/i.test(key)) continue;
-      env[key] = value;
-    }
-  }
-
-  const plan = spawnPlan(spec.command, spec.cwd, sandbox);
+  // The plan filters caller env: the model never overrides loader / runtime knobs.
+  const plan = spawnPlan(spec.command, spec.cwd, sandbox, { env: spec.env });
   const child = spawn(plan.bin, plan.args, {
     shell: plan.shell,
     cwd: spec.cwd,
-    env,
+    env: plan.env,
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
   });

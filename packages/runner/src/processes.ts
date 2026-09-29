@@ -31,18 +31,21 @@ export function startProcess(
   let finished = false;
   let killed = false;
 
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    HOME: spec.cwd,
-    ...spec.env,
-  };
-
   const plan = spec.shell
-    ? spawnPlan(spec.command, spec.cwd, spec.shell)
-    : { bin: spec.command, args: spec.args ?? [], shell: false };
+    ? spawnPlan(spec.command, spec.cwd, spec.shell, { env: spec.env })
+    : {
+        bin: spec.command,
+        args: spec.args ?? [],
+        shell: false,
+        env: {
+          PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+          HOME: spec.cwd,
+          ...spec.env,
+        },
+      };
   const child = spawn(plan.bin, plan.args, {
     cwd: spec.cwd,
-    env,
+    env: plan.env,
     shell: plan.shell,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
