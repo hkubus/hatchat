@@ -9,5 +9,6 @@ export * from "./tool.js";
 export * from "./policy.js";
 export * from "./capabilities.js";
 export * from "./events.js";
+export * from "./sse.js";
 export * from "./plugin.js";
 export * from "./async-queue.js";

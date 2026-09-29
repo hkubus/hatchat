@@ -3,10 +3,14 @@
  * emit. The whole thing is pure string-in/array-out so it can be tested
  * without a DOM, a fetch, or a running server — see `sse.test.ts`.
  *
- * Edge cases it has to survive, all of which happen in the desktop shell:
+ * It lives here rather than in any one client because the web, desktop, and
+ * mobile shells all decode the same stream, and they have to agree on the
+ * awkward parts:
  *   - a frame split across two network chunks (or several frames in one chunk)
  *   - multi-byte UTF-8 split mid-character between chunks
- *   - `: keepalive` comment frames, which carry no data
+ *   - `: keepalive` comment frames, which carry no data. The server emits one
+ *     every `HAT_SSE_KEEPALIVE_MS` of silence so that a turn paused on an
+ *     approval still looks alive, and so proxies do not close an idle stream.
  *   - a stream that ends mid-frame, with a pending decoder flush
  */
 

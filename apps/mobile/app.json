@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "hat",
+    "slug": "hat-mobile",
+    "scheme": "hat",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "chat.t3code.hat",
+      "supportsTablet": true,
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Attach images from your library to a conversation. Images are uploaded to your own hat server.",
+        "NSCameraUsageDescription": "Take a photo to attach to a conversation.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "chat.t3code.hat",
+      "adaptiveIcon": {
+        "backgroundColor": "#16161a",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Attach images from your library to a conversation. Images are uploaded to your own hat server.",
+          "cameraPermission": "Take a photo to attach to a conversation."
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": "Unlock the stored hat server token."
+        }
+      ]
+    ]
+  }
+}

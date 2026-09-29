@@ -31,6 +31,7 @@ web (React) ──SSE──▶ server ──WS /link──▶ runner ──▶ s
 | `@hat/runner` | Dial-out execution host: workspaces, process execution, fs, fetch |
 | `apps/web` | Streaming UI: grouped model picker, tool cards, approvals, branch navigation |
 | `apps/desktop` | Tauri v2 shell around `apps/web` for the same UI in a native window |
+| `apps/mobile` | React Native (Expo) iOS client: the same server, screens rewritten for touch |
 
 ## Providers (M1)
 
@@ -375,6 +376,62 @@ already sent the events. Keepalives also stop proxies closing idle streams.
 See [docs/desktop-app.md](docs/desktop-app.md) for the architecture, the
 Tauri↔web bridge, and what's deliberately out of scope.
 
+## iOS app (M7)
+
+`apps/mobile` is a React Native (Expo) client for the same server — not a
+WebView of the web app, so the screens are written for touch and the streaming
+is native. Like the desktop shell it is a thin client: it stores the address of
+a hat server and the token used to reach it, and nothing else.
+
+```sh
+pnpm dev:mobile          # Metro
+cd apps/mobile && eas build --profile device --platform ios
+```
+
+Three things about it are worth knowing before changing it, all of which are
+subtle and cost real time to rediscover:
+
+- **Streaming goes through `expo/fetch`, not `fetch`.** React Native's built-in
+  `fetch` buffers the response body, so a turn would not render until the model
+  had finished. `EventSource` is not an option: the turn endpoint is a POST.
+- **Auth is the bearer token, not a login.** `HAT_AUTH_TOKEN` is CSRF-exempt
+  server-side, so the app never touches `/api/auth/*` and needs no cookie jar.
+  The token lives in the iOS keychain. React Native does not enforce CORS, so
+  `HAT_CORS_ORIGINS` is not involved.
+- **A turn outlives its connection**, so the Stop button and "leave" are
+  different requests. Stop posts `POST /api/sessions/:id/turn/cancel` and then
+  drops the socket — closing the socket alone would stop the updates while the
+  model kept generating with nobody watching. Leaving only detaches, and the app
+  reattaches to a live turn (`GET /api/sessions/:id/stream`) on launch, on
+  opening a conversation, and when it returns to the foreground. This is what
+  makes it work on iOS, where the system suspends backgrounded apps freely.
+- **The SSE frame parser moved to `@hat/core`.** It is wire-format code that the
+  web, desktop, and mobile clients all have to agree on, so it now sits next to
+  the `KernelEvent` union it decodes rather than being copied per client.
+
+`@hat/core` ships raw TypeScript, so `apps/mobile/metro.config.js` has to
+transpile it out of `node_modules` and rewrite the `.js` extensions its ESM-style
+relative imports carry. If the app stops bundling, that file is the first thing
+to check.
+
+Real Liquid Glass comes from a local Expo module
+(`apps/mobile/modules/liquid-glass`) that uses `UIGlassEffect` on iOS 26 and
+falls back to `expo-blur` elsewhere, including in Expo Go.
+
+EAS device builds need a paid Apple Developer account. For a free Apple ID,
+[`.github/workflows/ios-ipa.yml`](.github/workflows/ios-ipa.yml) builds an
+unsigned IPA on a GitHub macOS runner for SideStore to sign on-device (7-day
+expiry, 3 apps at a time).
+
+The tool-loop view keeps **one assistant message per model iteration**, because
+that is what the server emits: a turn that calls tools produces several
+`message.start` events and each holds the tool cards for the calls made in it.
+Approvals are resolved with the session id, which is what lets the server reject
+a decision aimed at another conversation.
+
+See [docs/ios-app.md](docs/ios-app.md) for the architecture, the state machine,
+and what is deliberately out of scope.
+
 ## Run (dev)
 
 ```sh
@@ -391,7 +448,7 @@ default `HAT_ENROLL_TOKEN=dev-enroll-token`, so dev works with no config.
 
 ```sh
 pnpm typecheck    # tsc across all packages
-pnpm test         # node:test unit tests (providers, crypto, store, web SSE parser)
+pnpm test         # node:test unit tests (providers, crypto, store, SSE parser, chat view-model)
 pnpm smoke        # boots server + runner, exercises turn/approval/branching
 ```
 
@@ -448,5 +505,7 @@ This is a single-user app. Before exposing it:
   intentionally out of scope.
 - **M7 (started)** Tauri desktop: the shell, connection config, CORS and SSE
   keepalives are in place and a full turn (stream → approval → runner → result)
-  works in the app. Still open: packaging/signing, OS keychain for the token,
-  and React Native mobile over the same kernel/UI.
+  works in the app. Still open: packaging/signing, OS keychain for the token.
+  A React Native (Expo) iOS app now shares the same server and the SSE parser,
+  with EAS Build configured and an unsigned-IPA workflow for free Apple IDs.
+  Still open there: native tab bars for system Liquid Glass, and a device.
