@@ -24,7 +24,15 @@ import type {
   TextStyle,
   ViewStyle,
 } from "react-native";
+import { hasNativeGlass } from "../Glass";
 import { useTheme } from "../theme";
+import Icon from "./Icon";
+
+/**
+ * Corner radius of an inset-grouped section. iOS 26 rounds these far more than
+ * earlier releases, so match whichever design language the device is using.
+ */
+export const SECTION_RADIUS = hasNativeGlass() ? 24 : 10;
 
 export interface ButtonProps {
   label: string;
@@ -297,7 +305,7 @@ export function Banner({
           onPress={onDismiss}
           hitSlop={12}
         >
-          <Text style={[styles.bannerDismiss, { color: accent }]}>✕</Text>
+          <Icon name="xmark" size={13} weight="bold" color={accent} />
         </Pressable>
       ) : null}
     </View>
@@ -454,7 +462,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "flex-start",
     gap: 12,
-    borderRadius: 12,
+    borderRadius: 14,
     padding: 14,
   },
   bannerBody: {
@@ -468,11 +476,6 @@ const styles = StyleSheet.create({
   bannerDetail: {
     fontSize: 14,
     lineHeight: 19,
-  },
-  bannerDismiss: {
-    fontSize: 14,
-    fontWeight: "700",
-    paddingHorizontal: 4,
   },
   sectionHeader: {
     gap: 2,

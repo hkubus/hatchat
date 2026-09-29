@@ -21,11 +21,15 @@
  * not the default bundle.
  */
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import MarkdownDisplay, { MarkdownIt } from "react-native-markdown-display";
-import { StyleSheet, View } from "react-native";
+import type { ASTNode, RenderRules } from "react-native-markdown-display";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { StyleProp, ViewStyle } from "react-native";
+import * as Clipboard from "expo-clipboard";
+import * as haptics from "../haptics";
 import { useTheme } from "../theme";
+import Icon from "./Icon";
 
 /** One shared instance: markdown-it keeps a parser cache that is worth reusing. */
 const parser = MarkdownIt({
@@ -35,6 +39,65 @@ const parser = MarkdownIt({
   typographer: false,
   linkify: true,
 });
+
+/**
+ * A fenced or indented code block: a header with the language and a Copy
+ * button, and the code in a horizontal scroller. Wrapping code is worse than
+ * scrolling it — a wrapped line of shell reads as two commands.
+ */
+function CodeBlock({ code, language }: { code: string; language: string }) {
+  const theme = useTheme();
+  const [copied, setCopied] = useState(false);
+  return (
+    <View style={[styles.code, { backgroundColor: theme.color.surfaceAlt }]}>
+      <View style={styles.codeHead}>
+        <Text style={[styles.codeLang, { color: theme.color.textDim }]} numberOfLines={1}>
+          {language || "code"}
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Copy code"
+          hitSlop={8}
+          onPress={() => {
+            void Clipboard.setStringAsync(code).then(() => {
+              haptics.success();
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            });
+          }}
+          style={({ pressed }) => [styles.codeCopy, pressed && { opacity: 0.5 }]}
+        >
+          <Icon
+            name={copied ? "checkmark" : "doc.on.doc"}
+            size={13}
+            weight="medium"
+            color={theme.color.textDim}
+          />
+          <Text style={[styles.codeCopyLabel, { color: theme.color.textDim }]}>
+            {copied ? "Copied" : "Copy"}
+          </Text>
+        </Pressable>
+      </View>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.codeScroll}>
+        <Text
+          style={[styles.codeText, { color: theme.color.text, fontFamily: theme.font.mono }]}
+          selectable
+        >
+          {code}
+        </Text>
+      </ScrollView>
+    </View>
+  );
+}
+
+function codeRule(node: ASTNode) {
+  // markdown-it keeps the fence's info string (`ts`, `sh title=x`) on the
+  // token; the library copies it to the node without typing it.
+  const info = String((node as ASTNode & { sourceInfo?: string }).sourceInfo ?? "").trim();
+  return <CodeBlock key={node.key} code={node.content.replace(/\n$/, "")} language={info.split(/\s+/)[0] ?? ""} />;
+}
+
+const rules: RenderRules = { fence: codeRule, code_block: codeRule };
 
 export interface MarkdownProps {
   children: string;
@@ -77,28 +140,6 @@ export default function Markdown({ children, style }: MarkdownProps) {
         color: theme.color.text,
         borderRadius: 6,
       },
-      code_block: {
-        fontFamily: theme.font.mono,
-        fontSize: 13,
-        lineHeight: 19,
-        backgroundColor: theme.color.surfaceAlt,
-        color: theme.color.text,
-        borderRadius: 10,
-        padding: 12,
-        marginTop: 6,
-        marginBottom: 6,
-      },
-      fence: {
-        fontFamily: theme.font.mono,
-        fontSize: 13,
-        lineHeight: 19,
-        backgroundColor: theme.color.surfaceAlt,
-        color: theme.color.text,
-        borderRadius: 10,
-        padding: 12,
-        marginTop: 6,
-        marginBottom: 6,
-      },
       bullet_list: { marginTop: 4, marginBottom: 4 },
       ordered_list: { marginTop: 4, marginBottom: 4 },
       list_item: { marginTop: 2, marginBottom: 2 },
@@ -130,9 +171,26 @@ export default function Markdown({ children, style }: MarkdownProps) {
 
   return (
     <View style={style}>
-      <MarkdownDisplay style={markdownStyle} markdownit={parser}>
+      <MarkdownDisplay style={markdownStyle} markdownit={parser} rules={rules}>
         {children}
       </MarkdownDisplay>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  code: { borderRadius: 12, marginVertical: 6, overflow: "hidden" },
+  codeHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingLeft: 12,
+    paddingRight: 8,
+    paddingTop: 6,
+  },
+  codeLang: { fontSize: 12, fontWeight: "600", flexShrink: 1 },
+  codeCopy: { flexDirection: "row", alignItems: "center", gap: 4, padding: 4 },
+  codeCopyLabel: { fontSize: 12, fontWeight: "500" },
+  codeScroll: { paddingHorizontal: 12, paddingTop: 4, paddingBottom: 12 },
+  codeText: { fontSize: 13, lineHeight: 19 },
+});

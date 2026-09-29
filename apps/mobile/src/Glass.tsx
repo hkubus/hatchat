@@ -1,85 +1,124 @@
 import { BlurView } from "expo-blur";
-// Imported from `expo` rather than `expo-modules-core`: Expo re-exports both
-// of these, and taking the module core as a direct dependency is what
-// `expo-doctor` flags (it is not part of the public surface of this package).
-import { requireNativeView as requireNativeViewManager, requireOptionalNativeModule } from "expo";
+import {
+  GlassContainer,
+  GlassView,
+  isGlassEffectAPIAvailable,
+  isLiquidGlassAvailable,
+} from "expo-glass-effect";
+import type { ReactNode } from "react";
 import { Platform, StyleSheet, View } from "react-native";
-import type { GlassProps, GlassViewComponent, GlassVariant } from "../modules/liquid-glass";
+import type { ColorValue, StyleProp, ViewStyle } from "react-native";
 import { useTheme } from "./theme";
-
-export type { GlassProps, GlassVariant };
 
 /**
  * Translucent chrome that renders as real Liquid Glass where that exists, and
  * degrades to a plain material blur everywhere else.
  *
- * Three environments have to work, and this wrapper hides which one you are in:
+ * Liquid Glass belongs to the *navigation layer* only — controls that float over
+ * content (the composer, floating buttons). Content itself (bubbles, cards,
+ * settings rows) stays solid, per the HIG: glass on glass, or glass under text
+ * you have to read, is what makes an app look like a port.
  *
- *   - iOS 26+ with the local module built in: `UIGlassEffect`, the real thing.
- *   - iOS below 26: the module compiles, and the Swift `#available` check in
- *     `LiquidGlassModule.swift` picks `UIBlurEffect(.systemMaterial)`.
- *   - Expo Go, or any build made before `expo prebuild`: the native module is
- *     not in the binary at all, so `expo-blur` stands in.
+ * Environments this has to work in:
  *
- * The availability probe has to be `requireOptionalNativeModule`, and it has to
- * run before `requireNativeViewManager`. The latter does not fail when a view is
- * unregistered — it hands back a host component for a view that does not exist,
- * which renders as a red box instead of falling back.
+ *   - iOS 26+: `expo-glass-effect`, which is `UIGlassEffect` underneath.
+ *   - iOS below 26, Expo Go, web: `expo-blur` with a tint that supplies the
+ *     surface colour and keeps text legible.
+ *
+ * The availability probe calls both checks: `isLiquidGlassAvailable` reports
+ * whether the SDK has the components, and `isGlassEffectAPIAvailable` guards
+ * against the iOS 26 betas that shipped without the runtime API (and crash).
  */
 
-type NativeGlass = GlassViewComponent;
-
-let nativeGlass: NativeGlass | null = null;
-try {
-  if (Platform.OS === "ios" && requireOptionalNativeModule("LiquidGlass") !== null) {
-    nativeGlass = requireNativeViewManager<GlassProps>("LiquidGlass");
+const liquid = (() => {
+  if (Platform.OS !== "ios") return false;
+  try {
+    return isLiquidGlassAvailable() && isGlassEffectAPIAvailable();
+  } catch {
+    return false;
   }
-} catch {
-  nativeGlass = null;
-}
+})();
 
-/** True when this build has Apple's real `UIGlassEffect` available. */
+/** True when this build is drawing Apple's real Liquid Glass. */
 export function hasNativeGlass(): boolean {
-  return nativeGlass !== null;
+  return liquid;
 }
 
-export function Glass({ variant = "regular", style, children, intensity }: GlassProps & {
+export type GlassVariant = "regular" | "clear";
+
+export interface GlassProps {
+  /** `regular` tints the material; `clear` keeps only the distortion. */
+  variant?: GlassVariant;
+  /** Glass that responds to touch (scales and shimmers). Use for buttons. */
+  interactive?: boolean;
+  /** Tints the glass, e.g. the accent colour for a primary action. */
+  tint?: ColorValue;
+  style?: StyleProp<ViewStyle>;
+  children?: ReactNode;
   /** Blur strength for the fallback. Ignored when the native effect is in use. */
   intensity?: number;
-}) {
-  const theme = useTheme();
-  // Capitalised alias: a lowercase JSX tag would be read as an intrinsic
-  // element name rather than as this variable.
-  const NativeGlass = nativeGlass;
+}
 
-  if (NativeGlass) {
+export function Glass({ variant = "regular", interactive, tint, style, children, intensity }: GlassProps) {
+  const theme = useTheme();
+
+  if (liquid) {
     return (
-      <NativeGlass variant={variant} style={[styles.host, style]}>
+      <GlassView
+        glassEffectStyle={variant}
+        isInteractive={interactive}
+        tintColor={tint}
+        style={[styles.host, style]}
+      >
         {children}
-      </NativeGlass>
+      </GlassView>
     );
   }
 
+  // The blur and tint are absolutely positioned *siblings* before the children,
+  // not wrappers around them, so the caller's layout style (row direction,
+  // padding, alignment) applies to the children exactly as it does natively.
   return (
     <View style={[styles.host, style]}>
       <BlurView
-        intensity={intensity ?? 40}
-        tint={theme.dark ? "systemMaterialDark" : "systemMaterialLight"}
+        intensity={intensity ?? 50}
+        tint={theme.dark ? "systemChromeMaterialDark" : "systemChromeMaterialLight"}
         style={StyleSheet.absoluteFill}
       />
-      {/* The blur alone is nearly transparent; this tint supplies the surface
-          colour and the contrast that keeps text legible over it. */}
-      <View style={[StyleSheet.absoluteFill, { backgroundColor: theme.color.glassTint }]} />
-      <View style={styles.content}>{children}</View>
+      <View
+        style={[StyleSheet.absoluteFill, { backgroundColor: tint ?? theme.color.glassTint }]}
+      />
+      {children}
     </View>
   );
+}
+
+/**
+ * Groups neighbouring glass shapes so they blend and morph into one another as
+ * they move, the way the system does with adjacent bar buttons. A plain view
+ * where Liquid Glass is unavailable.
+ */
+export function GlassGroup({
+  spacing,
+  style,
+  children,
+}: {
+  spacing?: number;
+  style?: StyleProp<ViewStyle>;
+  children?: ReactNode;
+}) {
+  if (liquid) {
+    return (
+      <GlassContainer spacing={spacing} style={style}>
+        {children}
+      </GlassContainer>
+    );
+  }
+  return <View style={style}>{children}</View>;
 }
 
 const styles = StyleSheet.create({
   host: {
     overflow: "hidden",
-  },
-  content: {
-    flex: 1,
   },
 });

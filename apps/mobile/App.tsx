@@ -9,43 +9,54 @@
  *   2. With no server URL, the user has never connected: show the connect
  *      screen. This is the same gate the desktop shell uses, and for the same
  *      reason — the app is a thin client that has to be pointed at a server.
- *   3. Otherwise mount the chat state machine inside an iOS-native split
- *      shell: chats live in a sidebar (persistent split on wide windows,
- *      slide-over drawer on iPhone), the detail is Chat or Settings under an
- *      iOS navigation bar. There is no bottom tab bar — navigation is the
- *      sidebar plus the bar, as in Mail and Settings.
+ *   3. Otherwise mount the chat state machine above a native stack navigator.
+ *
+ * The navigator is `react-native-screens`' native stack, i.e. a real
+ * `UINavigationController`. That is what makes the chrome native rather than a
+ * lookalike: large titles that collapse on scroll, the system search field,
+ * edge-swipe back, `UIBarButtonItem`s with SF Symbols and pull-down menus, and —
+ * built with the iOS 26 SDK — Liquid Glass bar buttons and the scroll-edge
+ * effect, with no code here to draw any of it.
+ *
+ * The layout is the one Messages and Mail use on iPhone: a list of
+ * conversations at the root, the conversation pushed on top, Settings and the
+ * model picker presented as sheets.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  ActivityIndicator,
-  Animated,
-  Pressable,
-  StyleSheet,
-  View,
-  useWindowDimensions,
-} from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Platform, StyleSheet, View } from "react-native";
+import { DarkTheme, DefaultTheme, NavigationContainer } from "@react-navigation/native";
+import type { Theme as NavigationTheme } from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { KeyboardProvider } from "react-native-keyboard-controller";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { setUnauthorizedHandler } from "./src/api";
+import { hasNativeGlass } from "./src/Glass";
+import { ChatContext } from "./src/navigation";
+import type { RootStackParamList } from "./src/navigation";
 import type { HatConfig } from "./src/runtime";
 import { clearConfig, loadConfig } from "./src/runtime";
 import ChatScreen from "./src/screens/ChatScreen";
 import ConnectScreen from "./src/screens/ConnectScreen";
-import SettingsScreen from "./src/screens/SettingsScreen";
+import ModelScreen from "./src/screens/ModelScreen";
+import SessionsScreen from "./src/screens/SessionsScreen";
+import SettingsNavigator from "./src/screens/settings/SettingsNavigator";
 import { useTheme } from "./src/theme";
-import Sidebar from "./src/ui/Sidebar";
 import { useChat } from "./src/useChat";
 
-type Route = "chat" | "settings";
-
-const SIDEBAR_WIDTH = 320;
+const Stack = createNativeStackNavigator<RootStackParamList>();
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <Root />
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={styles.fill}>
+      <SafeAreaProvider>
+        <KeyboardProvider>
+          <Root />
+        </KeyboardProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
@@ -64,7 +75,7 @@ function Root() {
     // server's `HAT_AUTH_TOKEN` was rotated. Dropping the config returns the
     // user to the connect screen instead of letting every screen fail on its
     // own. Registered here, above the chat state, so it fires no matter which
-    // route is mounted.
+    // screen is mounted.
     setUnauthorizedHandler(() => {
       void clearConfig().then(() => setGeneration((n) => n + 1));
     });
@@ -76,191 +87,107 @@ function Root() {
     setGeneration((n) => n + 1);
   }, []);
 
+  let body;
+  if (!config) {
+    body = (
+      <View style={[styles.boot, { backgroundColor: theme.color.grouped }]}>
+        <ActivityIndicator color={theme.color.textFaint} />
+      </View>
+    );
+  } else if (!config.serverUrl) {
+    body = <ConnectScreen onConnected={() => setGeneration((n) => n + 1)} />;
+  } else {
+    body = <Shell onDisconnect={disconnect} />;
+  }
+
   // Every screen sets its own background, so the status bar has to follow the
   // appearance or the clock and battery are unreadable in one of the two modes.
   return (
     <>
       <StatusBar style={theme.dark ? "light" : "dark"} />
-      <RootBody config={config} onDisconnect={disconnect} setGeneration={setGeneration} />
+      {body}
     </>
   );
-}
-
-function RootBody({
-  config,
-  onDisconnect,
-  setGeneration,
-}: {
-  config: HatConfig | null;
-  onDisconnect: () => Promise<void>;
-  setGeneration: (updater: (n: number) => number) => void;
-}) {
-  const theme = useTheme();
-
-  if (!config) {
-    return (
-      <View style={[styles.boot, { backgroundColor: theme.color.bg }]}>
-        <ActivityIndicator color={theme.color.textFaint} />
-      </View>
-    );
-  }
-
-  if (!config.serverUrl) {
-    return <ConnectScreen onConnected={() => setGeneration((n) => n + 1)} />;
-  }
-
-  return <Shell onDisconnect={onDisconnect} />;
 }
 
 function Shell({ onDisconnect }: { onDisconnect: () => Promise<void> }) {
   const theme = useTheme();
   const chat = useChat();
-  const { width } = useWindowDimensions();
-  const isWide = width >= 768;
 
-  const [route, setRoute] = useState<Route>("chat");
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const navigationTheme = useMemo<NavigationTheme>(() => {
+    const base = theme.dark ? DarkTheme : DefaultTheme;
+    return {
+      ...base,
+      colors: {
+        ...base.colors,
+        primary: theme.color.accent,
+        background: theme.color.grouped,
+        card: theme.color.bg,
+        text: theme.color.text,
+        border: theme.color.separator,
+      },
+    };
+  }, [theme]);
 
-  // Drawer animation (narrow only): slide the panel in, fade the scrim.
-  const slide = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    Animated.timing(slide, {
-      toValue: sidebarOpen && !isWide ? 1 : 0,
-      duration: 240,
-      useNativeDriver: true,
-    }).start();
-  }, [sidebarOpen, isWide, slide]);
-
-  const drawerWidth = Math.min(SIDEBAR_WIDTH, width * 0.85);
-  const translateX = slide.interpolate({
-    inputRange: [0, 1],
-    outputRange: [-drawerWidth - 16, 0],
-  });
-  const scrimOpacity = slide.interpolate({
-    inputRange: [0, 1],
-    outputRange: [0, 0.35],
-  });
-
-  const closeSidebar = useCallback(() => setSidebarOpen(false), []);
-  const openSidebar = useCallback(() => setSidebarOpen(true), []);
-
-  const goChat = useCallback(() => {
-    setRoute("chat");
-    setSidebarOpen(false);
-  }, []);
-
-  const goSettings = useCallback(() => {
-    setRoute("settings");
-    setSidebarOpen(false);
-  }, []);
-
-  const sidebar = (
-    <Sidebar
-      chat={chat}
-      onSelect={goChat}
-      onNewChat={goChat}
-      onOpenSettings={goSettings}
-      settingsActive={route === "settings"}
-    />
-  );
+  // On iOS the bar is transparent and the content scrolls underneath it. Below
+  // iOS 26 the system blur gives the classic translucent bar; on iOS 26 the
+  // system draws the scroll-edge effect itself, and a blur here would fight it.
+  const translucent = Platform.OS === "ios";
+  const barBlur = translucent && !hasNativeGlass() ? ("systemChromeMaterial" as const) : undefined;
 
   return (
-    <View style={[styles.root, { backgroundColor: theme.color.bg }]}>
-      {isWide ? (
-        <View style={styles.split}>
-          <SafeAreaView
-            edges={["top", "left", "bottom"]}
-            style={[styles.sidebarPane, { borderRightColor: theme.color.hairline }]}
+    <ChatContext.Provider value={chat}>
+      <NavigationContainer theme={navigationTheme}>
+        <Stack.Navigator
+          initialRouteName="Chats"
+          screenOptions={{
+            headerTransparent: translucent,
+            headerBlurEffect: barBlur,
+            headerShadowVisible: false,
+            headerLargeTitleShadowVisible: false,
+            headerBackButtonDisplayMode: "minimal",
+            headerTintColor: theme.color.accent,
+            contentStyle: { backgroundColor: theme.color.grouped },
+          }}
+        >
+          <Stack.Screen
+            name="Chats"
+            component={SessionsScreen}
+            options={{ title: "Chats", headerLargeTitle: true }}
+          />
+          <Stack.Screen
+            name="Chat"
+            component={ChatScreen}
+            options={{ title: "", contentStyle: { backgroundColor: theme.color.bg } }}
+          />
+          <Stack.Screen
+            name="Settings"
+            options={{
+              presentation: "pageSheet",
+              // Settings is a stack of its own inside the sheet, so it can push
+              // detail screens; that inner stack draws the bars.
+              headerShown: false,
+            }}
           >
-            {sidebar}
-          </SafeAreaView>
-          <View style={styles.detail}>
-            {route === "chat" ? (
-              <ChatScreen chat={chat} showMenuButton={false} onMenu={openSidebar} onNewChat={goChat} />
-            ) : (
-              <SettingsScreen
-                chat={chat}
-                onDisconnect={onDisconnect}
-                onBack={goChat}
-                showMenuButton={false}
-                onMenu={openSidebar}
-              />
-            )}
-          </View>
-        </View>
-      ) : (
-        <View style={styles.detail}>
-          {route === "chat" ? (
-            <ChatScreen chat={chat} showMenuButton onMenu={openSidebar} onNewChat={goChat} />
-          ) : (
-            <SettingsScreen
-              chat={chat}
-              onDisconnect={onDisconnect}
-              onBack={goChat}
-              showMenuButton
-              onMenu={openSidebar}
-            />
-          )}
-
-          {/* Slide-over drawer + scrim. Kept mounted so the close animates;
-              pointer events only while open. */}
-          <Animated.View
-            style={[styles.scrim, { opacity: scrimOpacity }]}
-            pointerEvents={sidebarOpen ? "auto" : "none"}
-          >
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Close chats"
-              onPress={closeSidebar}
-              style={StyleSheet.absoluteFill}
-            />
-          </Animated.View>
-          <Animated.View
-            style={[
-              styles.drawer,
-              {
-                width: drawerWidth,
-                transform: [{ translateX }],
-                borderRightColor: theme.color.hairline,
-                backgroundColor: theme.color.grouped,
-              },
-            ]}
-          >
-            <SafeAreaView edges={["top", "left", "bottom"]} style={styles.drawerSafe}>
-              {sidebar}
-            </SafeAreaView>
-          </Animated.View>
-        </View>
-      )}
-    </View>
+            {() => <SettingsNavigator onDisconnect={onDisconnect} />}
+          </Stack.Screen>
+          <Stack.Screen
+            name="Model"
+            component={ModelScreen}
+            options={{
+              title: "Model",
+              presentation: "pageSheet",
+              headerTransparent: false,
+              headerStyle: { backgroundColor: theme.color.grouped },
+            }}
+          />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </ChatContext.Provider>
   );
 }
 
 const styles = StyleSheet.create({
+  fill: { flex: 1 },
   boot: { flex: 1, alignItems: "center", justifyContent: "center" },
-  root: { flex: 1 },
-  split: { flex: 1, flexDirection: "row" },
-  sidebarPane: { width: SIDEBAR_WIDTH, borderRightWidth: StyleSheet.hairlineWidth },
-  detail: { flex: 1 },
-  scrim: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: "#000",
-  },
-  drawer: {
-    position: "absolute",
-    top: 0,
-    bottom: 0,
-    left: 0,
-    borderRightWidth: StyleSheet.hairlineWidth,
-    shadowColor: "#000",
-    shadowOpacity: 0.2,
-    shadowRadius: 16,
-    shadowOffset: { width: 4, height: 0 },
-    elevation: 8,
-  },
-  drawerSafe: { flex: 1 },
 });
