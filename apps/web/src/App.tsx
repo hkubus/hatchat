@@ -27,7 +27,7 @@ import { notify } from "./notifications";
 import { formatTokens, cacheHitLabel, usageDetail } from "./tokens";
 import UsageMeter from "./UsageMeter";
 import type { HatConfig } from "./runtime";
-import { isNativeShell, loadConfig } from "./runtime";
+import { isNativeShell, loadConfig, saveConfig } from "./runtime";
 
 interface PendingAttachment {
   file: File;
@@ -70,7 +70,7 @@ const NEAR_BOTTOM_PX = 72;
 export default function App() {
   const [view, setView] = useState<"chat" | "settings">("chat");
   const [config, setConfig] = useState<HatConfig | null>(null);
-  const [auth, setAuth] = useState<{ required: boolean; authenticated: boolean } | null>(null);
+  const [auth, setAuth] = useState<{ required: boolean; authenticated: boolean; password?: boolean } | null>(null);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -266,7 +266,7 @@ export default function App() {
     api.setUnauthorizedHandler(() => setAuth((prev) => (prev ? { ...prev, authenticated: false } : prev)));
     void api
       .getAuthStatus()
-      .then((status) => setAuth({ required: status.required, authenticated: status.authenticated }))
+      .then((status) => setAuth(status))
       .catch(() => setAuth({ required: false, authenticated: true }));
     return () => api.setUnauthorizedHandler(undefined);
   }, []);
@@ -794,8 +794,7 @@ export default function App() {
     try {
       await api.login(password);
       setPassword("");
-      const status = await api.getAuthStatus();
-      setAuth({ required: status.required, authenticated: status.authenticated });
+      setAuth(await api.getAuthStatus());
     } catch (e) {
       setLoginError(String(e));
     }
@@ -804,7 +803,9 @@ export default function App() {
   async function doLogout(): Promise<void> {
     detachStream();
     await api.logout();
-    setAuth({ required: true, authenticated: false });
+    // A native shell is signed in by its token, so signing out forgets it.
+    if (config && isNativeShell()) setConfig(await saveConfig({ ...config, token: "" }));
+    setAuth((prev) => ({ required: true, authenticated: false, password: prev?.password }));
     setSessionId(null);
     setMessages([]);
     setInFlight([]);
@@ -869,6 +870,35 @@ export default function App() {
   }
 
   if (auth && auth.required && !auth.authenticated) {
+    // A native shell signs in with its token alone (a session cookie would not
+    // cross from its origin to the server's), so what it needs is a token the
+    // server accepts, not a password.
+    if (config && isNativeShell()) {
+      return (
+        <Connect
+          initial={config}
+          notice={config.token ? "The server did not accept this app's token." : "The server needs this app's token."}
+          onConnected={(saved) => {
+            setConfig(saved);
+            window.location.reload();
+          }}
+        />
+      );
+    }
+    if (!auth.password) {
+      return (
+        <div className="login">
+          <div className="login-card">
+            <div className="brand">Hat</div>
+            <p className="settings-hint">
+              This server only accepts its API token, which a browser tab does not send. Set{" "}
+              <code>HAT_AUTH_PASSWORD</code> on the server to sign in here, or use the desktop app with
+              the token.
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="login">
         <form
