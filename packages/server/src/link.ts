@@ -27,6 +27,16 @@ interface PendingRpc {
   reject: (error: unknown) => void;
 }
 
+export interface LinkTimings {
+  /** How long a request may wait for its answer before it fails. */
+  rpcTimeoutMs?: number;
+  /** How often each runner is pinged; one that misses a ping is dropped. */
+  pingIntervalMs?: number;
+}
+
+const DEFAULT_RPC_TIMEOUT_MS = 120_000;
+const DEFAULT_PING_INTERVAL_MS = 15_000;
+
 export interface RunnerRequirements {
   tags?: string[];
   os?: string;
@@ -81,6 +91,7 @@ export class RunnerConnection implements RunnerChannel {
     readonly id: string,
     readonly capabilities: HostCapabilities,
     private readonly log: Logger,
+    private readonly rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   ) {}
 
   /** In-flight work on this runner (jobs + long-lived processes). */
@@ -304,9 +315,21 @@ export class RunnerConnection implements RunnerChannel {
     if (this.closedReason !== undefined) return Promise.reject(new Error(this.closedReason));
     const reqId = newId("req");
     return new Promise<T>((resolve, reject) => {
+      // A runner that is connected but stuck (a file read on a stalled disk)
+      // would otherwise leave the tool call, and its turn, waiting forever.
+      const timer = setTimeout(() => {
+        this.reject(reqId, new Error(`runner ${this.id} did not answer within ${Math.round(this.rpcTimeoutMs / 1000)}s`));
+      }, this.rpcTimeoutMs);
+      timer.unref?.();
       this.pending.set(reqId, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value as T);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
       });
       this.send(build(reqId));
     });
@@ -342,6 +365,7 @@ export class RunnerRegistry {
      * the next restart.
      */
     private readonly onAvailabilityChange?: (available: boolean) => void,
+    private readonly timings: LinkTimings = {},
   ) {}
 
   attach(server: Server): void {
@@ -430,13 +454,33 @@ export class RunnerRegistry {
         previous?.close();
         previous?.fail("superseded by a newer connection");
 
-        connection = new RunnerConnection(ws, id, message.caps, this.log);
+        connection = new RunnerConnection(ws, id, message.caps, this.log, this.timings.rpcTimeoutMs);
         this.runners.set(id, connection);
         ws.send(encodeLinkMessage({ t: "hello.ok", runnerId: id }));
         this.log.info(`runner connected: ${id} (${message.caps.os}/${message.caps.arch}) tags=${message.caps.tags.join(",")}`);
         if (wasEmpty) this.onAvailabilityChange?.(true);
 
+        // A runner that vanished without closing its socket (power loss, a
+        // network partition) would keep its requests waiting until TCP gives
+        // up, which can take hours. The runner's socket answers pings on its
+        // own; one that misses a ping is dropped, and its requests fail.
+        let answered = true;
+        ws.on("pong", () => {
+          answered = true;
+        });
+        const ping = setInterval(() => {
+          if (!answered) {
+            this.log.warn(`runner ${id} stopped answering; dropping it`);
+            ws.terminate();
+            return;
+          }
+          answered = false;
+          ws.ping();
+        }, this.timings.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS);
+        ping.unref?.();
+
         ws.on("close", () => {
+          clearInterval(ping);
           if (this.runners.get(id) !== connection) return;
           this.runners.delete(id);
           connection?.fail("link closed");

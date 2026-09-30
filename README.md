@@ -653,6 +653,9 @@ The runner publishes **no ports** — it dials out to `server:8787/link`.
 - Server sends `workspace.ensure`, `exec.start|stdin|cancel`, `fs.*`, `net.fetch`
   with correlation ids; runner streams `exec.stdout|stderr|exit` and `*.result`.
 - Jobs are killed on cancel, timeout, or output-cap breach (process tree).
+- The server pings each runner every 15s and drops one that stops answering
+  (a machine that vanished without closing its socket), and a request its
+  runner never answers fails after 2 minutes: neither leaves a turn waiting.
 - The runner holds no provider keys, database, or auth state. Secrets and
   approval live only on the server and never cross the link.
 
