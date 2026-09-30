@@ -19,6 +19,8 @@ import type {
 export interface RunnerChannel {
   readonly id: string;
   readonly capabilities: HostCapabilities;
+  /** True once the link is gone; a replacement connection is a new channel. */
+  readonly closed?: boolean;
   ensureWorkspace(sessionId: string): Promise<WorkspaceInfo>;
   exec(sessionId: string, req: ExecRequest, signal: AbortSignal): AsyncIterable<ExecEvent>;
   fsRead(sessionId: string, path: string): Promise<string>;
@@ -41,6 +43,9 @@ export function createRemoteHost(channel: RunnerChannel, sessionId: string): Exe
   return {
     id: channel.id,
     capabilities: channel.capabilities,
+    get closed() {
+      return channel.closed ?? false;
+    },
     ensureWorkspace: (session) => channel.ensureWorkspace(session),
     exec: (req, signal) => channel.exec(sessionId, req, signal),
     fs,

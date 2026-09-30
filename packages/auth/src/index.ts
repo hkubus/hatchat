@@ -13,18 +13,27 @@ export function hashPassword(password: string): string {
   return `scrypt$${salt.toString("hex")}$${hash.toString("hex")}`;
 }
 
-export function verifyPassword(password: string, stored: string): boolean {
+/**
+ * Check a password against a stored hash. Asynchronous on purpose: scrypt is
+ * slow by design, and done synchronously every login attempt would stall the
+ * server, streams included, for its duration.
+ */
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const [scheme, saltHex, hashHex] = stored.split("$");
   if (scheme !== "scrypt" || !saltHex || !hashHex) return false;
   const salt = Buffer.from(saltHex, "hex");
   const expected = Buffer.from(hashHex, "hex");
   let actual: Buffer;
   try {
-    actual = crypto.scryptSync(password, salt, expected.length, {
-      N: SCRYPT_PARAMS.N,
-      r: SCRYPT_PARAMS.r,
-      p: SCRYPT_PARAMS.p,
-    });
+    actual = await new Promise<Buffer>((resolve, reject) =>
+      crypto.scrypt(
+        password,
+        salt,
+        expected.length,
+        { N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p },
+        (error, key) => (error ? reject(error) : resolve(key)),
+      ),
+    );
   } catch {
     return false;
   }
@@ -66,6 +75,7 @@ export function newToken(bytes = 24): string {
 /** Fixed-window rate limiter, keyed by e.g. client IP. */
 export class RateLimiter {
   private readonly hits = new Map<string, number[]>();
+  private lastSweep = 0;
 
   constructor(
     private readonly limit: number,
@@ -73,6 +83,7 @@ export class RateLimiter {
   ) {}
 
   allow(key: string, now = Date.now()): boolean {
+    this.sweep(now);
     const recent = (this.hits.get(key) ?? []).filter((time) => now - time < this.windowMs);
     if (recent.length >= this.limit) {
       this.hits.set(key, recent);
@@ -85,5 +96,22 @@ export class RateLimiter {
 
   reset(key: string): void {
     this.hits.delete(key);
+  }
+
+  /** How many keys are being tracked. */
+  get size(): number {
+    return this.hits.size;
+  }
+
+  /**
+   * Forget keys with no hit inside the window, at most once per window. Keys
+   * are client addresses, and there is no end to those.
+   */
+  private sweep(now: number): void {
+    if (now - this.lastSweep < this.windowMs) return;
+    this.lastSweep = now;
+    for (const [key, times] of this.hits) {
+      if (times.every((time) => now - time >= this.windowMs)) this.hits.delete(key);
+    }
   }
 }

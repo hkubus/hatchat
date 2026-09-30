@@ -2,6 +2,7 @@ import type { KernelEvent, ModelInfo, ReasoningEffort, UiMessage } from "@hat/co
 import {
   REASONING_EFFORTS,
   applyEffect,
+  applyStoredEffect,
   approvalForDecision,
   buildMessages,
   contextFill,
@@ -26,12 +27,24 @@ import { notify } from "./notifications";
 import { formatTokens, cacheHitLabel, usageDetail } from "./tokens";
 import UsageMeter from "./UsageMeter";
 import type { HatConfig } from "./runtime";
-import { isNativeShell, loadConfig } from "./runtime";
+import { isNativeShell, loadConfig, saveConfig } from "./runtime";
 
 interface PendingAttachment {
   file: File;
   /** Object URL for image previews; documents show their name instead. */
   previewUrl?: string;
+}
+
+/** What the composer held when a message was sent. */
+interface Draft {
+  text: string;
+  attachments: PendingAttachment[];
+}
+
+function releasePreviews(attachments: readonly PendingAttachment[]): void {
+  for (const attachment of attachments) {
+    if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+  }
 }
 
 /** Pasting more than this much text attaches it as a file instead. */
@@ -69,7 +82,7 @@ const NEAR_BOTTOM_PX = 72;
 export default function App() {
   const [view, setView] = useState<"chat" | "settings">("chat");
   const [config, setConfig] = useState<HatConfig | null>(null);
-  const [auth, setAuth] = useState<{ required: boolean; authenticated: boolean } | null>(null);
+  const [auth, setAuth] = useState<{ required: boolean; authenticated: boolean; password?: boolean } | null>(null);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -125,8 +138,17 @@ export default function App() {
   const scroller = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  /** Set while a turn is streaming so the composer can stop it. */
-  const abortRef = useRef<AbortController | null>(null);
+  /**
+   * The stream the view is showing. Only it may touch the view: any other,
+   * replaced or left behind, winds down without applying anything.
+   */
+  const streamRef = useRef<AbortController | null>(null);
+  /**
+   * Bumped whenever the view moves to another conversation. Async work checks
+   * it after every await, so a slow answer about the conversation the user
+   * just left can't land in the one they opened.
+   */
+  const viewRef = useRef(0);
   /** False once the user scrolls up, so streaming stops yanking the view down. */
   const stickToBottom = useRef(true);
   /** Mirrors `sessionId` for callbacks that must not re-subscribe on change. */
@@ -140,6 +162,15 @@ export default function App() {
   const sessionsRequestRef = useRef(0);
   /** Last status seen per session, to notice a turn finishing or needing the user. */
   const statusRef = useRef(new Map<string, SessionSummary["status"]>());
+  /** What the composer holds now, for async work that outlives the render it started in. */
+  const composerRef = useRef<Draft>({ text: input, attachments: pending });
+  composerRef.current = { text: input, attachments: pending };
+  /**
+   * Drafts a refused send gave back after the user had moved to another
+   * conversation, by the conversation they were written in. Opening it again
+   * puts the draft back in the composer.
+   */
+  const refusedDrafts = useRef(new Map<string, Draft>());
 
   useEffect(() => {
     const el = scroller.current;
@@ -265,7 +296,7 @@ export default function App() {
     api.setUnauthorizedHandler(() => setAuth((prev) => (prev ? { ...prev, authenticated: false } : prev)));
     void api
       .getAuthStatus()
-      .then((status) => setAuth({ required: status.required, authenticated: status.authenticated }))
+      .then((status) => setAuth(status))
       .catch(() => setAuth({ required: false, authenticated: true }));
     return () => api.setUnauthorizedHandler(undefined);
   }, []);
@@ -333,12 +364,13 @@ export default function App() {
     const stored = localStorage.getItem("hat.session");
     if (!stored) return;
     let cancelled = false;
+    const view = viewRef.current;
     setRestoring(true);
     void api
       .getSession(stored)
       .then((payload) => {
-        // The user may have picked another session while this was in flight.
-        if (cancelled || sessionIdRef.current !== stored) return;
+        // The user may have opened a conversation meanwhile, even this one.
+        if (cancelled || view !== viewRef.current) return;
         sessionIdRef.current = payload.session.id;
         setSessionId(payload.session.id);
         setMessages(buildMessages(payload.path));
@@ -349,7 +381,7 @@ export default function App() {
         void followActiveTurn(payload.session.id);
       })
       .catch((e: unknown) => {
-        if (cancelled || sessionIdRef.current !== stored) return;
+        if (cancelled || view !== viewRef.current) return;
         // Gone is permanent, so the stale pointer is dropped. Everything else
         // — 401, a server that is still starting, no network at all — is not,
         // and the stored pointer survives to be retried on the next load.
@@ -432,6 +464,11 @@ export default function App() {
         // Append rather than replace on message.start: a tool-using turn emits
         // one per model iteration, and the previous ones stay on screen.
         patchInFlight((list) => applyEffect(list, effect));
+        // After attaching mid-turn, the call waiting for approval is on a
+        // stored message: its approval request and result land there.
+        if (effect.kind === "tool-approval" || effect.kind === "tool-result") {
+          setMessages((list) => applyStoredEffect(list, effect));
+        }
         break;
     }
     // A blocked turn is worth a notification straight away, not on the next poll.
@@ -510,34 +547,45 @@ export default function App() {
     persist({ approvalMode: mode });
   }
 
-  async function refresh(id: string): Promise<void> {
+  async function refresh(id: string, view = viewRef.current): Promise<void> {
     const payload = await api.getSession(id);
+    if (view !== viewRef.current) return;
     setMessages(buildMessages(payload.path));
     applySession(payload.session);
   }
 
-  async function runStream(
+  /**
+   * Show a turn's events as they stream in, then settle the view from the
+   * server. `open` resolving `false` means there was no turn to watch.
+   *
+   * Only the current stream touches the view. One that was replaced, or left
+   * behind when the user moved to another conversation, still winds down, but
+   * its late events, its error and its refetch all stay out of the view.
+   */
+  async function watch(
     id: string,
-    fn: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<void>,
+    open: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<unknown>,
   ): Promise<void> {
+    const view = viewRef.current;
+    streamRef.current?.abort();
     const controller = new AbortController();
-    abortRef.current = controller;
+    streamRef.current = controller;
+    const current = (): boolean => streamRef.current === controller;
     // Starting a turn is an explicit request to watch it, even from scrollback.
     stickToBottom.current = true;
     setBusy(true);
     setError(null);
     setInFlight([]);
     setWarnings([]);
+    let watched = true;
     try {
-      await fn(handleEvent, controller.signal);
+      watched = (await open((event) => current() && handleEvent(event), controller.signal)) !== false;
     } catch (e) {
       // A turn the user stopped is not a failure; detaching is not either.
-      if (!api.isAbortError(e)) setError(String(e));
+      if (current() && !api.isAbortError(e)) setError(String(e));
     } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      // If the user moved to another conversation, leave its view alone: the
-      // turn keeps running server-side and these messages are persisted anyway.
-      if (sessionIdRef.current === id) {
+      if (current()) {
+        streamRef.current = null;
         // Hand the streamed turn to the history *before* the refetch. `refresh`
         // replaces the list wholesale from the server's branch path, so promoting
         // first means the refetch is a quiet reconciliation instead of a swap that
@@ -546,11 +594,20 @@ export default function App() {
         const streamed = inFlightRef.current;
         if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
         setInFlight([]);
-        await refresh(id).catch(() => undefined);
-        await refreshSessions();
-        setBusy(false);
+        if (watched) {
+          await refresh(id, view).catch(() => undefined);
+          await refreshSessions();
+        }
+        if (view === viewRef.current && !streamRef.current) setBusy(false);
       }
     }
+  }
+
+  function runStream(
+    id: string,
+    fn: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    return watch(id, fn);
   }
 
   /**
@@ -558,46 +615,24 @@ export default function App() {
    * switching back to a conversation the model is still working on. Does
    * nothing when the session is idle.
    */
-  async function followActiveTurn(id: string): Promise<void> {
-    if (sessionIdRef.current !== id) return;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    stickToBottom.current = true;
-    setBusy(true);
-    setError(null);
-    setInFlight([]);
-    setWarnings([]);
-    try {
-      const following = await api.followTurn(id, handleEvent, controller.signal);
-      if (!following) return;
-    } catch (e) {
-      if (!api.isAbortError(e)) setError(String(e));
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      if (sessionIdRef.current === id) {
-        const streamed = inFlightRef.current;
-        if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
-        setInFlight([]);
-        await refresh(id).catch(() => undefined);
-        await refreshSessions();
-        setBusy(false);
-      }
-    }
+  function followActiveTurn(id: string): Promise<void> {
+    return watch(id, (onEvent, signal) => api.followTurn(id, onEvent, signal));
   }
 
-  /** Detach this tab from the stream without cancelling the turn. */
+  /**
+   * Leave the current stream: the turn keeps running on the server, and none
+   * of its events or cleanup reach the view. The caller settles the view.
+   */
   function detachStream(): void {
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
+    streamRef.current?.abort();
+    streamRef.current = null;
   }
 
-  /** Stop button: really cancel the turn, then detach. */
+  /** Stop button: really cancel the turn. The stream's cleanup settles the view. */
   function stop(): void {
     const id = sessionIdRef.current;
     if (id) void api.cancelTurn(id).catch(() => undefined);
-    detachStream();
+    streamRef.current?.abort();
   }
 
   async function ensureSession(): Promise<string> {
@@ -606,35 +641,66 @@ export default function App() {
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     await refreshSessions();
-    if (policyMode !== "ask" || reasoningEffort !== "off") {
-      const updated = await api.updateSession(payload.session.id, {
-        approvalMode: policyMode,
-        allowedTools: parseAllowlist(allowedToolsText),
-        reasoningEffort,
-      });
-      applySession(updated);
-    }
+    // What the composer shows is this chat's settings. Always send them: a new
+    // session gets the server's defaults, which need not match (skipping "ask"
+    // left a chat the user set to ask running tools without asking).
+    const updated = await api.updateSession(payload.session.id, {
+      approvalMode: policyMode,
+      allowedTools: parseAllowlist(allowedToolsText),
+      reasoningEffort,
+    });
+    applySession(updated);
     return payload.session.id;
+  }
+
+  /**
+   * Put an unsent draft back in the composer, keeping whatever the user has
+   * written since: their text, or their attachments, win over the draft's.
+   */
+  function putBackDraft(draft: Draft): void {
+    const current = composerRef.current;
+    if (!current.text && draft.text) setInput(draft.text);
+    if (current.attachments.length === 0) setPending(draft.attachments);
+    else releasePreviews(draft.attachments);
+  }
+
+  /**
+   * Give back a draft that was not sent. Only into the conversation it was
+   * written in: if the user has opened another one since, it waits for them
+   * to come back to its own.
+   */
+  function giveBackDraft(draft: Draft, sentFromView: number, sessionIdSentTo: string | null): void {
+    if (viewRef.current === sentFromView) {
+      putBackDraft(draft);
+      return;
+    }
+    if (!sessionIdSentTo) {
+      releasePreviews(draft.attachments);
+      return;
+    }
+    const previous = refusedDrafts.current.get(sessionIdSentTo);
+    if (previous) releasePreviews(previous.attachments);
+    refusedDrafts.current.set(sessionIdSentTo, draft);
   }
 
   async function send(): Promise<void> {
     const text = input.trim();
     if ((!text && pending.length === 0) || busy) return;
     const attachments = pending;
+    const draft: Draft = { text, attachments };
+    const sentFromView = viewRef.current;
+    const sessionAtSend = sessionIdRef.current;
     setInput("");
     setPending([]);
     setError(null);
 
-    const revoke = (): void =>
-      attachments.forEach((a) => a.previewUrl && URL.revokeObjectURL(a.previewUrl));
     let uploaded: api.AttachmentRecord[] = [];
     try {
       uploaded = await Promise.all(attachments.map((a) => api.uploadAttachment(a.file)));
     } catch (e) {
       // Nothing was sent, so give the user their draft back.
-      setInput(text);
-      setPending(attachments);
-      setError(e instanceof Error ? e.message : String(e));
+      giveBackDraft(draft, sentFromView, sessionAtSend);
+      if (viewRef.current === sentFromView) setError(e instanceof Error ? e.message : String(e));
       return;
     }
 
@@ -655,23 +721,34 @@ export default function App() {
       },
     ]);
 
+    let refused = false;
+    let sessionIdSentTo = sessionAtSend;
     try {
       const id = await ensureSession();
-      await runStream(id, (onEvent, signal) =>
-        api.sendTurn(
-          id,
-          text,
-          model,
-          uploaded.map((record, index) => ({ id: record.id, name: attachments[index].file.name })),
-          onEvent,
-          signal,
-        ),
-      );
+      sessionIdSentTo = id;
+      await runStream(id, async (onEvent, signal) => {
+        try {
+          await api.sendTurn(
+            id,
+            text,
+            model,
+            uploaded.map((record, index) => ({ id: record.id, name: attachments[index].file.name })),
+            onEvent,
+            signal,
+          );
+        } catch (e) {
+          // The server said no before a turn started (another reply running,
+          // too many turns): nothing was sent.
+          refused = e instanceof api.HttpError;
+          throw e;
+        }
+      });
     } catch (e) {
       if (!api.isAbortError(e)) setError(String(e));
       setBusy(false);
     } finally {
-      revoke();
+      if (refused) giveBackDraft(draft, sentFromView, sessionIdSentTo);
+      else releasePreviews(attachments);
     }
   }
 
@@ -722,7 +799,9 @@ export default function App() {
   }
 
   async function newChat(): Promise<void> {
+    const view = ++viewRef.current;
     detachStream();
+    setBusy(false);
     setMessages([]);
     setInFlight([]);
     setError(null);
@@ -732,6 +811,7 @@ export default function App() {
     setSettingsOpen(false);
     stickToBottom.current = true;
     const payload = await api.createSession(model);
+    if (view !== viewRef.current) return;
     setSessionId(payload.session.id);
     applySession(payload.session);
     await refreshSessions();
@@ -742,6 +822,7 @@ export default function App() {
    * message is the active one and bring the message into view.
    */
   async function openSession(id: string, messageId?: string): Promise<void> {
+    const view = ++viewRef.current;
     detachStream();
     setBusy(false);
     setError(null);
@@ -755,6 +836,8 @@ export default function App() {
     if (messageId && !payload.path.some((node) => node.message.id === messageId)) {
       payload = await api.selectBranch(id, messageId).catch(() => payload);
     }
+    // Another conversation was opened meanwhile; the last click wins.
+    if (view !== viewRef.current) return;
     if (messageId) {
       stickToBottom.current = false;
       setHighlightId(messageId);
@@ -765,6 +848,11 @@ export default function App() {
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     applySession(payload.session);
+    const refused = refusedDrafts.current.get(payload.session.id);
+    if (refused) {
+      refusedDrafts.current.delete(payload.session.id);
+      putBackDraft(refused);
+    }
     void followActiveTurn(payload.session.id);
   }
 
@@ -775,7 +863,15 @@ export default function App() {
 
   async function handleDelete(id: string): Promise<void> {
     await api.deleteSession(id);
-    if (id === sessionId) {
+    const refused = refusedDrafts.current.get(id);
+    if (refused) {
+      refusedDrafts.current.delete(id);
+      releasePreviews(refused.attachments);
+    }
+    if (id === sessionIdRef.current) {
+      viewRef.current++;
+      detachStream();
+      setBusy(false);
       setSessionId(null);
       setMessages([]);
       setInFlight([]);
@@ -788,17 +884,20 @@ export default function App() {
     try {
       await api.login(password);
       setPassword("");
-      const status = await api.getAuthStatus();
-      setAuth({ required: status.required, authenticated: status.authenticated });
+      setAuth(await api.getAuthStatus());
     } catch (e) {
       setLoginError(String(e));
     }
   }
 
   async function doLogout(): Promise<void> {
+    viewRef.current++;
     detachStream();
+    setBusy(false);
     await api.logout();
-    setAuth({ required: true, authenticated: false });
+    // A native shell is signed in by its token, so signing out forgets it.
+    if (config && isNativeShell()) setConfig(await saveConfig({ ...config, token: "" }));
+    setAuth((prev) => ({ required: true, authenticated: false, password: prev?.password }));
     setSessionId(null);
     setMessages([]);
     setInFlight([]);
@@ -828,15 +927,17 @@ export default function App() {
   }
 
   async function decide(callId: string, decision: "approve" | "deny"): Promise<void> {
-    const previous = inFlightRef.current;
-    patchInFlight((list) =>
-      applyEffect(list, { kind: "tool-approval", callId, status: approvalForDecision(decision) }),
-    );
+    // The card is in flight, or stored if this tab attached mid-turn.
+    const mark = (status: "requested" | "approved" | "denied"): void => {
+      patchInFlight((list) => applyEffect(list, { kind: "tool-approval", callId, status }));
+      setMessages((list) => applyStoredEffect(list, { kind: "tool-approval", callId, status }));
+    };
+    mark(approvalForDecision(decision));
     try {
       await api.resolveApproval(callId, decision, sessionId ?? undefined);
     } catch (e) {
-      // Roll back the optimistic patch so the approval stays actionable.
-      setInFlight(previous);
+      // Roll back the optimistic mark so the approval stays actionable.
+      mark("requested");
       setError(String(e));
     }
   }
@@ -861,6 +962,35 @@ export default function App() {
   }
 
   if (auth && auth.required && !auth.authenticated) {
+    // A native shell signs in with its token alone (a session cookie would not
+    // cross from its origin to the server's), so what it needs is a token the
+    // server accepts, not a password.
+    if (config && isNativeShell()) {
+      return (
+        <Connect
+          initial={config}
+          notice={config.token ? "The server did not accept this app's token." : "The server needs this app's token."}
+          onConnected={(saved) => {
+            setConfig(saved);
+            window.location.reload();
+          }}
+        />
+      );
+    }
+    if (!auth.password) {
+      return (
+        <div className="login">
+          <div className="login-card">
+            <div className="brand">Hat</div>
+            <p className="settings-hint">
+              This server only accepts its API token, which a browser tab does not send. Set{" "}
+              <code>HAT_AUTH_PASSWORD</code> on the server to sign in here, or use the desktop app with
+              the token.
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="login">
         <form

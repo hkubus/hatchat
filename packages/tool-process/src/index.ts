@@ -34,6 +34,9 @@ export function createProcessPlugin(): Plugin {
       manager?.killAll();
       manager = undefined;
     },
+    sessionDeleted(sessionId) {
+      manager?.killSession(sessionId);
+    },
   };
 }
 
@@ -61,6 +64,9 @@ export function createPythonPlugin(): Plugin {
     deactivate() {
       kernels?.killAll();
       kernels = undefined;
+    },
+    sessionDeleted(sessionId) {
+      kernels?.reset(sessionId);
     },
   };
 }

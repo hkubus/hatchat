@@ -13,7 +13,7 @@ import type {
 } from "@hat/core";
 import { DEFAULT_CAPABILITIES, textOf } from "@hat/core";
 import { Agent, type AgentTurnInput, type KernelDeps } from "./agent.js";
-import { estimateTokens, fitToContext } from "./context.js";
+import { estimateTextTokens, estimateTokens, fitToContext } from "./context.js";
 import { ProviderRegistry, ToolRegistry } from "./registries.js";
 
 const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -264,4 +264,62 @@ test("an over-full conversation is trimmed for the request and a warning is emit
   assert.ok(estimateTokens(sent) < 4_000);
   const warning = events.find((e) => e.type === "warning") as { message: string } | undefined;
   assert.match(warning?.message ?? "", /context window/);
+});
+
+test("fitToContext keeps the reply a Continue asks to continue", () => {
+  const history: ChatMessage[] = [];
+  for (let i = 0; i < 6; i++) {
+    history.push({ id: `u${i}`, role: "user", parts: [{ type: "text", text: big(4_000) }], createdAt: i });
+    history.push({ id: `a${i}`, role: "assistant", parts: [{ type: "text", text: big(4_000) }], createdAt: i });
+  }
+  history.push({ id: "q", role: "user", parts: [{ type: "text", text: big(8_000) }], createdAt: 10 });
+  history.push({ id: "cut", role: "assistant", parts: [{ type: "text", text: big(8_000) }], meta: { finishReason: "length" }, createdAt: 11 });
+  history.push({ id: "nudge", role: "user", parts: [{ type: "text", text: "Continue" }], meta: { synthetic: "continue" }, createdAt: 12 });
+
+  const fit = fitToContext(history, 6_000);
+  const kept = fit.messages.map((m) => m.id);
+  assert.ok(fit.droppedMessages > 0);
+  assert.ok(kept.includes("cut"), "the cut-off reply is still there to continue");
+  assert.ok(kept.includes("q"));
+});
+
+test("fitToContext keeps every result of the latest round of parallel calls", () => {
+  const round: ChatMessage[] = [
+    { id: "q", role: "user", parts: [{ type: "text", text: "read them all" }], createdAt: 1 },
+    {
+      id: "calls",
+      role: "assistant",
+      parts: [0, 1, 2, 3].map((i) => ({ type: "tool_call" as const, id: `c${i}`, name: "read_file", args: {} })),
+      createdAt: 2,
+    },
+    ...[0, 1, 2, 3].map((i) => ({
+      id: `parallel${i}`,
+      role: "tool" as const,
+      parts: [{ type: "tool_result" as const, id: `c${i}`, name: "read_file", content: [{ type: "text" as const, text: big(20_000) }] }],
+      createdAt: 3 + i,
+    })),
+  ];
+  const fit = fitToContext([...toolExchange(0, 20_000), ...round], 25_000);
+  for (const i of [0, 1, 2, 3]) {
+    const result = fit.messages.find((m) => m.id === `parallel${i}`)?.parts[0] as { content: Array<{ text: string }> };
+    assert.equal(result.content[0].text.length, 20_000, `result ${i} is intact`);
+  }
+  assert.ok(fit.elidedToolResults >= 1, "the older exchange's output made room");
+});
+
+test("reasoning costs nothing, since it is never sent back", () => {
+  const withReasoning: ChatMessage = {
+    id: "a",
+    role: "assistant",
+    parts: [{ type: "reasoning", text: big(50_000) }, { type: "text", text: "answer" }],
+    createdAt: 1,
+  };
+  assert.ok(estimateTokens([withReasoning]) < 10);
+});
+
+test("Chinese, Japanese and Korean text counts about a token a character", () => {
+  assert.equal(estimateTextTokens("東京".repeat(500)), 1_000);
+  assert.equal(estimateTextTokens("ひらがな한국어"), 7);
+  // Other text is estimated as before.
+  assert.equal(estimateTextTokens("x".repeat(35)), 10);
 });

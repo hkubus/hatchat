@@ -11,9 +11,12 @@ import { normalizeServerUrl, saveConfig } from "./runtime";
  */
 export default function Connect({
   initial,
+  notice,
   onConnected,
 }: {
   initial: HatConfig;
+  /** Why the screen is back, e.g. the server stopped accepting the token. */
+  notice?: string;
   onConnected: (config: HatConfig) => void;
 }): JSX.Element {
   const [serverUrl, setServerUrl] = useState(initial.serverUrl);
@@ -31,9 +34,18 @@ export default function Connect({
     setBusy(true);
     setError(null);
     try {
-      // Probe before saving: proves the address is reachable *and* that the
-      // server allows this app's origin.
-      const res = await fetch(`${base}/api/health`);
+      // Probe before saving: proves the address is reachable, that the server
+      // allows this app's origin, and that it accepts the token.
+      const res = await fetch(`${base}/api/health`, {
+        headers: token.trim() ? { authorization: `Bearer ${token.trim()}` } : {},
+      });
+      if (res.status === 401) {
+        throw new Error(
+          token.trim()
+            ? "The server did not accept this token. It must be the server's HAT_AUTH_TOKEN."
+            : "This server requires a token: its HAT_AUTH_TOKEN.",
+        );
+      }
       if (!res.ok) throw new Error(`server responded ${res.status}`);
     } catch (err) {
       setBusy(false);
@@ -53,6 +65,7 @@ export default function Connect({
     <div className="login">
       <form className="login-card" onSubmit={(e) => void submit(e)}>
         <div className="brand">Hat</div>
+        {notice && <div className="error">{notice}</div>}
         <p className="settings-hint">
           Connect to a hat server. Run <code>pnpm dev</code> on the machine that hosts it, then point
           this app at that address.

@@ -595,3 +595,272 @@ test("ephemeral runs hide excluded tools, skip persistence and give tools their 
   assert.deepEqual(emitted, [{ type: "warning", message: "from tool" }]);
   assert.deepEqual(persisted, []);
 });
+
+/** Calls `tools` (in one round) whenever the user spoke last, and answers once they have run. */
+function toolRoundProvider(tools: string[], counter = { calls: 0 }): Provider {
+  return {
+    id: "round",
+    label: "round",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true }),
+    listModels: async () => [],
+    async *chat(req) {
+      counter.calls += 1;
+      if (req.messages.at(-1)?.role === "tool") {
+        yield { type: "text.delta", text: "done" };
+        yield { type: "done", finishReason: "stop" as const };
+        return;
+      }
+      for (const name of tools) {
+        yield { type: "toolcall", call: { id: newId("call"), name, args: {} } };
+      }
+      yield { type: "done", finishReason: "tool_calls" as const };
+    },
+  };
+}
+
+function agentFor(provider: Provider, tools: Tool[], extra: Partial<ConstructorParameters<typeof Agent>[0]> = {}) {
+  const providers = new ProviderRegistry();
+  providers.register(provider);
+  const registry = new ToolRegistry();
+  for (const entry of tools) registry.register(entry);
+  return new Agent({
+    providers,
+    tools: registry,
+    resolveHost: async () => ({}) as ExecutionHost,
+    approval: { async request() { return "approve"; } },
+    secrets: { async get() { return undefined; } },
+    audit: { record() {} },
+    logger,
+    ...extra,
+  });
+}
+
+async function runTurn(
+  agent: Agent,
+  model: string,
+  options: { history?: ChatMessage[]; signal?: AbortSignal; mode?: ToolPolicy["mode"] } = {},
+): Promise<KernelEvent[]> {
+  const events: KernelEvent[] = [];
+  for await (const event of agent.run({
+    sessionId: "s1",
+    history: options.history ?? [],
+    model,
+    userText: "go",
+    signal: options.signal ?? new AbortController().signal,
+    toolPolicy: { ...DEFAULT_TOOL_POLICY, mode: options.mode ?? "auto", maxIterations: 5 },
+  })) {
+    events.push(event);
+  }
+  return events;
+}
+
+const okTool = (name: string, onRun?: () => void): Tool => ({
+  name,
+  description: "test",
+  async execute() {
+    onRun?.();
+    return [{ type: "text", text: "ok" }];
+  },
+});
+
+test("a turn stores its messages as one chain, starting after its history", async () => {
+  const stored: Array<{ id: string; role: string; parentId: string | null }> = [];
+  const agent = agentFor(toolRoundProvider(["a", "b"]), [okTool("a"), okTool("b")], {
+    onMessage: (_s, message, parentId) => stored.push({ id: message.id, role: message.role, parentId }),
+  });
+  const history: ChatMessage[] = [
+    { id: "u0", role: "user", parts: [{ type: "text", text: "earlier" }], createdAt: 1 },
+    { id: "a0", role: "assistant", parts: [{ type: "text", text: "reply" }], createdAt: 2 },
+  ];
+
+  await runTurn(agent, "round/m", { history });
+
+  assert.deepEqual(stored.map((m) => m.role), ["user", "assistant", "tool", "tool", "assistant"]);
+  assert.equal(stored[0].parentId, "a0");
+  for (let i = 1; i < stored.length; i++) assert.equal(stored[i].parentId, stored[i - 1].id);
+});
+
+test("a cached host whose runner went away is replaced, not reused", async () => {
+  const hosts: Array<{ id: string; closed: boolean }> = [];
+  const used: string[] = [];
+  const recorder: Tool = {
+    name: "where",
+    description: "records its host",
+    async execute(_args, ctx) {
+      used.push(ctx.host.id);
+      return [{ type: "text", text: "ok" }];
+    },
+  };
+  const agent = agentFor(toolRoundProvider(["where"]), [recorder], {
+    resolveHost: async () => {
+      const host = { id: `host-${hosts.length + 1}`, closed: false };
+      hosts.push(host);
+      return host as unknown as ExecutionHost;
+    },
+  });
+
+  await runTurn(agent, "round/m");
+  await runTurn(agent, "round/m");
+  assert.deepEqual(used, ["host-1", "host-1"]);
+
+  hosts[0].closed = true; // its runner reconnected: the old link will never answer
+  await runTurn(agent, "round/m");
+  assert.deepEqual(used, ["host-1", "host-1", "host-2"]);
+});
+
+test("stopping a turn mid-round abandons a hung tool and starts nothing else", async () => {
+  const counter = { calls: 0 };
+  const stop = new AbortController();
+  let laterRan = false;
+  const hung: Tool = {
+    name: "hung",
+    description: "ignores its signal, like a wedged MCP server",
+    execute() {
+      stop.abort();
+      return new Promise<Part[]>(() => {});
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(toolRoundProvider(["hung", "later"], counter), [hung, okTool("later", () => (laterRan = true))], {
+    stopGraceMs: 20,
+    onMessage: (_s, message) => stored.push(message),
+  });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal });
+
+  assert.equal(laterRan, false);
+  assert.equal(counter.calls, 1, "no model call after the stop");
+  const results = events.filter((e) => e.type === "tool.result");
+  assert.equal(results.length, 2);
+  assert.ok(results.every((e) => e.type === "tool.result" && e.isError));
+  assert.equal(events.at(-1)?.type, "turn.done");
+  // Every tool call still has a stored result, so the history stays well-formed.
+  assert.deepEqual(stored.map((m) => m.role), ["user", "assistant", "tool", "tool"]);
+});
+
+test("a tool that honours the stop keeps its own result", async () => {
+  const stop = new AbortController();
+  const cooperative: Tool = {
+    name: "build",
+    description: "returns what it has when cancelled",
+    execute(_args, ctx) {
+      return new Promise<Part[]>((resolve) => {
+        ctx.signal.addEventListener("abort", () => resolve([{ type: "text", text: "partial output [cancelled]" }]));
+        stop.abort();
+      });
+    },
+  };
+  const agent = agentFor(toolRoundProvider(["build"]), [cooperative], { stopGraceMs: 1_000 });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal });
+
+  const result = events.find((e) => e.type === "tool.result");
+  assert.ok(result && result.type === "tool.result");
+  assert.match(JSON.stringify(result.parts), /partial output/);
+});
+
+test("stopping while an approval is pending records the call as stopped, not denied", async () => {
+  const stop = new AbortController();
+  const gated: Tool = { ...okTool("gated"), requiresApproval: true };
+  const agent = agentFor(toolRoundProvider(["gated"]), [gated], {
+    approval: {
+      request: (_req, signal) =>
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("approval aborted")), { once: true });
+          stop.abort(); // the user presses Stop instead of answering
+        }),
+    },
+  });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal, mode: "ask" });
+
+  const result = events.find((e) => e.type === "tool.result");
+  assert.ok(result && result.type === "tool.result");
+  assert.match(JSON.stringify(result.parts), /not run: the turn was stopped/);
+  assert.doesNotMatch(JSON.stringify(result.parts), /denied/);
+});
+
+test("a call that fails before any output stores no reply, and the next request carries none", async () => {
+  let fail = true;
+  const sent: ChatMessage[][] = [];
+  const flaky: Provider = {
+    id: "flaky",
+    label: "flaky",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES }),
+    listModels: async () => [],
+    async *chat(req) {
+      sent.push(req.messages);
+      if (fail) {
+        yield { type: "error", error: { code: "http_401", message: "invalid api key", retryable: false } };
+        return;
+      }
+      yield { type: "text.delta", text: "hello" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(flaky, [], { onMessage: (_s, message) => stored.push(message) });
+
+  const events = await runTurn(agent, "flaky/m");
+  assert.ok(events.some((e) => e.type === "error"));
+  assert.deepEqual(stored.map((m) => m.role), ["user"]);
+
+  // The user fixes the key and asks again, on top of what was stored.
+  fail = false;
+  await runTurn(agent, "flaky/m", { history: [...stored] });
+  const roles = sent[1].map((m) => m.role);
+  assert.deepEqual(roles, ["user"], "the two user turns go out as one, with no empty reply between");
+});
+
+test("stopping mid-reply keeps what streamed, marks it unfinished and reports no error", async () => {
+  const stop = new AbortController();
+  const slow: Provider = {
+    id: "slow",
+    label: "slow",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES }),
+    listModels: async () => [],
+    async *chat(_req, signal) {
+      yield { type: "text.delta", text: "The answer is" };
+      stop.abort();
+      await new Promise((_resolve, reject) => {
+        if (signal.aborted) reject(new DOMException("This operation was aborted", "AbortError"));
+        signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+      });
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(slow, [], { onMessage: (_s, message) => stored.push(message) });
+
+  const events = await runTurn(agent, "slow/m", { signal: stop.signal });
+
+  assert.equal(events.some((e) => e.type === "error"), false);
+  const reply = stored.find((m) => m.role === "assistant");
+  assert.ok(reply);
+  assert.deepEqual(reply.parts, [{ type: "text", text: "The answer is" }]);
+  assert.equal(reply.meta?.incomplete, true);
+});
+
+test("history is repaired for a model with a known context window too", async () => {
+  const sent: ChatMessage[][] = [];
+  const windowed: Provider = {
+    id: "windowed",
+    label: "windowed",
+    // A context window turns on fitting, which must work on the repaired history.
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true, contextWindow: 100_000 }),
+    listModels: async () => [],
+    async *chat(req) {
+      sent.push(req.messages);
+      yield { type: "text.delta", text: "hello" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+  const at = Date.now();
+  // The server stopped mid-call: the call never got its result.
+  const history: ChatMessage[] = [
+    { id: "u0", role: "user", parts: [{ type: "text", text: "list files" }], createdAt: at },
+    { id: "a0", role: "assistant", parts: [{ type: "tool_call", id: "c1", name: "shell_exec", args: {} }], createdAt: at + 1 },
+  ];
+  await runTurn(agentFor(windowed, []), "windowed/m", { history });
+  const roles = sent[0].filter((m) => m.role !== "system").map((m) => m.role);
+  assert.deepEqual(roles, ["user", "assistant", "tool", "user"], "the dangling call is answered before the new message");
+});

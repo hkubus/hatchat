@@ -50,6 +50,11 @@ export interface MasterKey {
   key: Buffer;
   source: "env" | "file" | "generated";
   path?: string;
+  /**
+   * A key file ignored because `HAT_MASTER_KEY` is set, holding a different
+   * key: whatever was saved before the variable was set is encrypted with it.
+   */
+  shadowedFile?: string;
 }
 
 /**
@@ -63,7 +68,20 @@ export function loadMasterKey(options: {
 }): MasterKey {
   const envVar = options.envVar ?? "HAT_MASTER_KEY";
   const fromEnv = process.env[envVar];
-  if (fromEnv) return { key: parseKey(fromEnv), source: "env" };
+  if (fromEnv) {
+    const key = parseKey(fromEnv);
+    let fileKey: Buffer | undefined;
+    try {
+      if (fs.existsSync(options.filePath)) fileKey = parseKey(fs.readFileSync(options.filePath, "utf8"));
+    } catch {
+      /* an unreadable key file is not one secrets were saved under */
+    }
+    return {
+      key,
+      source: "env",
+      ...(fileKey && !fileKey.equals(key) ? { shadowedFile: options.filePath } : {}),
+    };
+  }
 
   if (fs.existsSync(options.filePath)) {
     return {

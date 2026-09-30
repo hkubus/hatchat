@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@hat/core": "workspace:*",
+    "@hat/net-guard": "workspace:*",
     "playwright-core": "1.48.0",
     "zod": "^3.24.1"
   }

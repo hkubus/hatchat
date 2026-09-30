@@ -1,6 +1,6 @@
-import type { Part, Plugin, Tool } from "@hat/core";
+import type { Part, Plugin, ProcessHost, Tool } from "@hat/core";
 import { z } from "zod";
-import { connectHttp, connectStdio, type McpClient, type McpTool } from "./mcp.js";
+import { connectHttp, connectStdio, type McpClient, type McpConnection, type McpTool } from "./mcp.js";
 
 export const mcpServerSchema = z.object({
   name: z.string().min(1, "each MCP server needs a name"),
@@ -105,6 +105,23 @@ function sanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
+/**
+ * `mcp__<server>__<tool>`, unique among the names already `taken`.
+ * Sanitizing folds distinct names together (`get-item` and `get_item`, or
+ * servers "a b" and "a-b"), and a duplicate registration fails the whole
+ * plugin, so a clash gets a short hash of the name it came from.
+ */
+export function mcpToolName(serverName: string, toolName: string, taken: Set<string>): string {
+  let name = `mcp__${sanitize(serverName)}__${sanitize(toolName)}`;
+  if (taken.has(name)) {
+    let hash = 5381;
+    for (const char of `${serverName}\u0000${toolName}`) hash = ((hash << 5) + hash + char.charCodeAt(0)) | 0;
+    name = `${name}_${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  }
+  taken.add(name);
+  return name;
+}
+
 function toParts(result: { content?: unknown[]; isError?: boolean }): Part[] {
   const parts: Part[] = [];
   for (const item of (result.content ?? []) as Array<Record<string, unknown>>) {
@@ -141,6 +158,7 @@ export function mcpToolNeedsApproval(
 }
 
 function makeTool(
+  name: string,
   serverName: string,
   tool: McpTool,
   client: McpClient,
@@ -148,11 +166,11 @@ function makeTool(
   isRunnerUp: () => boolean,
 ): Tool {
   return {
-    name: `mcp__${sanitize(serverName)}__${sanitize(tool.name)}`,
+    name,
     description: tool.description ?? `MCP tool "${tool.name}" from ${serverName}`,
     parameters: tool.inputSchema ?? { type: "object", properties: {} },
     requiresApproval: requireApproval,
-    async execute(args): Promise<Part[]> {
+    async execute(args, ctx): Promise<Part[]> {
       // The stdio process lives on the runner, so it dies with it. The tool
       // stays registered on purpose: unregistering would make it disappear
       // from the model's tool list mid-turn, and "Unknown tool" is a far worse
@@ -166,10 +184,36 @@ function makeTool(
           },
         ];
       }
-      const result = await client.callTool(tool.name, args ?? {});
+      const result = await client.callTool(tool.name, args ?? {}, ctx.signal);
       return toParts(result);
     },
   };
+}
+
+async function connectServer(server: ServerConfig, processHost: ProcessHost | undefined): Promise<McpConnection> {
+  if ((server.transport ?? "stdio") === "http") {
+    // validateServers guarantees url is present for http servers.
+    return connectHttp(server.url ?? "", server.token);
+  }
+  if (!processHost) {
+    throw new Error("No runner connected; stdio MCP servers need a runner.");
+  }
+  try {
+    return await connectStdio(processHost, {
+      // validateServers guarantees command is present for stdio servers.
+      command: server.command ?? "",
+      args: server.args,
+      env: server.env,
+    });
+  } catch (error) {
+    // The usual cause at boot is that no runner has dialed in yet. The
+    // server reactivates this plugin when one does, so say so instead
+    // of leaving a bare spawn failure in the plugin list.
+    throw new Error(
+      `MCP server ${server.name}: ${error instanceof Error ? error.message : String(error)} ` +
+        `(stdio servers run on the runner; this retries when one connects)`,
+    );
+  }
 }
 
 export function createMcpPlugin(): Plugin {
@@ -190,53 +234,41 @@ export function createMcpPlugin(): Plugin {
       validateServers(servers);
       const requireApproval = config.requireApproval ?? true;
       const isRunnerUp = ctx.runnerAvailable ?? (() => Boolean(ctx.processHost));
+      const taken = new Set<string>();
 
-      for (const server of servers) {
-        let connection;
-        if ((server.transport ?? "stdio") === "http") {
-          // validateServers guarantees url is present for http servers.
-          connection = await connectHttp(server.url ?? "", server.token);
-        } else {
-          if (!ctx.processHost) {
-            throw new Error("No runner connected; stdio MCP servers need a runner.");
+      try {
+        for (const server of servers) {
+          const connection = await connectServer(server, ctx.processHost);
+          connections.set(server.name, { close: connection.close });
+          const tools = await connection.client.listTools();
+          for (const tool of tools) {
+            const needsApproval = mcpToolNeedsApproval(tool, requireApproval, server.trustReadOnlyHint ?? true);
+            const name = mcpToolName(server.name, tool.name, taken);
+            ctx.register.tool(makeTool(name, server.name, tool, connection.client, needsApproval, isRunnerUp));
           }
-          try {
-            connection = await connectStdio(ctx.processHost, {
-              // validateServers guarantees command is present for stdio servers.
-              command: server.command ?? "",
-              args: server.args,
-              env: server.env,
-            });
-          } catch (error) {
-            // The usual cause at boot is that no runner has dialed in yet. The
-            // server reactivates this plugin when one does, so say so instead
-            // of leaving a bare spawn failure in the plugin list.
-            throw new Error(
-              `MCP server ${server.name}: ${error instanceof Error ? error.message : String(error)} ` +
-                `(stdio servers run on the runner; this retries when one connects)`,
-            );
-          }
+          ctx.logger.info(`connected ${server.name}: ${tools.length} tool(s)`);
         }
-
-        connections.set(server.name, { close: connection.close });
-        const tools = await connection.client.listTools();
-        for (const tool of tools) {
-          const needsApproval = mcpToolNeedsApproval(tool, requireApproval, server.trustReadOnlyHint ?? true);
-          ctx.register.tool(makeTool(server.name, tool, connection.client, needsApproval, isRunnerUp));
-        }
-        ctx.logger.info(`connected ${server.name}: ${tools.length} tool(s)`);
+      } catch (error) {
+        // The host drops the tools registered so far; the connections are
+        // this plugin's to close, or their processes outlive it.
+        closeAll();
+        throw error;
       }
     },
 
     deactivate() {
-      for (const connection of connections.values()) {
-        try {
-          connection.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      connections.clear();
+      closeAll();
     },
   };
+
+  function closeAll(): void {
+    for (const connection of connections.values()) {
+      try {
+        connection.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    connections.clear();
+  }
 }

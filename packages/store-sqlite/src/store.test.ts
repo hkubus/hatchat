@@ -47,6 +47,25 @@ test("branches, selects and walks the message tree", () => {
   store.close();
 });
 
+test("the active leaf follows an append only while it points at the parent", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("u1", "user", "one"));
+  store.appendMessage(session.id, message("a1", "assistant", "reply"));
+  store.appendMessage(session.id, message("u2", "user", "two"), "a1");
+  assert.deepEqual(ids(store, session.id), ["u1", "a1", "u2"]);
+
+  // The user switches to another branch while a turn is still writing its own.
+  store.setActiveLeaf(session.id, "u1");
+  store.appendMessage(session.id, message("a2", "assistant", "reply two"), "u2");
+  assert.deepEqual(ids(store, session.id), ["u1"]);
+  assert.deepEqual(store.children(session.id, "u2").map((m) => m.id), ["a2"]);
+
+  store.selectBranch(session.id, "a1");
+  assert.deepEqual(ids(store, session.id), ["u1", "a1", "u2", "a2"]);
+  store.close();
+});
+
 test("a new session persists the auto/low defaults it reports", () => {
   const store = new Store(":memory:", crypto.randomBytes(32));
   const created = store.createSession("fake/fake-agent");
@@ -466,4 +485,53 @@ test("synthetic nudges are neither searchable nor counted as visible rows", () =
   assert.equal(store.hasMessage(session.id, "m1"), true);
   const other = store.createSession("fake/fake-agent");
   assert.equal(store.hasMessage(other.id, "m1"), false);
+});
+
+test("a secret saved under another master key reads as unset instead of throwing", async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hat-store-")), "hat.db");
+  const before = new Store(file, crypto.randomBytes(32));
+  before.setSecret("HAT_TEST_PROVIDER_KEY", "sk-old");
+  before.close();
+
+  // The key changed: HAT_MASTER_KEY set to a new value, or master.key lost.
+  const after = new Store(file, crypto.randomBytes(32));
+  assert.equal(await after.get("HAT_TEST_PROVIDER_KEY"), undefined);
+  assert.equal(after.hasSecret("HAT_TEST_PROVIDER_KEY"), false);
+  assert.deepEqual(after.unreadableSecrets(), ["HAT_TEST_PROVIDER_KEY"]);
+
+  after.setSecret("HAT_TEST_PROVIDER_KEY", "sk-new");
+  assert.equal(await after.get("HAT_TEST_PROVIDER_KEY"), "sk-new");
+  assert.deepEqual(after.unreadableSecrets(), []);
+  after.close();
+});
+
+test("a secret records the plugin it was saved for, and keeps it on a new value", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  store.setSecret("PLUGIN_TOKEN", "v1", "weather");
+  assert.equal(store.ownerOf("PLUGIN_TOKEN"), "weather");
+  store.setSecret("PLUGIN_TOKEN", "v2");
+  assert.equal(store.ownerOf("PLUGIN_TOKEN"), "weather", "a new value alone does not change whose it is");
+  store.setSecret("PLUGIN_TOKEN", "v3", "other");
+  assert.equal(store.ownerOf("PLUGIN_TOKEN"), "other");
+
+  store.setSecret("GENERAL", "x");
+  assert.equal(store.ownerOf("GENERAL"), "", "saved for no plugin");
+  assert.equal(store.ownerOf("MISSING"), undefined);
+  store.close();
+});
+
+test("secrets saved before owners existed read as unowned until claimed", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hat-store-")), "hat.db");
+  const key = crypto.randomBytes(32);
+  const before = new Store(file, key);
+  before.setSecret("LEGACY", "v");
+  // What a database from before the owner column holds.
+  (before as unknown as { db: { exec(sql: string): void } }).db.exec(`UPDATE secrets SET owner = NULL`);
+  before.close();
+
+  const after = new Store(file, key);
+  assert.equal(after.ownerOf("LEGACY"), null);
+  after.setOwner("LEGACY", "weather");
+  assert.equal(after.ownerOf("LEGACY"), "weather");
+  after.close();
 });

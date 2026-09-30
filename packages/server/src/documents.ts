@@ -66,7 +66,9 @@ function decodeText(data: Uint8Array): string | undefined {
 async function pdfText(data: Uint8Array): Promise<string> {
   // Loaded lazily: pdf.js is large and most servers never see a PDF.
   const { extractText, getDocumentProxy } = await import("unpdf");
-  const pdf = await getDocumentProxy(data);
+  // pdf.js refuses a Node Buffer (what the upload route has) and takes over the
+  // memory it is given, so it gets a private copy: the caller still stores it.
+  const pdf = await getDocumentProxy(new Uint8Array(data));
   const { text } = await extractText(pdf, { mergePages: true });
   return (Array.isArray(text) ? text.join("\n\n") : text).trim();
 }

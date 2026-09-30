@@ -61,3 +61,14 @@ test("emit routes out-of-band events into the active turn", () => {
   hub.emit("s1", event("tool.approval"));
   assert.deepEqual(seen, ["tool.approval"]);
 });
+
+test("settled reports whether the turn ended within the time allowed", async () => {
+  const hub = new TurnHub();
+  const turn = hub.start("s1");
+  assert.equal(await turn.settled(20), false);
+
+  const waiting = turn.settled(1_000);
+  hub.finish(turn);
+  assert.equal(await waiting, true);
+  assert.equal(await turn.settled(20), true);
+});

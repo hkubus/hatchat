@@ -38,6 +38,17 @@ export interface IsolationOptions {
   startTimeoutMs?: number;
   /** How long `activate` may run before the child is killed. */
   activateTimeoutMs?: number;
+  /**
+   * Secret names a plugin may not declare: those the built-in plugins use.
+   * `HAT_*` names are always reserved.
+   */
+  reservedSecrets?: readonly string[];
+  /**
+   * The ids of every installed plugin that declares a secret name. A secret
+   * saved before secrets recorded their owner goes to a plugin only when it
+   * is the one plugin that wants that name.
+   */
+  secretClaimants?: (name: string) => readonly string[];
 }
 
 /**
@@ -76,6 +87,8 @@ export async function loadIsolatedPlugin(file: string, options: IsolationOptions
     requiresSecrets: manifest.requiresSecrets,
     configJsonSchema: manifest.configJsonSchema,
     async activate(ctx) {
+      const refused = await secretsProblem(manifest, ctx, options);
+      if (refused) throw new Error(refused);
       const proc = new PluginProcess(file, options);
       current = proc;
       try {
@@ -208,7 +221,12 @@ class PluginProcess {
       if (!manifest.requiresSecrets.includes(name)) {
         throw new Error(`secret "${name}" is not declared in requiresSecrets`);
       }
-      return ctx.secrets.get(name);
+      // Saved for this plugin only (checked, and legacy ones claimed, at
+      // activation); never the server's environment.
+      if (ctx.secrets.ownerOf?.(name) !== manifest.id) {
+        throw new Error(`secret "${name}" was not saved for plugin ${manifest.id}`);
+      }
+      return ctx.secrets.getStored?.(name);
     });
     this.serveHost(manifest);
     this.onCrash = (error) => ctx.fail?.(error);
@@ -465,6 +483,55 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 }
 
 // The child is untrusted: check the shapes it reports before using them.
+
+/**
+ * Why a sandboxed plugin can't have the secrets it declares, if it can't.
+ * A plugin names its own `requiresSecrets`, so the names prove nothing: it is
+ * refused hat's own (`HAT_AUTH_TOKEN`, `HAT_MASTER_KEY`, ...) and those of the
+ * built-in plugins (the user's provider keys), and is only ever served
+ * secrets saved in hat for it (`POST /api/secrets` with its id as `plugin`),
+ * never another plugin's, one saved for no plugin, or the server's
+ * environment. A secret saved before secrets had owners is given to the one
+ * plugin that declares it, and stays its own from then on.
+ */
+async function secretsProblem(
+  manifest: PluginManifest,
+  ctx: PluginContext,
+  options: Pick<IsolationOptions, "reservedSecrets" | "secretClaimants">,
+): Promise<string | undefined> {
+  const reserved = options.reservedSecrets ?? [];
+  const forbidden = manifest.requiresSecrets.filter((name) => /^HAT_/i.test(name) || reserved.includes(name));
+  if (forbidden.length > 0) {
+    return `plugins may not read ${forbidden.join(", ")}: reserved for hat and its built-in plugins`;
+  }
+  const missing: string[] = [];
+  const notOurs: string[] = [];
+  for (const name of manifest.requiresSecrets) {
+    if ((await ctx.secrets.getStored?.(name)) === undefined) {
+      missing.push(name);
+      continue;
+    }
+    const owner = ctx.secrets.ownerOf?.(name);
+    if (owner === manifest.id) continue;
+    const claimants = options.secretClaimants?.(name) ?? [manifest.id];
+    if (owner === null && ctx.secrets.setOwner && claimants.every((id) => id === manifest.id)) {
+      ctx.secrets.setOwner(name, manifest.id);
+      ctx.logger.info(`secret ${name}, saved before secrets had owners, now belongs to plugin ${manifest.id}`);
+      continue;
+    }
+    notOurs.push(name);
+  }
+  if (missing.length > 0) {
+    return `missing secret: ${missing.join(", ")} (save it in Settings; plugins are not given the server's environment)`;
+  }
+  if (notOurs.length > 0) {
+    return (
+      `secret ${notOurs.join(", ")} was not saved for this plugin; save it with ` +
+      `POST /api/secrets {"name", "value", "plugin": "${manifest.id}"}`
+    );
+  }
+  return undefined;
+}
 
 function checkManifest(value: PluginManifest): PluginManifest {
   const strings = (list: unknown): list is string[] =>

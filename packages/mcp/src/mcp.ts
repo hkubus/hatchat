@@ -65,6 +65,9 @@ export interface McpConnection {
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 
+const MAX_TOOL_PAGES = 50;
+const TOOL_CALL_TIMEOUT_MS = 10 * 60_000;
+
 export class McpClient {
   constructor(readonly rpc: JsonRpcClient) {}
 
@@ -77,14 +80,34 @@ export class McpClient {
     this.rpc.notify("notifications/initialized");
   }
 
+  /** Every page of the tool list: a server may split it, with `nextCursor`. */
   async listTools(): Promise<McpTool[]> {
-    const result = await this.rpc.request<{ tools?: unknown }>("tools/list", {});
-    if (!Array.isArray(result?.tools)) return [];
-    return result.tools.flatMap((raw) => parseMcpTool(raw) ?? []);
+    const tools: McpTool[] = [];
+    let cursor: string | undefined;
+    // A cap, so a server handing back the same cursor can't spin forever.
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const result = await this.rpc.request<{ tools?: unknown; nextCursor?: unknown }>(
+        "tools/list",
+        cursor ? { cursor } : {},
+      );
+      if (Array.isArray(result?.tools)) tools.push(...result.tools.flatMap((raw) => parseMcpTool(raw) ?? []));
+      cursor = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
+      if (!cursor) break;
+    }
+    return tools;
   }
 
-  callTool(name: string, args: unknown): Promise<McpToolResult> {
-    return this.rpc.request<McpToolResult>("tools/call", { name, arguments: args ?? {} });
+  /**
+   * Call a tool. Some do real work (a scan, a build) and take minutes, so the
+   * limit is generous; stopping the turn ends the call at once, and tells the
+   * server to stop too.
+   */
+  callTool(name: string, args: unknown, signal?: AbortSignal): Promise<McpToolResult> {
+    return this.rpc.request<McpToolResult>(
+      "tools/call",
+      { name, arguments: args ?? {} },
+      { signal, timeoutMs: TOOL_CALL_TIMEOUT_MS },
+    );
   }
 
   onToolsChanged(handler: () => void): void {
@@ -102,7 +125,14 @@ export async function connectStdio(
 ): Promise<McpConnection> {
   const process = await processHost.spawn(request);
   const client = new McpClient(new JsonRpcClient(new StdioTransport(process)));
-  await client.initialize();
+  try {
+    await client.initialize();
+  } catch (error) {
+    // A server that never finished starting would otherwise be left running.
+    client.close();
+    process.kill();
+    throw error;
+  }
   return {
     client,
     close: () => {
@@ -114,6 +144,11 @@ export async function connectStdio(
 
 export async function connectHttp(url: string, token?: string): Promise<McpConnection> {
   const client = new McpClient(new JsonRpcClient(new HttpTransport(url, token)));
-  await client.initialize();
+  try {
+    await client.initialize();
+  } catch (error) {
+    client.close();
+    throw error;
+  }
   return { client, close: () => client.close() };
 }
