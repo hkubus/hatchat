@@ -670,23 +670,37 @@ export default function App() {
       },
     ]);
 
+    let refused = false;
     try {
       const id = await ensureSession();
-      await runStream(id, (onEvent, signal) =>
-        api.sendTurn(
-          id,
-          text,
-          model,
-          uploaded.map((record, index) => ({ id: record.id, name: attachments[index].file.name })),
-          onEvent,
-          signal,
-        ),
-      );
+      await runStream(id, async (onEvent, signal) => {
+        try {
+          await api.sendTurn(
+            id,
+            text,
+            model,
+            uploaded.map((record, index) => ({ id: record.id, name: attachments[index].file.name })),
+            onEvent,
+            signal,
+          );
+        } catch (e) {
+          // The server said no before a turn started (another reply running,
+          // too many turns): nothing was sent.
+          refused = e instanceof api.HttpError;
+          throw e;
+        }
+      });
     } catch (e) {
       if (!api.isAbortError(e)) setError(String(e));
       setBusy(false);
     } finally {
-      revoke();
+      if (refused) {
+        // Give the user their draft back, unless they already started another.
+        setInput((current) => current || text);
+        setPending((current) => (current.length > 0 ? current : attachments));
+      } else {
+        revoke();
+      }
     }
   }
 
