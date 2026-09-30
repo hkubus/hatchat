@@ -240,7 +240,15 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   // The built-in plugins' secrets (the user's provider keys) are theirs alone.
   const reservedSecrets = pluginHost.list().flatMap((plugin) => plugin.requiresSecrets);
   for (const plugin of config.enableExternalPlugins
-    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation, reservedSecrets })
+    ? await loadExternalPlugins(config.pluginsDir, logger, {
+        isolate: config.pluginIsolation,
+        reservedSecrets,
+        secretClaimants: (name) =>
+          pluginHost
+            .list()
+            .filter((plugin) => plugin.requiresSecrets.includes(name))
+            .map((plugin) => plugin.id),
+      })
     : []) {
     pluginHost.register(plugin, "external");
   }
@@ -762,7 +770,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   app.get("/api/secrets", (c) => c.json({ secrets: store.listSecretNames() }));
 
   app.post("/api/secrets", async (c) => {
-    let body: { name?: string; value?: string } = {};
+    let body: { name?: string; value?: string; plugin?: unknown } = {};
     try {
       body = await c.req.json();
     } catch {
@@ -771,7 +779,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!body.name || typeof body.value !== "string" || body.value.length === 0) {
       return c.json({ error: "name and value are required" }, 400);
     }
-    store.setSecret(body.name, body.value);
+    // `plugin`: the external plugin this secret is for. Sandboxed plugins
+    // are served only secrets saved for them.
+    if (body.plugin !== undefined) {
+      const plugin = typeof body.plugin === "string" ? pluginHost.get(body.plugin) : undefined;
+      if (!plugin) return c.json({ error: "no such plugin" }, 400);
+      if (!plugin.requiresSecrets.includes(body.name)) {
+        return c.json({ error: `plugin ${plugin.id} does not declare the secret ${body.name}` }, 400);
+      }
+    }
+    store.setSecret(body.name, body.value, typeof body.plugin === "string" ? body.plugin : undefined);
     await pluginHost.reload();
     return c.json({ ok: true });
   });

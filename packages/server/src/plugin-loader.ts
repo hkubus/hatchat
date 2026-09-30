@@ -12,6 +12,8 @@ export interface ExternalPluginOptions {
   isolate?: boolean;
   /** Secret names isolated plugins may not declare (see `IsolationOptions`). */
   reservedSecrets?: readonly string[];
+  /** Every installed plugin declaring a secret name (see `IsolationOptions`). */
+  secretClaimants?: (name: string) => readonly string[];
 }
 
 /** Load plugins from a directory of ESM modules. */
@@ -49,7 +51,11 @@ export async function loadExternalPlugins(
               "external plugins get their own process but no filesystem sandbox (needs Node >= 22.18)",
           );
         }
-        const plugin = await loadIsolatedPlugin(file, { logger, reservedSecrets: options.reservedSecrets });
+        const plugin = await loadIsolatedPlugin(file, {
+          logger,
+          reservedSecrets: options.reservedSecrets,
+          secretClaimants: options.secretClaimants,
+        });
         plugins.push(plugin);
         logger.info(`loaded external plugin: ${plugin.id} (${entry.name}, isolated)`);
         continue;

@@ -26,6 +26,10 @@ interface SecretSetup {
   /** What the server's own environment holds. */
   env?: Record<string, string>;
   reservedSecrets?: string[];
+  /** Whom each saved secret was saved for (`null`: before secrets had owners). */
+  owners?: Record<string, string | null>;
+  /** Every installed plugin declaring a name. */
+  secretClaimants?: (name: string) => readonly string[];
 }
 
 async function setup(t: TestContext, file = FIXTURE, secrets: SecretSetup = {}) {
@@ -34,19 +38,29 @@ async function setup(t: TestContext, file = FIXTURE, secrets: SecretSetup = {}) 
   const tools = new ToolRegistry();
   const stored = secrets.stored ?? { FIXTURE_TOKEN: "tok", OTHER_KEY: "not-yours" };
   const env = secrets.env ?? {};
+  const owners: Record<string, string | null> = secrets.owners ?? { FIXTURE_TOKEN: "fixture", OTHER_KEY: "" };
   const host = new PluginHost({
     providers,
     tools,
     // Like the real store: saved secrets first, then the environment.
-    secrets: { get: async (name) => stored[name] ?? env[name], getStored: async (name) => stored[name] },
+    secrets: {
+      get: async (name) => stored[name] ?? env[name],
+      getStored: async (name) => stored[name],
+      ownerOf: (name) => (name in stored ? (owners[name] ?? null) : undefined),
+      setOwner: (name, owner) => void (owners[name] = owner),
+    },
     logger,
     persistence: { get: () => undefined, set: () => {} },
   });
-  const plugin = await loadIsolatedPlugin(file, { logger, reservedSecrets: secrets.reservedSecrets });
+  const plugin = await loadIsolatedPlugin(file, {
+    logger,
+    reservedSecrets: secrets.reservedSecrets,
+    secretClaimants: secrets.secretClaimants,
+  });
   host.register(plugin, "external");
   t.after(() => host.deactivate(plugin.id));
   await host.activateAll();
-  return { host, providers, tools, logger, plugin };
+  return { host, providers, tools, logger, plugin, owners };
 }
 
 function toolContext(signal = new AbortController().signal): ToolContext {
@@ -151,6 +165,36 @@ test("a plugin may not declare hat's own secrets or a built-in plugin's", async 
   assert.equal(descriptor?.status, "error");
   assert.match(descriptor?.error ?? "", /may not read FIXTURE_TOKEN: reserved/);
   assert.equal(tools.get("fixture_secret"), undefined, "nothing was started");
+});
+
+test("a plugin is served only secrets saved for it", async (t) => {
+  for (const owner of ["another-plugin", ""]) {
+    const { host, plugin, tools } = await setup(t, FIXTURE, { owners: { FIXTURE_TOKEN: owner } });
+    const descriptor = host.get(plugin.id);
+    assert.equal(descriptor?.status, "error", `saved for ${JSON.stringify(owner)}`);
+    assert.match(descriptor?.error ?? "", /secret FIXTURE_TOKEN was not saved for this plugin/);
+    assert.equal(tools.get("fixture_secret"), undefined, "nothing was started");
+  }
+});
+
+test("a secret saved before owners existed goes to the one plugin that declares it", async (t) => {
+  const { host, plugin, tools, owners } = await setup(t, FIXTURE, {
+    owners: { FIXTURE_TOKEN: null },
+    secretClaimants: () => ["fixture"],
+  });
+  assert.equal(host.get(plugin.id)?.status, "active");
+  assert.equal(owners.FIXTURE_TOKEN, "fixture", "claimed, so no other plugin can take it later");
+  assert.equal(await run(tools, "fixture_secret", { name: "FIXTURE_TOKEN" }), "value:tok");
+});
+
+test("a secret saved before owners existed is refused when another plugin declares it too", async (t) => {
+  const { host, plugin, owners } = await setup(t, FIXTURE, {
+    owners: { FIXTURE_TOKEN: null },
+    secretClaimants: () => ["fixture", "lookalike"],
+  });
+  assert.equal(host.get(plugin.id)?.status, "error");
+  assert.match(host.get(plugin.id)?.error ?? "", /FIXTURE_TOKEN was not saved for this plugin/);
+  assert.equal(owners.FIXTURE_TOKEN, null);
 });
 
 test("forwards the execution host, pinned to the call and its permissions", async (t) => {

@@ -456,10 +456,21 @@ Schema.
   process with a scrubbed env, but without the filesystem sandbox (a warning is
   logged).
 - **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`,
-  and only secrets saved in hat (Settings, or `POST /api/secrets`), never the
-  server's environment. A plugin names its own secrets, so hat's (`HAT_*`) and
-  those of the built-in plugins (`OPENROUTER_API_KEY`, ...) can't be declared:
-  such a plugin is refused before it starts.
+  and only secrets saved in hat *for that plugin*, never the server's
+  environment. A plugin names its own secrets, so the name proves nothing:
+  hat's (`HAT_*`) and those of the built-in plugins (`OPENROUTER_API_KEY`, ...)
+  can't be declared, and a secret saved for another plugin, or for none, is
+  not served (the plugin is refused before it starts). Save one for a plugin
+  with its id:
+
+  ```sh
+  curl -X POST localhost:8787/api/secrets -H 'content-type: application/json' \
+    -d '{"name":"WEATHER_API_KEY","value":"...","plugin":"weather"}'
+  ```
+
+  A secret saved before secrets recorded their plugin goes to the one
+  installed plugin that declares its name, and is that plugin's from then on;
+  if several declare it, save it again with `plugin`.
 - **Tool context**: `sessionId`, `callId`, `signal`, `logger` and `secrets`.
   `ctx.host` forwards to the call's execution host, stays pinned to that session,
   and works only while the call runs. Each part needs its declared permission:

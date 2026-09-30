@@ -213,6 +213,12 @@ export class Store implements SecretStore {
       }
     }
     // Documents the user attaches keep their original name and extracted text.
+    // Whom a secret was saved for; NULL on secrets saved before this existed.
+    try {
+      this.db.exec(`ALTER TABLE secrets ADD COLUMN owner TEXT`);
+    } catch {
+      /* column already exists */
+    }
     // `last_put_at`: the last time these bytes were uploaded, a dedupe hit included.
     for (const column of ["name TEXT", "text TEXT", "last_put_at INTEGER"]) {
       try {
@@ -793,14 +799,31 @@ export class Store implements SecretStore {
 
   // ---- secrets ------------------------------------------------------------
 
-  setSecret(name: string, value: string): void {
+  /**
+   * Save a secret. `owner` is the plugin it is for, which alone (of the
+   * sandboxed plugins) may read it. Without one, a new secret belongs to no
+   * plugin, and a new value for an existing secret keeps its owner.
+   */
+  setSecret(name: string, value: string, owner?: string): void {
     const record = encryptSecret(value, this.masterKey);
     this.db
       .prepare(
-        `INSERT INTO secrets (name, ciphertext, iv, tag, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET ciphertext = excluded.ciphertext, iv = excluded.iv, tag = excluded.tag, updated_at = excluded.updated_at`,
+        `INSERT INTO secrets (name, ciphertext, iv, tag, updated_at, owner) VALUES (?, ?, ?, ?, ?, COALESCE(?, ''))
+         ON CONFLICT(name) DO UPDATE SET ciphertext = excluded.ciphertext, iv = excluded.iv, tag = excluded.tag,
+           updated_at = excluded.updated_at, owner = COALESCE(?, secrets.owner, '')`,
       )
-      .run(name, record.ciphertext, record.iv, record.tag, Date.now());
+      .run(name, record.ciphertext, record.iv, record.tag, Date.now(), owner ?? null, owner ?? null);
+  }
+
+  ownerOf(name: string): string | null | undefined {
+    const row = this.db.prepare(`SELECT owner FROM secrets WHERE name = ?`).get(name) as
+      | { owner: string | null }
+      | undefined;
+    return row ? row.owner : undefined;
+  }
+
+  setOwner(name: string, owner: string): void {
+    this.db.prepare(`UPDATE secrets SET owner = ? WHERE name = ?`).run(owner, name);
   }
 
   async getSecret(name: string): Promise<string | undefined> {
