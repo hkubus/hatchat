@@ -24,6 +24,7 @@
     "@hat/runner-protocol": "workspace:*",
     "@hat/store-sqlite": "workspace:*",
     "@hat/tool-browser": "workspace:*",
+    "@hat/tool-ceneo": "workspace:*",
     "@hat/tool-fs": "workspace:*",
     "@hat/tool-process": "workspace:*",
     "@hat/tool-shell": "workspace:*",

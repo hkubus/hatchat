@@ -329,6 +329,9 @@ importers:
       '@hat/tool-browser':
         specifier: workspace:*
         version: link:../tool-browser
+      '@hat/tool-ceneo':
+        specifier: workspace:*
+        version: link:../tool-ceneo
       '@hat/tool-fs':
         specifier: workspace:*
         version: link:../tool-fs
@@ -380,6 +383,15 @@ importers:
       playwright-core:
         specifier: 1.48.0
         version: 1.48.0
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
+
+  packages/tool-ceneo:
+    dependencies:
+      '@hat/core':
+        specifier: workspace:*
+        version: link:../core
       zod:
         specifier: ^3.24.1
         version: 3.25.76

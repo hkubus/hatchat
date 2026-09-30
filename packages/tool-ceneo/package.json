@@ -1,0 +1,17 @@
+{
+  "name": "@hat/tool-ceneo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@hat/core": "workspace:*",
+    "zod": "^3.24.1"
+  }
+}

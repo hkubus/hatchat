@@ -258,6 +258,28 @@ max 20) and `requireApproval` gates each search (off by default — searches are
 read-only). The search request is made by the **server process** directly, like
 provider calls, so no key or query crosses the runner link.
 
+## Ceneo (price checks)
+
+The `ceneo` plugin checks prices of **new** products on
+[Ceneo.pl](https://www.ceneo.pl), the Polish price comparison site. It is
+keyless and on by default:
+
+- `ceneo_search` — products matching a query with their lowest price (PLN),
+  shop count, rating and key specs; optional `min_price` / `max_price` filters.
+- `ceneo_product` — the shop offers for one product (id from the search, or a
+  ceneo.pl URL), cheapest first, with shop rating and delivery. Ceneo renders
+  only the first ~15 offers server-side, so the tool says when the list is
+  partial.
+
+While the plugin is active, the system prompt tells the model to use Ceneo
+for the price of anything bought new. When a Scout MCP server is connected
+(`mcp__scout__*` tools), it also says to keep Scout for second-hand listings or
+products Ceneo doesn't carry. Like web search, requests go from the server
+process and parse Ceneo's HTML, so markup changes can degrade results. Each
+request has its own 20 s timeout and a 5 MB size cap, and redirects are only
+followed within ceneo.pl. `maxResults` sets the default number of products and offers
+(max 30).
+
 ## System prompt
 
 Every turn is prefixed with a base system prompt that is never stored in

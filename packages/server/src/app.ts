@@ -36,6 +36,7 @@ import type { SessionRecord } from "@hat/store-sqlite";
 import { Store } from "@hat/store-sqlite";
 import { createShellPlugin } from "@hat/tool-shell";
 import { createBrowserPlugin } from "@hat/tool-browser";
+import { ceneoPrompt, createCeneoPlugin } from "@hat/tool-ceneo";
 import { createWebSearchPlugin } from "@hat/tool-websearch";
 import { createFsPlugin } from "@hat/tool-fs";
 import { createWebFetchPlugin } from "@hat/tool-webfetch";
@@ -166,6 +167,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createDeepSeekPlugin());
   pluginHost.register(createShellPlugin());
   pluginHost.register(createWebSearchPlugin());
+  pluginHost.register(createCeneoPlugin());
   pluginHost.register(createBrowserPlugin());
   pluginHost.register(createFsPlugin());
   pluginHost.register(createWebFetchPlugin());
@@ -259,7 +261,14 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     logger,
     systemPrompt: config.systemPrompt,
     systemContext: () =>
-      pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
+      [
+        pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
+        pluginHost.get("ceneo")?.status === "active"
+          ? ceneoPrompt(tools.list().map((tool) => tool.name))
+          : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n\n") || undefined,
     maxToolIterations: config.maxToolIterations,
     onMessage: (sessionId, message) => store.appendMessage(sessionId, message),
     resolveImage: async (attachmentId) => {
