@@ -3,8 +3,10 @@
  * transcript, and folding a live `KernelEvent` stream into the same shape.
  *
  * This is deliberately pure and free of any UI framework. It is the part of
- * the client that has to agree exactly with what the server sends, so the web,
- * desktop and mobile clients all share it — see `chat-view.test.ts`.
+ * the client that has to agree exactly with what the server sends, so the web
+ * and desktop clients share it — see `chat-view.test.ts`. The iOS app has a
+ * Swift port (`apps/ios/HatKit/Sources/HatKit/ChatView.swift`) whose tests hold
+ * the same cases; change the two together.
  */
 
 import type { ApprovalDecision } from "./context.js";

@@ -1,0 +1,63 @@
+# XcodeGen spec for the iOS app. The Xcode project is generated from this file
+# (`xcodegen generate`) and is not committed, so it cannot drift from it —
+# see docs/ios-app.md.
+
+name: Hat
+
+options:
+  bundleIdPrefix: chat.t3code
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+packages:
+  HatKit:
+    path: HatKit
+
+targets:
+  Hat:
+    type: application
+    platform: iOS
+    sources:
+      - path: Hat
+    dependencies:
+      - package: HatKit
+    info:
+      path: Hat/Info.plist
+      properties:
+        CFBundleDisplayName: hat
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: Take a photo to attach to a conversation.
+        # Plain HTTP only to unqualified hosts, .local and link-local addresses
+        # (the simulator, Tailscale MagicDNS). Anything else needs TLS.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: chat.t3code.hat
+        PRODUCT_NAME: Hat
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+        CODE_SIGN_STYLE: Automatic
+    scheme: {}

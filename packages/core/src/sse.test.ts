@@ -79,6 +79,23 @@ test("handles CRLF terminators from a rewriting proxy", () => {
   ]);
 });
 
+test("handles CR-only terminators", () => {
+  const parser = new SseFrameParser();
+  assert.deepEqual(parser.push('data: {"a":1}\r\rdata: {"b":2}\r\r'), ['{"a":1}', '{"b":2}']);
+});
+
+test("finds a terminator split across chunks", () => {
+  for (const terminator of ["\n\n", "\r\n\r\n", "\r\r"]) {
+    const body = `data: one${terminator}data: two${terminator}`;
+    for (let cut = 0; cut <= body.length; cut++) {
+      const parser = new SseFrameParser();
+      const out = [...parser.push(body.slice(0, cut)), ...parser.push(body.slice(cut))];
+      assert.deepEqual(out, ["one", "two"], `${JSON.stringify(terminator)} cut at ${cut}`);
+      assert.deepEqual(parser.flush(), []);
+    }
+  }
+});
+
 test("decodeFrame passes JSON through and swallows malformed frames", () => {
   assert.deepEqual(decodeFrame<{ a: number }>('{"a":1}'), { a: 1 });
   assert.equal(decodeFrame('{"a":'), null);
