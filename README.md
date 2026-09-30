@@ -153,6 +153,13 @@ too (with an image that has what they need). An explicit
 `HAT_SANDBOX_PROCESSES=host` opts them out. stdio MCP servers always run on the
 host.
 
+The file tools (`read_file`, `write_file`, `list_dir`, ...) are not sandboxed
+commands: the runner performs them itself, on its host. They resolve symlinks
+and refuse any path that ends up outside the session workspace, so a link left
+there by a command, a cloned repo or an unpacked archive can't lead them
+elsewhere on the machine. Dangling links and special files (FIFOs, devices) are
+refused too.
+
 ## MCP (M5)
 
 The `mcp` plugin connects to Model Context Protocol servers and exposes their
