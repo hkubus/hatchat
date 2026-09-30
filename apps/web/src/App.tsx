@@ -126,8 +126,17 @@ export default function App() {
   const scroller = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  /** Set while a turn is streaming so the composer can stop it. */
-  const abortRef = useRef<AbortController | null>(null);
+  /**
+   * The stream the view is showing. Only it may touch the view: any other,
+   * replaced or left behind, winds down without applying anything.
+   */
+  const streamRef = useRef<AbortController | null>(null);
+  /**
+   * Bumped whenever the view moves to another conversation. Async work checks
+   * it after every await, so a slow answer about the conversation the user
+   * just left can't land in the one they opened.
+   */
+  const viewRef = useRef(0);
   /** False once the user scrolls up, so streaming stops yanking the view down. */
   const stickToBottom = useRef(true);
   /** Mirrors `sessionId` for callbacks that must not re-subscribe on change. */
@@ -334,12 +343,13 @@ export default function App() {
     const stored = localStorage.getItem("hat.session");
     if (!stored) return;
     let cancelled = false;
+    const view = viewRef.current;
     setRestoring(true);
     void api
       .getSession(stored)
       .then((payload) => {
-        // The user may have picked another session while this was in flight.
-        if (cancelled || sessionIdRef.current !== stored) return;
+        // The user may have opened a conversation meanwhile, even this one.
+        if (cancelled || view !== viewRef.current) return;
         sessionIdRef.current = payload.session.id;
         setSessionId(payload.session.id);
         setMessages(buildMessages(payload.path));
@@ -350,7 +360,7 @@ export default function App() {
         void followActiveTurn(payload.session.id);
       })
       .catch((e: unknown) => {
-        if (cancelled || sessionIdRef.current !== stored) return;
+        if (cancelled || view !== viewRef.current) return;
         // Gone is permanent, so the stale pointer is dropped. Everything else
         // — 401, a server that is still starting, no network at all — is not,
         // and the stored pointer survives to be retried on the next load.
@@ -516,34 +526,45 @@ export default function App() {
     persist({ approvalMode: mode });
   }
 
-  async function refresh(id: string): Promise<void> {
+  async function refresh(id: string, view = viewRef.current): Promise<void> {
     const payload = await api.getSession(id);
+    if (view !== viewRef.current) return;
     setMessages(buildMessages(payload.path));
     applySession(payload.session);
   }
 
-  async function runStream(
+  /**
+   * Show a turn's events as they stream in, then settle the view from the
+   * server. `open` resolving `false` means there was no turn to watch.
+   *
+   * Only the current stream touches the view. One that was replaced, or left
+   * behind when the user moved to another conversation, still winds down, but
+   * its late events, its error and its refetch all stay out of the view.
+   */
+  async function watch(
     id: string,
-    fn: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<void>,
+    open: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<unknown>,
   ): Promise<void> {
+    const view = viewRef.current;
+    streamRef.current?.abort();
     const controller = new AbortController();
-    abortRef.current = controller;
+    streamRef.current = controller;
+    const current = (): boolean => streamRef.current === controller;
     // Starting a turn is an explicit request to watch it, even from scrollback.
     stickToBottom.current = true;
     setBusy(true);
     setError(null);
     setInFlight([]);
     setWarnings([]);
+    let watched = true;
     try {
-      await fn(handleEvent, controller.signal);
+      watched = (await open((event) => current() && handleEvent(event), controller.signal)) !== false;
     } catch (e) {
       // A turn the user stopped is not a failure; detaching is not either.
-      if (!api.isAbortError(e)) setError(String(e));
+      if (current() && !api.isAbortError(e)) setError(String(e));
     } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      // If the user moved to another conversation, leave its view alone: the
-      // turn keeps running server-side and these messages are persisted anyway.
-      if (sessionIdRef.current === id) {
+      if (current()) {
+        streamRef.current = null;
         // Hand the streamed turn to the history *before* the refetch. `refresh`
         // replaces the list wholesale from the server's branch path, so promoting
         // first means the refetch is a quiet reconciliation instead of a swap that
@@ -552,11 +573,20 @@ export default function App() {
         const streamed = inFlightRef.current;
         if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
         setInFlight([]);
-        await refresh(id).catch(() => undefined);
-        await refreshSessions();
-        setBusy(false);
+        if (watched) {
+          await refresh(id, view).catch(() => undefined);
+          await refreshSessions();
+        }
+        if (view === viewRef.current && !streamRef.current) setBusy(false);
       }
     }
+  }
+
+  function runStream(
+    id: string,
+    fn: (onEvent: (event: KernelEvent) => void, signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    return watch(id, fn);
   }
 
   /**
@@ -564,46 +594,24 @@ export default function App() {
    * switching back to a conversation the model is still working on. Does
    * nothing when the session is idle.
    */
-  async function followActiveTurn(id: string): Promise<void> {
-    if (sessionIdRef.current !== id) return;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    stickToBottom.current = true;
-    setBusy(true);
-    setError(null);
-    setInFlight([]);
-    setWarnings([]);
-    try {
-      const following = await api.followTurn(id, handleEvent, controller.signal);
-      if (!following) return;
-    } catch (e) {
-      if (!api.isAbortError(e)) setError(String(e));
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      if (sessionIdRef.current === id) {
-        const streamed = inFlightRef.current;
-        if (streamed.length > 0) setMessages((prev) => [...prev, ...streamed]);
-        setInFlight([]);
-        await refresh(id).catch(() => undefined);
-        await refreshSessions();
-        setBusy(false);
-      }
-    }
+  function followActiveTurn(id: string): Promise<void> {
+    return watch(id, (onEvent, signal) => api.followTurn(id, onEvent, signal));
   }
 
-  /** Detach this tab from the stream without cancelling the turn. */
+  /**
+   * Leave the current stream: the turn keeps running on the server, and none
+   * of its events or cleanup reach the view. The caller settles the view.
+   */
   function detachStream(): void {
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
+    streamRef.current?.abort();
+    streamRef.current = null;
   }
 
-  /** Stop button: really cancel the turn, then detach. */
+  /** Stop button: really cancel the turn. The stream's cleanup settles the view. */
   function stop(): void {
     const id = sessionIdRef.current;
     if (id) void api.cancelTurn(id).catch(() => undefined);
-    detachStream();
+    streamRef.current?.abort();
   }
 
   async function ensureSession(): Promise<string> {
@@ -728,7 +736,9 @@ export default function App() {
   }
 
   async function newChat(): Promise<void> {
+    const view = ++viewRef.current;
     detachStream();
+    setBusy(false);
     setMessages([]);
     setInFlight([]);
     setError(null);
@@ -738,6 +748,7 @@ export default function App() {
     setSettingsOpen(false);
     stickToBottom.current = true;
     const payload = await api.createSession(model);
+    if (view !== viewRef.current) return;
     setSessionId(payload.session.id);
     applySession(payload.session);
     await refreshSessions();
@@ -748,6 +759,7 @@ export default function App() {
    * message is the active one and bring the message into view.
    */
   async function openSession(id: string, messageId?: string): Promise<void> {
+    const view = ++viewRef.current;
     detachStream();
     setBusy(false);
     setError(null);
@@ -761,6 +773,8 @@ export default function App() {
     if (messageId && !payload.path.some((node) => node.message.id === messageId)) {
       payload = await api.selectBranch(id, messageId).catch(() => payload);
     }
+    // Another conversation was opened meanwhile; the last click wins.
+    if (view !== viewRef.current) return;
     if (messageId) {
       stickToBottom.current = false;
       setHighlightId(messageId);
@@ -781,7 +795,10 @@ export default function App() {
 
   async function handleDelete(id: string): Promise<void> {
     await api.deleteSession(id);
-    if (id === sessionId) {
+    if (id === sessionIdRef.current) {
+      viewRef.current++;
+      detachStream();
+      setBusy(false);
       setSessionId(null);
       setMessages([]);
       setInFlight([]);
@@ -801,7 +818,9 @@ export default function App() {
   }
 
   async function doLogout(): Promise<void> {
+    viewRef.current++;
     detachStream();
+    setBusy(false);
     await api.logout();
     // A native shell is signed in by its token, so signing out forgets it.
     if (config && isNativeShell()) setConfig(await saveConfig({ ...config, token: "" }));
