@@ -486,28 +486,50 @@ function FileCard({ file }: { file: UiFile }) {
 }
 
 function Images({ images, onOpen }: { images: UiImage[]; onOpen: (src: string) => void }) {
-  const theme = useTheme();
   if (images.length === 0) return null;
   return (
     <View style={styles.images}>
       {images.map((image, index) => (
-        <Pressable
-          key={image.attachmentId ?? image.src.slice(0, 32) + index}
-          accessibilityRole="imagebutton"
-          accessibilityLabel="Open image"
-          disabled={!image.src}
-          onPress={() => onOpen(image.src)}
-        >
-          <Image
-            // A stored attachment is fetched by the caller and handed over as a
-            // data URL, because `<Image>` cannot carry the bearer token itself.
-            source={{ uri: image.src }}
-            style={[styles.image, { backgroundColor: theme.color.surfaceAlt }]}
-            resizeMode="cover"
-          />
-        </Pressable>
+        <ImageTile key={image.attachmentId ?? image.src.slice(0, 32) + index} image={image} onOpen={onOpen} />
       ))}
     </View>
+  );
+}
+
+/**
+ * One photo in a message. A stored attachment comes back from the server as
+ * an id with no source, so it is fetched here, as a data URL: `<Image>` cannot
+ * carry the bearer token itself. Without this a sent photo turned into a blank
+ * tile once the turn ended.
+ */
+function ImageTile({ image, onOpen }: { image: UiImage; onOpen: (src: string) => void }) {
+  const theme = useTheme();
+  const [uri, setUri] = useState(image.src);
+
+  useEffect(() => {
+    if (image.src || !image.attachmentId) return;
+    let live = true;
+    fetchAttachmentBase64(image.attachmentId)
+      .then((data) => live && setUri(data))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [image.src, image.attachmentId]);
+
+  return (
+    <Pressable
+      accessibilityRole="imagebutton"
+      accessibilityLabel="Open image"
+      disabled={!uri}
+      onPress={() => onOpen(uri)}
+    >
+      <Image
+        source={uri ? { uri } : undefined}
+        style={[styles.image, { backgroundColor: theme.color.surfaceAlt }]}
+        resizeMode="cover"
+      />
+    </Pressable>
   );
 }
 

@@ -319,7 +319,11 @@ export default function ChatScreen({ navigation }: ScreenProps<"Chat">) {
     setAttachments([]);
     stickToBottom.current = true;
     scrollToEnd(true);
-    await chat.send(body, pending);
+    if (!(await chat.send(body, pending))) {
+      // Nothing went out: give the draft back, unless a new one was started.
+      setText((current) => current || body);
+      setAttachments((current) => (current.length > 0 ? current : pending));
+    }
   }, [text, attachments, chat, scrollToEnd]);
 
   const submitEdit = useCallback(async () => {

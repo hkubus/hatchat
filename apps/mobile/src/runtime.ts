@@ -77,7 +77,13 @@ export function loadConfig(): Promise<HatConfig> {
 
 export async function saveConfig(config: HatConfig): Promise<HatConfig> {
   const next = coerce(config);
-  await SecureStore.setItemAsync(CONFIG_KEY, JSON.stringify(next));
+  // "This device only" keeps the token out of backups and off new devices;
+  // the default accessibility has neither. The keychain keeps an existing
+  // item's accessibility on update, so the item is replaced, not updated.
+  await SecureStore.deleteItemAsync(CONFIG_KEY).catch(() => undefined);
+  await SecureStore.setItemAsync(CONFIG_KEY, JSON.stringify(next), {
+    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  });
   cached = Promise.resolve(next);
   snapshot = next;
   return next;

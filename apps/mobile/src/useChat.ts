@@ -100,7 +100,8 @@ export interface ChatStore {
   clearError: () => void;
   /** Raise a client-side problem (a rejected file, a failed request). */
   reportError: (message: string) => void;
-  send: (text: string, attachments: PendingAttachment[]) => Promise<void>;
+  /** False when nothing went out (an upload was rejected, or the turn refused): the draft is the caller's to restore. */
+  send: (text: string, attachments: PendingAttachment[]) => Promise<boolean>;
   stop: () => void;
   newChat: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
@@ -426,10 +427,12 @@ export function useChat(): ChatStore {
         const target =
           (storedId && list.find((s) => s.id === storedId)?.id) || list[0]?.id || null;
 
+        let restored = false;
         if (target) {
           const payload = await api.getSession(target).catch(() => null);
           if (cancelled) return;
           if (payload) {
+            restored = true;
             setSessionId(payload.session.id);
             setMessages(buildMessages(payload.path));
             applySession(payload.session);
@@ -442,16 +445,21 @@ export function useChat(): ChatStore {
           }
         }
 
-        const storedModel = await loadPref("model", "");
-        if (storedModel && modelList.some((m) => m.id === storedModel)) {
-          setModelState(storedModel);
-        } else if (modelList.length > 0) {
-          setModelState(modelList[0].id);
-        }
+        // The last-used model and effort are what a new chat starts with. A
+        // restored conversation keeps its own: applied over it, they switched
+        // its model on the next send.
+        if (!restored) {
+          const storedModel = await loadPref("model", "");
+          if (storedModel && modelList.some((m) => m.id === storedModel)) {
+            setModelState(storedModel);
+          } else if (modelList.length > 0) {
+            setModelState(modelList[0].id);
+          }
 
-        const storedEffort = await loadPref("effort", "off");
-        if ((REASONING_EFFORTS as readonly string[]).includes(storedEffort)) {
-          setEffortState(storedEffort as ReasoningEffort);
+          const storedEffort = await loadPref("effort", "off");
+          if ((REASONING_EFFORTS as readonly string[]).includes(storedEffort)) {
+            setEffortState(storedEffort as ReasoningEffort);
+          }
         }
       } catch (e) {
         if (!cancelled) setError(describe(e));
@@ -528,10 +536,10 @@ export function useChat(): ChatStore {
   }, [sessionId, model, policyMode, reasoningEffort, allowedTools, applySession, refreshSessions]);
 
   const send = useCallback(
-    async (text: string, attachments: PendingAttachment[]) => {
-      if (busy) return;
+    async (text: string, attachments: PendingAttachment[]): Promise<boolean> => {
+      if (busy) return false;
       const body = text.trim();
-      if (!body && attachments.length === 0) return;
+      if (!body && attachments.length === 0) return false;
 
       setError(null);
 
@@ -549,7 +557,7 @@ export function useChat(): ChatStore {
           });
         } catch (e) {
           setError(describe(e));
-          return;
+          return false;
         }
       }
 
@@ -579,15 +587,24 @@ export function useChat(): ChatStore {
         },
       ]);
 
+      let refused = false;
       try {
         const id = await ensureSession();
-        await runStream(id, (onEvent, signal) =>
-          api.sendTurn(id, body, model, { ids: attachmentIds, names: attachmentNames }, onEvent, signal),
-        );
+        await runStream(id, async (onEvent, signal) => {
+          try {
+            await api.sendTurn(id, body, model, { ids: attachmentIds, names: attachmentNames }, onEvent, signal);
+          } catch (e) {
+            // The server said no before a turn started (another reply running,
+            // too many turns): nothing was sent.
+            refused = e instanceof api.HttpError;
+            throw e;
+          }
+        });
       } catch (e) {
         if (!api.isAbortError(e)) setError(describe(e));
         setBusy(false);
       }
+      return !refused;
     },
     [busy, ensureSession, model, runStream],
   );
@@ -599,11 +616,19 @@ export function useChat(): ChatStore {
     setError(null);
     setWarnings([]);
     setBusy(false);
-    const payload = await api.createSession(model);
-    setSessionId(payload.session.id);
-    applySession(payload.session);
-    await savePref("session", payload.session.id);
-    await refreshSessions().catch(() => undefined);
+    // Off the old conversation first: should creating the new one fail, the
+    // next message must not go into the old one behind an empty screen. With
+    // no session, the next send creates one.
+    setSessionId(null);
+    try {
+      const payload = await api.createSession(model);
+      setSessionId(payload.session.id);
+      applySession(payload.session);
+      await savePref("session", payload.session.id);
+      await refreshSessions().catch(() => undefined);
+    } catch (e) {
+      setError(describe(e));
+    }
   }, [abandonTurn, model, applySession, refreshSessions]);
 
   const openSession = useCallback(
