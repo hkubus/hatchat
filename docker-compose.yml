@@ -13,6 +13,10 @@ services:
       # and a known enroll token lets anyone attach a runner of their own.
       HAT_AUTH_TOKEN: "${HAT_AUTH_TOKEN:?set HAT_AUTH_TOKEN to a random secret, e.g. openssl rand -hex 32}"
       HAT_ENROLL_TOKEN: "${HAT_ENROLL_TOKEN:?set HAT_ENROLL_TOKEN to a random secret, e.g. openssl rand -hex 16}"
+    volumes:
+      # Conversations, uploads and the master key that encrypts saved secrets.
+      # Without a volume they vanish whenever the container is recreated.
+      - server-data:/app/.hat
 
   runner:
     build:
@@ -34,4 +38,5 @@ services:
     # Intentionally no ports: the runner dials out to the server.
 
 volumes:
+  server-data:
   runner-workspaces:

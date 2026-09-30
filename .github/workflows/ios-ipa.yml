@@ -26,6 +26,10 @@ on:
     tags:
       - "mobile-v*"
 
+# Read-only token: the job only checks out code and uploads an artifact.
+permissions:
+  contents: read
+
 concurrency:
   group: ios-ipa-${{ github.ref }}
   cancel-in-progress: true

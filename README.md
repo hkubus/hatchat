@@ -666,6 +666,16 @@ so an empty `HAT_AUTH_TOKEN` would leave the API — and the runner's shell — 
 to anyone who can reach it. Keep them in a `.env` file next to
 `docker-compose.yml` (compose reads it) so later commands see the same values.
 
+The server keeps conversations, uploads and the master key that encrypts saved
+secrets in the `server-data` volume, so they survive rebuilds; back it up. Both
+images install from the lockfile and run as the unprivileged `node` user.
+
+Upgrading from an image that ran the runner as root: its `runner-workspaces`
+volume is root-owned. The runner's entrypoint starts as root just long enough
+to hand that directory to `node`, then drops privileges before the runner
+starts, so no manual step is needed. If you start the runner with `--user`, it
+cannot do that; it exits with a message naming the directory to `chown`.
+
 The runner publishes **no ports** — it dials out to `server:8787/link`.
 
 ## The execution link
