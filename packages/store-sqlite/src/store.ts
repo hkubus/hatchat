@@ -754,18 +754,20 @@ export class Store implements SecretStore {
   }
 
   async getSecret(name: string): Promise<string | undefined> {
-    const row = this.db
-      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
-      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
-    if (row) {
-      return decryptSecret(row, this.masterKey);
-    }
-    return process.env[name];
+    return (await this.getStored(name)) ?? process.env[name];
   }
 
   /** SecretStore contract: DB first, then process env. */
   async get(name: string): Promise<string | undefined> {
     return this.getSecret(name);
+  }
+
+  /** SecretStore contract: the DB only, never the process env. */
+  async getStored(name: string): Promise<string | undefined> {
+    const row = this.db
+      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
+      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
+    return row ? decryptSecret(row, this.masterKey) : undefined;
   }
 
   hasSecret(name: string): boolean {

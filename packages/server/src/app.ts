@@ -221,8 +221,10 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createFakePlugin());
   pluginHost.register(createMcpPlugin());
 
+  // The built-in plugins' secrets (the user's provider keys) are theirs alone.
+  const reservedSecrets = pluginHost.list().flatMap((plugin) => plugin.requiresSecrets);
   for (const plugin of config.enableExternalPlugins
-    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation })
+    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation, reservedSecrets })
     : []) {
     pluginHost.register(plugin, "external");
   }

@@ -431,8 +431,11 @@ Schema.
   workers or load native addons. On older Node the child still runs in its own
   process with a scrubbed env, but without the filesystem sandbox (a warning is
   logged).
-- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`.
-  Anything else is refused.
+- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`,
+  and only secrets saved in hat (Settings, or `POST /api/secrets`), never the
+  server's environment. A plugin names its own secrets, so hat's (`HAT_*`) and
+  those of the built-in plugins (`OPENROUTER_API_KEY`, ...) can't be declared:
+  such a plugin is refused before it starts.
 - **Tool context**: `sessionId`, `callId`, `signal`, `logger` and `secrets`.
   `ctx.host` forwards to the call's execution host, stays pinned to that session,
   and works only while the call runs. Each part needs its declared permission:

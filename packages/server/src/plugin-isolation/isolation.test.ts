@@ -20,19 +20,29 @@ function recordingLogger(): Logger & { lines: string[] } {
   return { lines, debug: record, info: record, warn: record, error: record };
 }
 
-async function setup(t: TestContext, file = FIXTURE) {
+interface SecretSetup {
+  /** Secrets saved in hat. */
+  stored?: Record<string, string>;
+  /** What the server's own environment holds. */
+  env?: Record<string, string>;
+  reservedSecrets?: string[];
+}
+
+async function setup(t: TestContext, file = FIXTURE, secrets: SecretSetup = {}) {
   const logger = recordingLogger();
   const providers = new ProviderRegistry();
   const tools = new ToolRegistry();
-  const secrets: Record<string, string> = { FIXTURE_TOKEN: "tok", OTHER_KEY: "not-yours" };
+  const stored = secrets.stored ?? { FIXTURE_TOKEN: "tok", OTHER_KEY: "not-yours" };
+  const env = secrets.env ?? {};
   const host = new PluginHost({
     providers,
     tools,
-    secrets: { get: async (name) => secrets[name] },
+    // Like the real store: saved secrets first, then the environment.
+    secrets: { get: async (name) => stored[name] ?? env[name], getStored: async (name) => stored[name] },
     logger,
     persistence: { get: () => undefined, set: () => {} },
   });
-  const plugin = await loadIsolatedPlugin(file, { logger });
+  const plugin = await loadIsolatedPlugin(file, { logger, reservedSecrets: secrets.reservedSecrets });
   host.register(plugin, "external");
   t.after(() => host.deactivate(plugin.id));
   await host.activateAll();
@@ -125,6 +135,22 @@ test("serves only declared secrets and scrubs the environment", async (t) => {
   };
   assert.ok(!probe.env.includes("HAT_MASTER_KEY_TEST_LEAK"), "server env is not inherited");
   if (sandboxSupported) assert.equal(probe.read, "ERR_ACCESS_DENIED");
+});
+
+test("a secret only the server's environment has is not handed to a plugin", async (t) => {
+  const { host, plugin } = await setup(t, FIXTURE, { stored: {}, env: { FIXTURE_TOKEN: "from the server env" } });
+  const descriptor = host.get(plugin.id);
+  assert.equal(descriptor?.status, "error");
+  assert.match(descriptor?.error ?? "", /missing secret: FIXTURE_TOKEN .*not given the server's environment/);
+});
+
+test("a plugin may not declare hat's own secrets or a built-in plugin's", async (t) => {
+  // The fixture declares FIXTURE_TOKEN; here a built-in plugin uses that name.
+  const { host, plugin, tools } = await setup(t, FIXTURE, { reservedSecrets: ["FIXTURE_TOKEN"] });
+  const descriptor = host.get(plugin.id);
+  assert.equal(descriptor?.status, "error");
+  assert.match(descriptor?.error ?? "", /may not read FIXTURE_TOKEN: reserved/);
+  assert.equal(tools.get("fixture_secret"), undefined, "nothing was started");
 });
 
 test("forwards the execution host, pinned to the call and its permissions", async (t) => {

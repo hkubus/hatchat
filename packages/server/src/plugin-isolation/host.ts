@@ -38,6 +38,11 @@ export interface IsolationOptions {
   startTimeoutMs?: number;
   /** How long `activate` may run before the child is killed. */
   activateTimeoutMs?: number;
+  /**
+   * Secret names a plugin may not declare: those the built-in plugins use.
+   * `HAT_*` names are always reserved.
+   */
+  reservedSecrets?: readonly string[];
 }
 
 /**
@@ -76,6 +81,8 @@ export async function loadIsolatedPlugin(file: string, options: IsolationOptions
     requiresSecrets: manifest.requiresSecrets,
     configJsonSchema: manifest.configJsonSchema,
     async activate(ctx) {
+      const refused = await secretsProblem(manifest, ctx, options.reservedSecrets);
+      if (refused) throw new Error(refused);
       const proc = new PluginProcess(file, options);
       current = proc;
       try {
@@ -208,7 +215,8 @@ class PluginProcess {
       if (!manifest.requiresSecrets.includes(name)) {
         throw new Error(`secret "${name}" is not declared in requiresSecrets`);
       }
-      return ctx.secrets.get(name);
+      // Saved secrets only: the server's environment is not the plugin's.
+      return ctx.secrets.getStored?.(name);
     });
     this.serveHost(manifest);
     this.onCrash = (error) => ctx.fail?.(error);
@@ -465,6 +473,32 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 }
 
 // The child is untrusted: check the shapes it reports before using them.
+
+/**
+ * Why a sandboxed plugin can't have the secrets it declares, if it can't.
+ * A plugin names its own `requiresSecrets`, so the names prove nothing: it is
+ * refused hat's own (`HAT_AUTH_TOKEN`, `HAT_MASTER_KEY`, ...) and those of the
+ * built-in plugins (the user's provider keys), and is only ever served
+ * secrets saved in hat, never the server's environment.
+ */
+async function secretsProblem(
+  manifest: PluginManifest,
+  ctx: PluginContext,
+  reserved: readonly string[] = [],
+): Promise<string | undefined> {
+  const forbidden = manifest.requiresSecrets.filter((name) => /^HAT_/i.test(name) || reserved.includes(name));
+  if (forbidden.length > 0) {
+    return `plugins may not read ${forbidden.join(", ")}: reserved for hat and its built-in plugins`;
+  }
+  const missing: string[] = [];
+  for (const name of manifest.requiresSecrets) {
+    if ((await ctx.secrets.getStored?.(name)) === undefined) missing.push(name);
+  }
+  if (missing.length > 0) {
+    return `missing secret: ${missing.join(", ")} (save it in Settings; plugins are not given the server's environment)`;
+  }
+  return undefined;
+}
 
 function checkManifest(value: PluginManifest): PluginManifest {
   const strings = (list: unknown): list is string[] =>

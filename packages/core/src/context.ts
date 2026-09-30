@@ -18,6 +18,12 @@ export interface ApprovalBroker {
 
 export interface SecretStore {
   get(key: string): Promise<string | undefined>;
+  /**
+   * A secret saved in hat itself, never one read from the process
+   * environment. Sandboxed plugins are only served these: the server's
+   * environment holds its own credentials, and whatever else the host set.
+   */
+  getStored?(key: string): Promise<string | undefined>;
 }
 
 export interface AuditEntry {
