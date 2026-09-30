@@ -24,14 +24,24 @@ final class ServerTests: XCTestCase {
         func set(_ value: String, forKey key: String) { values[key] = value }
     }
 
-    private func bootedStore() async throws -> ChatStore {
-        let store = ChatStore(client: HatClient(config: config), prefs: MemoryPrefs())
+    private func bootedStore(prefs: MemoryPrefs = MemoryPrefs(), newChat: Bool = true) async throws -> ChatStore {
+        let store = ChatStore(client: HatClient(config: config), prefs: prefs)
         await store.boot()
         XCTAssertTrue(store.ready)
         XCTAssertTrue(store.models.contains { $0.id == "fake/fake-agent" }, "the fake provider is registered")
+        guard newChat else { return store }
         store.setModel("fake/fake-agent")
         try await store.newChat()
         return store
+    }
+
+    /// A store whose turn in its own conversation is paused on an approval.
+    private func storePausedOnApproval(_ command: String) async throws -> (ChatStore, Task<Bool, Never>) {
+        let store = try await bootedStore()
+        _ = try await store.client.updateSession(id: store.sessionId!, SessionPatch(approvalMode: .ask))
+        let turn = Task { await store.send("run: \(command)", attachments: []) }
+        try await waitUntil("the approval request") { store.pendingApproval != nil }
+        return (store, turn)
     }
 
     /// Poll the main actor until `condition` holds, or fail after `timeout`.
@@ -123,7 +133,7 @@ final class ServerTests: XCTestCase {
         XCTAssertEqual(toolSummary(call), "echo hi-from-runner")
 
         await store.decide(call.callId, .approve)
-        await turn.value
+        _ = await turn.value
 
         XCTAssertNil(store.error)
         let tool = try XCTUnwrap(store.messages.flatMap(\.tools).first { $0.callId == call.callId })
@@ -138,7 +148,7 @@ final class ServerTests: XCTestCase {
         let turn = Task { await store.send("run: echo never", attachments: []) }
         try await waitUntil("the approval request") { store.pendingApproval != nil }
         store.stop()
-        await turn.value
+        _ = await turn.value
 
         XCTAssertFalse(store.busy)
         XCTAssertNil(store.error, "a stopped turn is not a failure")
@@ -192,11 +202,88 @@ final class ServerTests: XCTestCase {
         XCTAssertFalse(store.sessions.contains { $0.id == id })
 
         // With no conversation open, sending creates one and keeps the message.
+        // The settings shown carry over, "ask" included: the server would
+        // otherwise create it as auto.
+        store.setPolicyMode(.ask)
         let turn = Task { await store.send("first words", attachments: []) }
         try await waitUntil("the new conversation") { store.sessionId != nil }
         XCTAssertEqual(store.messages.first?.text, "first words", "the optimistic message survives the create")
-        await turn.value
+        _ = await turn.value
         XCTAssertEqual(store.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(store.policyMode, .ask)
+        XCTAssertEqual(store.session?.approvalMode, .ask)
+    }
+
+    func testARestoredConversationKeepsItsOwnSettings() async throws {
+        let first = try await bootedStore()
+        let id = try XCTUnwrap(first.sessionId)
+        _ = try await first.client.updateSession(id: id, SessionPatch(reasoningEffort: .high))
+
+        // The last-used effort is "off", but that is what a new chat starts with.
+        let prefs = MemoryPrefs()
+        prefs.values = ["session": id, "model": "fake/fake-agent", "effort": "off"]
+        let relaunched = try await bootedStore(prefs: prefs, newChat: false)
+        XCTAssertEqual(relaunched.sessionId, id)
+        XCTAssertEqual(relaunched.reasoningEffort, .high)
+        XCTAssertEqual(relaunched.model, relaunched.session?.model)
+    }
+
+    /// Opened on another device (or after a relaunch) while a call waits for
+    /// approval: the call is on a stored message, and must still be answerable.
+    func testAnApprovalCanBeAnsweredAfterReattaching() async throws {
+        let (first, turn) = try await storePausedOnApproval("echo answered-after-reattaching")
+        let id = try XCTUnwrap(first.sessionId)
+        let callId = try XCTUnwrap(first.pendingApproval?.callId)
+
+        let second = try await bootedStore(newChat: false)
+        try await second.openSession(id)
+        try await waitUntil("the replayed approval request") { second.pendingApproval?.callId == callId }
+        XCTAssertTrue(second.busy)
+        XCTAssertTrue(second.messages.contains { $0.tools.contains { $0.callId == callId } }, "the card is the stored one")
+
+        await second.decide(callId, .approve)
+        XCTAssertNil(second.error)
+        XCTAssertNil(second.pendingApproval, "the tap is recorded at once")
+        _ = await turn.value
+        try await waitUntil("the reattached turn to end") { !second.busy }
+
+        XCTAssertNil(second.error)
+        let tool = try XCTUnwrap(second.messages.flatMap(\.tools).first { $0.callId == callId })
+        XCTAssertFalse(tool.running)
+        XCTAssertTrue(tool.result?.contains("answered-after-reattaching") == true, tool.result ?? "no result")
+    }
+
+    /// A send the server refuses gives its draft back, with the server's reason.
+    func testARefusedSendGivesTheDraftBack() async throws {
+        let first = try await bootedStore()
+        let id = try XCTUnwrap(first.sessionId)
+        // Open the conversation elsewhere while it is idle, then start a turn in it.
+        let second = try await bootedStore(newChat: false)
+        try await second.openSession(id)
+        try await waitUntil("the second store to settle") { !second.busy }
+        _ = try await first.client.updateSession(id: id, SessionPatch(approvalMode: .ask))
+        let turn = Task { await first.send("run: echo first", attachments: []) }
+        try await waitUntil("the approval request") { first.pendingApproval != nil }
+
+        let note = PendingAttachment(data: Data("a note\n".utf8), name: "note.txt", mime: "text/plain", kind: .document)
+        let sent = await second.send("  and another thing ", attachments: [note])
+        XCTAssertFalse(sent)
+        XCTAssertEqual(second.error, "a reply is still running in this conversation; stop it first")
+        XCTAssertFalse(second.messages.contains { $0.id.hasPrefix(localPrefix) }, "the refused message is not shown as sent")
+        XCTAssertEqual(second.takeUnsentDraft(for: id), UnsentDraft(text: "and another thing", attachments: [note]))
+        XCTAssertNil(second.takeUnsentDraft(for: id), "given back once")
+
+        // A rejected upload gives the draft back too.
+        let photo = PendingAttachment(data: Data([0, 1, 2]), name: "photo.heic", mime: "image/heic", kind: .image)
+        let uploaded = await second.send("look", attachments: [photo])
+        XCTAssertFalse(uploaded)
+        XCTAssertEqual(second.unsentDrafts[id]?.attachments, [photo])
+
+        await first.decide(first.pendingApproval!.callId, .deny)
+        _ = await turn.value
+        // Deleting the conversation drops what was held for it.
+        try await second.deleteSession(id)
+        XCTAssertNil(second.unsentDrafts[id])
     }
 
     func testTheLastConversationOpenedWins() async throws {

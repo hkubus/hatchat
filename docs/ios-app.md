@@ -88,10 +88,15 @@ app does:
 - a streamed turn settling on the stored transcript;
 - regenerate and branch switching, fork, and Markdown export;
 - Continue on a reply cut off at the length limit;
-- a tool approval round trip through the runner;
+- a tool approval round trip through the runner, and an approval answered
+  from a second store that reattached to the turn mid-way;
+- a send refused while another reply runs giving its draft back, with the
+  server's reason;
 - Stop cancelling the turn on the server rather than only detaching;
 - document upload, the HEIC rejection, and search;
-- conversation settings, including resetting to the provider default;
+- conversation settings, including resetting to the provider default, a new
+  chat's settings reaching the server ("ask" included), and a restored
+  conversation keeping its own reasoning effort;
 - rename, delete, and the 401 path.
 
 The CI `ios-core` job runs the same script on Linux.
@@ -177,6 +182,20 @@ has loaded. A reattach scheduled for the old conversation (at boot, say) then
 finds it gone and stands down. It no longer marks the store busy under the
 conversation being opened, which used to swallow the next send. The React
 Native app had that race; `ServerTests` caught it in the port.
+
+Reattaching mid-turn brings the message that made a tool call back with the
+stored history (it was saved before the call ran), so the replayed
+`tool.approval` and the `tool.result` are applied to that stored card too
+(`applyStoredEffect`), and the approval panel looks at both lists. Without it,
+an approval came back with no buttons and the turn waited on it. A tap is
+recorded at once and put back to "requested" if the server rejects it.
+
+**A send that goes nowhere gives its draft back**: an upload the server
+rejects, a turn it refuses (409 while another reply runs, 429), or the user
+opening another conversation before the message could go. The draft is kept
+in `ChatStore.unsentDrafts` under the conversation it was written in, and the
+composer takes it back only while that conversation is open, keeping any text
+or attachments written since. Deleting the conversation drops it.
 
 ### Attachments
 

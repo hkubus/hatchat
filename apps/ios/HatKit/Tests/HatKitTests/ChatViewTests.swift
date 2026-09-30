@@ -211,6 +211,47 @@ final class ChatViewTests: XCTestCase {
         XCTAssertEqual(split.files, [UiFile(id: "att_9", name: "report.csv", mime: "text/csv", size: 2048)])
     }
 
+    // MARK: Attaching to a turn already under way
+
+    func testAReplayedApprovalRequestReachesTheStoredMessageThatMadeTheCall() {
+        // Reopened while a call waits for approval: the message that made it
+        // was stored before the call ran, so it comes back with the history,
+        // and the server replays only what came after it.
+        let call = node("assistant", [.text("Deleting the build"), .toolCall(id: "call_1", name: "shell_exec", args: ["command": "rm -rf build"])])
+        var stored = buildMessages([node("user", [.text("clean up")]), call])
+        var inFlight: [UiMessage] = []
+        func apply(_ event: KernelEvent) {
+            let effect = readEvent(event)
+            inFlight = applyEffect(inFlight, effect)
+            stored = applyStoredEffect(stored, effect)
+        }
+        apply(.toolCall(messageId: call.message.id, callId: "call_1", name: "shell_exec", args: [:]))
+        apply(.toolApproval(callId: "call_1", status: .requested))
+
+        XCTAssertEqual(inFlight, [])
+        XCTAssertEqual(stored[1].tools.count, 1, "the replayed call does not add a second card")
+        XCTAssertEqual(stored[1].tools[0].approval, .requested, "the approval buttons come back")
+
+        apply(.toolApproval(callId: "call_1", status: .approved))
+        apply(.toolResult(callId: "call_1", name: "shell_exec", parts: [.text("removed")], isError: false))
+        XCTAssertEqual(stored[1].tools[0].approval, .approved)
+        XCTAssertFalse(stored[1].tools[0].running)
+        XCTAssertEqual(stored[1].tools[0].result, "removed")
+    }
+
+    func testStoredMessagesIgnoreEveryEffectButToolApprovalsAndResults() {
+        let stored = buildMessages([node("assistant", [.toolCall(id: "call_1", name: "shell_exec", args: [:])])])
+        let events: [KernelEvent] = [
+            .messageStart(messageId: "x"),
+            .textDelta(messageId: "x", text: "hi"),
+            .usage(Usage(inputTokens: 1)),
+            .toolApproval(callId: "someone_else", status: .requested),
+        ]
+        for event in events {
+            XCTAssertEqual(applyStoredEffect(stored, readEvent(event)), stored)
+        }
+    }
+
     // MARK: Tool cards
 
     func testToolSummary() {

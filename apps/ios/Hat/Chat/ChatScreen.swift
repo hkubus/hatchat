@@ -38,6 +38,13 @@ struct ChatScreen: View {
     private static let nearBottomDistance: CGFloat = 96
 
     private var rows: [UiMessage] { store.messages + store.inFlight }
+    /// A draft a send gave back (refused, or a file rejected), once the
+    /// conversation it was written in is the one open here. Never another's:
+    /// switching away before the refusal arrives leaves it waiting for this one.
+    private var unsentDraftHere: UnsentDraft? {
+        guard let id = selection, store.sessionId == id else { return nil }
+        return store.unsentDrafts[id]
+    }
     private var canSend: Bool {
         !store.busy && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
     }
@@ -85,6 +92,17 @@ struct ChatScreen: View {
         .onChange(of: store.pendingQuestionId) { _, id in if id != nil { Haptics.warning() } }
         .onChange(of: store.busy) { was, now in if was && !now && store.error == nil { Haptics.success() } }
         .onChange(of: store.error) { _, error in if error != nil { Haptics.error() } }
+        .onChange(of: unsentDraftHere, initial: true) { _, unsent in
+            if unsent != nil { restoreUnsentDraft() }
+        }
+    }
+
+    /// Put an unsent draft back in the composer, keeping whatever has been
+    /// written since: the user's own text, or attachments, win over the draft's.
+    private func restoreUnsentDraft() {
+        guard let id = selection, store.sessionId == id, let unsent = store.takeUnsentDraft(for: id) else { return }
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !unsent.text.isEmpty { draft = unsent.text }
+        if attachments.isEmpty { attachments = unsent.attachments }
     }
 
     // MARK: Transcript

@@ -306,6 +306,21 @@ public func applyEffect(_ list: [UiMessage], _ effect: ChatEffect) -> [UiMessage
     return next
 }
 
+/// Apply a live effect to the stored messages shown above the in-flight ones.
+/// Only tool approvals and results can concern them: a client that attached
+/// to a turn already under way (a relaunch, switching back, another device)
+/// got the message that made the call with the stored history, since it was
+/// saved before the call ran, so the replayed approval request and the result
+/// belong to that copy. Applied only in flight, they were dropped, which left
+/// an approval with no buttons and the turn waiting on it. The list comes back
+/// unchanged when the call is not in it.
+public func applyStoredEffect(_ stored: [UiMessage], _ effect: ChatEffect) -> [UiMessage] {
+    switch effect {
+    case .toolApproval, .toolResult: return applyEffect(stored, effect)
+    default: return stored
+    }
+}
+
 /// How full the context window is, judged by the latest model call: its prompt
 /// plus its reply is what the next call starts from.
 public func contextFill(_ messages: [UiMessage], contextWindow: Int?) -> (tokens: Int, fraction: Double)? {

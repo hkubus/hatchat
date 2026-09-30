@@ -44,6 +44,18 @@ public struct PendingAttachment: Hashable, Sendable, Identifiable {
     }
 }
 
+/// What the composer held when a send went nowhere: given back so nothing
+/// the user wrote is lost.
+public struct UnsentDraft: Hashable, Sendable {
+    public var text: String
+    public var attachments: [PendingAttachment]
+
+    public init(text: String, attachments: [PendingAttachment]) {
+        self.text = text
+        self.attachments = attachments
+    }
+}
+
 /// Instructions, temperature and max reply tokens for one conversation.
 public struct ConversationSettings: Hashable, Sendable {
     public var instructions: String
@@ -109,12 +121,18 @@ public final class ChatStore {
     public private(set) var reasoningEffort: ReasoningEffort = .off
     public private(set) var policyMode: ApprovalMode = .ask
     public private(set) var allowedTools: [String] = []
+    /// Drafts of sends that went nowhere (an upload rejected, the turn refused,
+    /// the user moved on mid-upload), by the conversation they were written in.
+    /// The composer takes one back when its conversation is open, so a draft
+    /// never lands in another conversation's composer; deleting the
+    /// conversation drops it.
+    public private(set) var unsentDrafts: [String: UnsentDraft] = [:]
 
     /// The in-flight list as of the latest event; `inFlight` trails it by at
     /// most one publish interval.
     @ObservationIgnored private var liveInFlight: [UiMessage] = []
     @ObservationIgnored private var publishPending = false
-    @ObservationIgnored private var streamTask: Task<Void, Never>?
+    @ObservationIgnored private var streamTask: Task<Error?, Never>?
     /// Identity of the turn whose events may touch state. Guards against a late
     /// event from an abandoned turn landing in the conversation opened since,
     /// and tells a turn's own cleanup whether it is still the current one.
@@ -153,9 +171,10 @@ public final class ChatStore {
         !busy && inFlight.isEmpty && endsTruncated(messages)
     }
 
-    /// The first tool call in the turn that is waiting for approval.
+    /// The first tool call in the turn that is waiting for approval. After
+    /// reattaching mid-turn it is on a stored message rather than in flight.
     public var pendingApproval: UiTool? {
-        inFlight.lazy.flatMap(\.tools).first { $0.running && $0.approval == .requested }
+        (messages + inFlight).lazy.flatMap(\.tools).first { $0.running && $0.approval == .requested }
     }
 
     /// An `ask_user` question blocking the turn, if any.
@@ -187,13 +206,19 @@ public final class ChatStore {
         // it. One that has since been deleted falls back to the most recent.
         let stored = prefs.string(forKey: "session") ?? ""
         let target = list.first { $0.id == stored }?.id ?? list.max { $0.updatedAt < $1.updatedAt }?.id
+        var restored = false
         if let target, let payload = try? await client.session(id: target) {
             show(payload)
+            restored = true
             // A turn started before the app was closed may still be running; on
             // iOS that is the common case, since the system suspends apps freely.
             Task { await followActiveTurn(payload.session.id) }
         }
 
+        // The last-used model and effort are what a new chat starts with. A
+        // restored conversation keeps its own: applied over it, they would
+        // switch its model on the next send.
+        guard !restored else { return }
         let storedModel = prefs.string(forKey: "model") ?? ""
         if models.contains(where: { $0.id == storedModel }) {
             model = storedModel
@@ -284,9 +309,26 @@ public final class ChatStore {
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 sessions[index].title = title
             }
+        case .toolApproval, .toolResult:
+            applyToolEffect(effect)
         default:
             updateInFlight { applyEffect($0, effect) }
         }
+    }
+
+    /// Apply a tool approval or result to the card it concerns: in flight, or,
+    /// after reattaching mid-turn, on the stored message that made the call.
+    /// Stored cards are only touched when the call is not in flight, so a call
+    /// id a provider reuses cannot restamp an old card.
+    private func applyToolEffect(_ effect: ChatEffect) {
+        updateInFlight { applyEffect($0, effect) }
+        let callId: String
+        switch effect {
+        case let .toolApproval(id, _), let .toolResult(id, _, _, _, _): callId = id
+        default: return
+        }
+        guard !liveInFlight.contains(where: { $0.tools.contains { $0.callId == callId } }) else { return }
+        messages = applyStoredEffect(messages, effect)
     }
 
     /// Settle the view once a turn ends, however it ended: promote what
@@ -306,8 +348,11 @@ public final class ChatStore {
 
     private typealias Run = (_ onEvent: @escaping @Sendable (KernelEvent) async -> Void) async throws -> Void
 
-    /// Run one stream to its end as the current turn.
-    private func runStream(_ id: String, _ run: @escaping Run) async {
+    /// Run one stream to its end as the current turn. Returns what it failed
+    /// with, if anything: an `HttpError` means the server refused the turn
+    /// before it started.
+    @discardableResult
+    private func runStream(_ id: String, _ run: @escaping Run) async -> Error? {
         turnSeq += 1
         let turn = turnSeq
         turnId = turn
@@ -317,21 +362,22 @@ public final class ChatStore {
         setInFlight([])
 
         // The store lives as long as the app, so holding it for a turn is fine.
-        let task = Task { @MainActor in
+        let task = Task { @MainActor () -> Error? in
             do {
                 try await run { event in await self.handle(event, turn: turn) }
+                return nil
             } catch {
                 // A turn the user stopped or left is not a failure.
-                guard !isCancellation(error), turnId == turn else { return }
-                self.error = describe(error)
+                if !isCancellation(error), turnId == turn { self.error = describe(error) }
+                return error
             }
         }
         streamTask = task
-        await task.value
+        let failure = await task.value
 
         // Skipped once the turn has been abandoned: its cleanup would otherwise
         // overwrite the conversation the user moved to.
-        guard turnId == turn else { return }
+        guard turnId == turn else { return failure }
         streamTask = nil
         turnId = nil
         if sessionId == id {
@@ -341,6 +387,7 @@ public final class ChatStore {
         } else {
             busy = false
         }
+        return failure
     }
 
     /// Close the socket but leave the turn running server-side.
@@ -382,21 +429,27 @@ public final class ChatStore {
 
     private func ensureSession() async throws -> String {
         if let sessionId { return sessionId }
-        let payload = try await client.createSession(model: model)
+        let seq = switchSeq
         let (mode, tools, effort) = (policyMode, allowedTools, reasoningEffort)
+        let payload = try await client.createSession(model: model)
+        // Opened another conversation meanwhile: this one is no longer where
+        // the user is, so it must not take over.
+        guard seq == switchSeq else { throw CancellationError() }
         // Not `show`: a new session's path is empty, and replacing the
         // transcript with it would drop the message being sent.
         sessionId = payload.session.id
         applySession(payload.session)
         prefs.set(payload.session.id, forKey: "session")
         try? await refreshSessions()
-        // Settings chosen before the first message carry over to the new session.
-        if mode != .ask || effort != .off || !tools.isEmpty {
-            applySession(try await client.updateSession(
-                id: payload.session.id,
-                SessionPatch(approvalMode: mode, allowedTools: tools, reasoningEffort: effort)
-            ))
-        }
+        // What the composer showed is this chat's settings. Always sent: a new
+        // session gets the server's defaults (auto approval), which need not
+        // match, and skipping "ask" left a chat set to ask running tools
+        // without asking.
+        let updated = try await client.updateSession(
+            id: payload.session.id,
+            SessionPatch(approvalMode: mode, allowedTools: tools, reasoningEffort: effort)
+        )
+        if sessionId == payload.session.id { applySession(updated) }
         return payload.session.id
     }
 
@@ -411,11 +464,30 @@ public final class ChatStore {
         error = message
     }
 
-    public func send(_ text: String, attachments: [PendingAttachment]) async {
-        guard !busy else { return }
+    /// The draft a send gave back to the conversation `id`, if any, taken so
+    /// it is given back once. The composer calls this when `id` is open.
+    public func takeUnsentDraft(for id: String) -> UnsentDraft? {
+        unsentDrafts.removeValue(forKey: id)
+    }
+
+    /// Send a message. Returns false when nothing went out: an upload was
+    /// rejected, the server refused the turn (another reply still running, too
+    /// many turns), or the user opened another conversation before it could
+    /// go. The draft is then kept in `unsentDrafts` for the conversation it
+    /// was written in.
+    @discardableResult
+    public func send(_ text: String, attachments: [PendingAttachment]) async -> Bool {
+        guard !busy else { return false }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty || !attachments.isEmpty else { return }
+        guard !body.isEmpty || !attachments.isEmpty else { return false }
         error = nil
+
+        let origin = sessionId
+        let seq = switchSeq
+        func giveBack(to id: String?) {
+            guard let id else { return }
+            unsentDrafts[id] = UnsentDraft(text: body, attachments: attachments)
+        }
 
         // Upload first, so a rejected file fails before anything is persisted.
         var ids: [String] = []
@@ -428,14 +500,22 @@ public final class ChatStore {
                 if record.kind == "document" { names[record.id] = attachment.name }
             }
         } catch {
-            self.error = describe(error)
-            return
+            if seq == switchSeq { self.error = describe(error) }
+            giveBack(to: origin)
+            return false
+        }
+        // The user opened another conversation while the files went up: the
+        // message belongs to the one it was written in, so it waits there.
+        guard seq == switchSeq else {
+            giveBack(to: origin)
+            return false
         }
 
         // Show the message now; the post-turn refresh swaps in the stored one.
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
+        let localId = "\(localPrefix)\(stamp)"
         messages.append(UiMessage(
-            id: "\(localPrefix)\(stamp)",
+            id: localId,
             role: .user,
             text: body,
             images: attachments.filter { $0.kind == .image }.map {
@@ -448,19 +528,36 @@ public final class ChatStore {
             }
         ))
 
+        let id: String
         do {
-            let id = try await ensureSession()
-            let model = self.model
-            await runStream(id) { [client] onEvent in
-                try await client.sendTurn(
-                    sessionId: id, text: body, model: model, attachmentIds: ids,
-                    attachmentNames: names, onEvent: onEvent
-                )
-            }
+            id = try await ensureSession()
         } catch {
-            if !isCancellation(error) { self.error = describe(error) }
-            busy = false
+            // No conversation to send to, so nothing went out.
+            if seq == switchSeq {
+                messages.removeAll { $0.id == localId }
+                if !isCancellation(error) { self.error = describe(error) }
+            }
+            giveBack(to: seq == switchSeq ? sessionId ?? origin : origin)
+            return false
         }
+        // Created for this message, but the user has moved on since.
+        guard seq == switchSeq else {
+            giveBack(to: id)
+            return false
+        }
+        let model = self.model
+        let failure = await runStream(id) { [client] onEvent in
+            try await client.sendTurn(
+                sessionId: id, text: body, model: model, attachmentIds: ids,
+                attachmentNames: names, onEvent: onEvent
+            )
+        }
+        // An HTTP error comes only from the stream's start: the server said no
+        // before a turn began (the post-turn refresh has already dropped the
+        // optimistic message). The reason is on `error`.
+        guard failure is HttpError else { return true }
+        giveBack(to: id)
+        return false
     }
 
     /// The Stop button: ask the server to cancel, then drop the socket.
@@ -501,6 +598,7 @@ public final class ChatStore {
 
     public func deleteSession(_ id: String) async throws {
         try await client.deleteSession(id: id)
+        unsentDrafts.removeValue(forKey: id)
         if id == sessionId {
             abandonTurn()
             sessionId = nil
@@ -573,22 +671,24 @@ public final class ChatStore {
 
     public func decide(_ callId: String, _ decision: ApprovalDecision) async {
         // Recorded at once: a button that sits there looking live through the
-        // round trip makes the tool look hung.
-        let resolved = approvalForDecision(decision)
-        let mark: ([UiMessage]) -> [UiMessage] = { list in
-            list.map { message in
-                var message = message
-                for i in message.tools.indices where message.tools[i].callId == callId {
-                    message.tools[i].approval = resolved
-                }
-                return message
+        // round trip makes the tool look hung. The card is in flight, or stored
+        // if the app reattached to the turn.
+        func mark(_ status: ApprovalStatus) {
+            let effect = ChatEffect.toolApproval(callId: callId, status: status)
+            setInFlight(applyEffect(liveInFlight, effect))
+            if !liveInFlight.contains(where: { $0.tools.contains { $0.callId == callId } }) {
+                messages = applyStoredEffect(messages, effect)
             }
         }
-        setInFlight(mark(liveInFlight))
+        mark(approvalForDecision(decision))
         guard let id = sessionId else { return }
+        let seq = switchSeq
         do {
             try await client.resolveApproval(callId: callId, decision: decision, sessionId: id)
         } catch {
+            guard seq == switchSeq else { return }
+            // Bring the buttons back: the approval is still pending.
+            mark(.requested)
             self.error = describe(error)
         }
     }
