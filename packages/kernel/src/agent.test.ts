@@ -839,3 +839,28 @@ test("stopping mid-reply keeps what streamed, marks it unfinished and reports no
   assert.deepEqual(reply.parts, [{ type: "text", text: "The answer is" }]);
   assert.equal(reply.meta?.incomplete, true);
 });
+
+test("history is repaired for a model with a known context window too", async () => {
+  const sent: ChatMessage[][] = [];
+  const windowed: Provider = {
+    id: "windowed",
+    label: "windowed",
+    // A context window turns on fitting, which must work on the repaired history.
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true, contextWindow: 100_000 }),
+    listModels: async () => [],
+    async *chat(req) {
+      sent.push(req.messages);
+      yield { type: "text.delta", text: "hello" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+  const at = Date.now();
+  // The server stopped mid-call: the call never got its result.
+  const history: ChatMessage[] = [
+    { id: "u0", role: "user", parts: [{ type: "text", text: "list files" }], createdAt: at },
+    { id: "a0", role: "assistant", parts: [{ type: "tool_call", id: "c1", name: "shell_exec", args: {} }], createdAt: at + 1 },
+  ];
+  await runTurn(agentFor(windowed, []), "windowed/m", { history });
+  const roles = sent[0].filter((m) => m.role !== "system").map((m) => m.role);
+  assert.deepEqual(roles, ["user", "assistant", "tool", "user"], "the dangling call is answered before the new message");
+});

@@ -200,7 +200,7 @@ export class Agent {
         const fixed =
           estimateTextTokens(systemPrompt) + (withTools ? estimateTextTokens(JSON.stringify(withTools)) : 0);
         const fit = fitToContext(
-          list,
+          fitted,
           messageBudget({ contextWindow: caps.contextWindow, maxOutputTokens: input.maxTokens, fixedTokens: fixed }),
         );
         fitted = fit.messages;
