@@ -43,7 +43,9 @@ import { createProcessPlugin, createPythonPlugin } from "@hat/tool-process";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
+import { getConnInfo } from "@hono/node-server/conninfo";
 import crypto from "node:crypto";
 import { ApprovalManager } from "./approvals.js";
 import type { ServerConfig } from "./config.js";
@@ -348,16 +350,30 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   const turnLimiter = new RateLimiter(60, 60_000);
   const uploadLimiter = new RateLimiter(30, 60_000);
 
+  let ignoredForwarding = false;
+
+  /**
+   * The address a request came from, for rate limits. `X-Forwarded-For` is
+   * anyone's to write, so it only counts on a connection from a proxy listed
+   * in HAT_TRUSTED_PROXIES: otherwise a client could claim a fresh address on
+   * every login attempt and never be limited.
+   */
   function clientIp(c: Context): string {
-    // Prefer the last forwarded entry (closest proxy) and fall back to direct.
-    // Full proxy-trust needs explicit config; this at least stops trivial
-    // header-rotation bypasses from resetting the login bucket alone.
+    const peer = peerAddress(c);
     const forwarded = c.req.header("x-forwarded-for");
-    if (forwarded) {
-      const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
-      if (parts.length > 0) return parts[parts.length - 1];
+    if (forwarded && peer && config.trustedProxies.includes(peer)) {
+      // The proxy appends the address it saw: the last entry is its own word.
+      const hops = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
+      if (hops.length > 0) return hops[hops.length - 1];
     }
-    return c.req.header("x-real-ip")?.trim() || "local";
+    if (forwarded && !ignoredForwarding) {
+      ignoredForwarding = true;
+      logger.warn(
+        `ignoring X-Forwarded-For from ${peer ?? "an unknown address"}; if that is your reverse proxy, ` +
+          "list it in HAT_TRUSTED_PROXIES, or every client shares its rate limits",
+      );
+    }
+    return peer ?? "local";
   }
 
   const bearerAuthed = (c: Context): boolean => {
@@ -385,7 +401,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     }),
   );
 
-  app.post("/api/auth/login", async (c) => {
+  // Anyone can call this one, so it reads a password, not whatever they send.
+  app.post("/api/auth/login", bodyLimit({ maxSize: 16 * 1024, onError: tooLarge("request too large") }), async (c) => {
     if (!config.authPasswordHash) {
       return c.json({ error: "password auth is not configured" }, 400);
     }
@@ -399,7 +416,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     } catch {
       /* ignore */
     }
-    if (!body.password || !verifyPassword(body.password, config.authPasswordHash)) {
+    if (typeof body.password !== "string" || !(await verifyPassword(body.password, config.authPasswordHash))) {
       return c.json({ error: "invalid password" }, 401);
     }
     loginLimiter.reset(ip);
@@ -414,7 +431,22 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ ok: true, csrfToken: csrf });
   });
 
+  /**
+   * Sign out: clear the cookies. A live session takes its CSRF token as well,
+   * so a cross-site form can't sign the user out. A session that has expired
+   * (or a forged one) is cleared without it: there is nothing to protect, and
+   * a stale cookie must not leave the user unable to sign out at all.
+   */
   app.post("/api/auth/logout", (c) => {
+    const token = getCookie(c, "hat_session");
+    const live = token ? verifySession(token, sessionSecret) : undefined;
+    if (live && !bearerAuthed(c)) {
+      const csrfCookie = getCookie(c, "hat_csrf");
+      const csrfHeader = c.req.header("x-csrf-token");
+      if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+        return c.json({ error: "invalid csrf token" }, 403);
+      }
+    }
     deleteCookie(c, "hat_session", { path: "/" });
     deleteCookie(c, "hat_csrf", { path: "/" });
     return c.json({ ok: true });
@@ -424,9 +456,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   app.use("/api/*", async (c, next) => {
     const path = c.req.path;
-    // Login + status stay unauthenticated; logout requires session + CSRF
-    // so a cross-site form can't log the user out.
-    if (path === "/api/auth/login" || path === "/api/auth/status") return next();
+    // Login, status and logout check what they need themselves.
+    if (path === "/api/auth/login" || path === "/api/auth/status" || path === "/api/auth/logout") return next();
     if (!authRequired) return next();
     if (bearerAuthed(c)) return next();
 
@@ -626,7 +657,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- attachments --------------------------------------------------------
 
-  app.post("/api/attachments", async (c) => {
+  // Refused while it streams in, not after the whole body sits in memory.
+  const uploadLimit = bodyLimit({ maxSize: 26 * 1024 * 1024, onError: tooLarge("file too large (max 25MB)") });
+  app.post("/api/attachments", uploadLimit, async (c) => {
     if (!uploadLimiter.allow(clientIp(c))) {
       return c.json({ error: "too many uploads; try again later" }, 429);
     }
@@ -1251,6 +1284,20 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       store.close();
     },
   };
+}
+
+/** A 413 for a body over its limit, worded like the API's other errors. */
+function tooLarge(message: string): (c: Context) => Response {
+  return (c) => c.json({ error: message }, 413);
+}
+
+/** The connection's own address; an in-process request (tests) has none. */
+function peerAddress(c: Context): string | undefined {
+  try {
+    return getConnInfo(c).remote.address?.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, "");
+  } catch {
+    return undefined;
+  }
 }
 
 /**

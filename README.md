@@ -78,7 +78,10 @@ the API is open (dev only).
   expiry) plus a readable `hat_csrf` cookie.
 - Mutating requests authenticated by cookie must send `x-csrf-token` matching
   the cookie (double-submit); bearer-token requests are exempt.
-- Login is **rate-limited** (10 attempts / 15 min per IP).
+- Login is **rate-limited** (10 attempts / 15 min per client address). The
+  address is the connection's own: `X-Forwarded-For` is believed only from the
+  proxies listed in `HAT_TRUSTED_PROXIES`, since anyone can send it. Behind a
+  reverse proxy, list its address there, or every client shares one limit.
 - `HAT_AUTH_TOKEN` still works as a bearer credential for automation (curl,
   scripts) and bypasses CSRF.
 - `HAT_COOKIE_SECURE=true` when serving over HTTPS. The web UI shows a login
