@@ -48,6 +48,20 @@ interface LiveSession {
 
 const MAX_LINK_TEXT = 120;
 
+/**
+ * Chromium's flags. WebRTC is the one way a page gets traffic past the egress
+ * proxy: STUN and media go out over UDP, straight from the server's network,
+ * and ICE candidates would tell a page its private addresses. Only UDP that
+ * would go through the proxy is allowed, which is none (the proxy is HTTP).
+ */
+export const CHROMIUM_ARGS: readonly string[] = [
+  "--no-sandbox",
+  "--disable-dev-shm-usage",
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--enforce-webrtc-ip-permission-check",
+];
+
 /** One shared Chromium; one isolated context/page per conversation. */
 export class BrowserManager implements BrowserController {
   private browser?: Browser;
@@ -71,7 +85,7 @@ export class BrowserManager implements BrowserController {
         chromium.launch({
           executablePath: this.options.executablePath || undefined,
           headless: this.options.headless,
-          args: ["--no-sandbox", "--disable-dev-shm-usage"],
+          args: [...CHROMIUM_ARGS],
           // Playwright also sends loopback traffic through the proxy, which
           // Chromium would otherwise let bypass it.
           proxy: { server: url },

@@ -13,6 +13,8 @@ export interface EgressProxy {
 
 /** Hop-by-hop headers of the browser-to-proxy leg, not to be forwarded. */
 const PROXY_HEADERS = ["proxy-connection", "proxy-authorization", "connection", "keep-alive"];
+/** The same for a WebSocket handshake, which must keep its `Connection: Upgrade`. */
+const UPGRADE_DROPPED_HEADERS = ["proxy-connection", "proxy-authorization", "keep-alive"];
 
 /**
  * A forward proxy that only lets the browser reach public hosts.
@@ -25,8 +27,9 @@ const PROXY_HEADERS = ["proxy-connection", "proxy-authorization", "connection", 
  * WebSockets), checks where it goes, and connects to the address it checked,
  * so the host's DNS can't answer differently in between.
  *
- * Plain HTTP to a blocked host gets a 403 page saying why; HTTPS gets its
- * tunnel refused, which the browser reports as a failed navigation.
+ * Plain HTTP to a blocked host gets a 403 page saying why; HTTPS and
+ * WebSockets get the tunnel or upgrade refused, which the browser reports as
+ * a failed navigation or connection.
  */
 export async function startEgressProxy(vet: HostVetter): Promise<EgressProxy> {
   const sockets = new Set<net.Socket>();
@@ -97,9 +100,43 @@ export async function startEgressProxy(vet: HostVetter): Promise<EgressProxy> {
     })();
   });
 
-  // A WebSocket over plain HTTP asks to upgrade instead of tunnelling.
-  server.on("upgrade", (_req: http.IncomingMessage, client: net.Socket) => {
-    client.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  // A WebSocket over plain HTTP (ws://) asks to upgrade instead of
+  // tunnelling: checked like any HTTP request, then the handshake is passed
+  // on to the address checked and the two sockets joined.
+  server.on("upgrade", (req: http.IncomingMessage, client: net.Socket, head: Buffer) => {
+    void (async () => {
+      client.on("error", () => client.destroy());
+      let target: URL;
+      try {
+        target = new URL(req.url ?? "");
+        if (target.protocol !== "http:" && target.protocol !== "ws:") throw new Error("not an http URL");
+      } catch {
+        client.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
+      }
+      let address: string;
+      try {
+        address = await vet(target.hostname);
+      } catch {
+        client.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+        return;
+      }
+      // The handshake needs its Connection: Upgrade; only the proxy's own headers go.
+      const lines = [`${req.method ?? "GET"} ${target.pathname}${target.search} HTTP/1.1`];
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        const name = req.rawHeaders[i];
+        if (UPGRADE_DROPPED_HEADERS.includes(name.toLowerCase())) continue;
+        lines.push(`${name}: ${req.rawHeaders[i + 1]}`);
+      }
+      const upstream = net.connect(Number(target.port) || 80, address, () => {
+        upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on("error", () => client.destroy());
+      client.on("close", () => upstream.destroy());
+    })();
   });
 
   server.on("connection", (socket: net.Socket) => {
