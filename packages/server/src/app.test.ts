@@ -116,9 +116,13 @@ test("a message sent right after Stop waits for the stopped turn to finish", asy
   assert.equal(next.status, 200);
   await Promise.all([events(first), events(next)]);
 
+  // The stopped turn keeps only what streamed before the stop, possibly
+  // nothing, and the new turn follows it instead of interleaving with it.
   const path = await pathOf(app, id);
-  assert.deepEqual(path.map((node) => node.message.role), ["user", "assistant", "user", "assistant"]);
-  assert.equal(path[2].message.parts[0]?.text, "after stop");
+  assert.equal(path[0].message.parts[0]?.text, LONG);
+  assert.deepEqual(path.slice(-2).map((node) => node.message.role), ["user", "assistant"]);
+  assert.equal(path.at(-2)?.message.parts[0]?.text, "after stop");
+  assert.ok(path.every((node) => node.message.parts.length > 0), "no empty reply is stored");
 });
 
 test("switching branches mid-turn keeps the reply under the turn's own question", async (t) => {

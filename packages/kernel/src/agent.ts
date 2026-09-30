@@ -22,6 +22,7 @@ import type {
 } from "@hat/core";
 import { DEFAULT_TOOL_POLICY, addUsage, decideTool, newId, normalizeError } from "@hat/core";
 import { estimateTextTokens, fitToContext, messageBudget } from "./context.js";
+import { repairTranscript } from "./transcript.js";
 import type { ProviderRegistry, ToolRegistry } from "./registries.js";
 
 export interface AgentTurnInput {
@@ -193,7 +194,7 @@ export class Agent {
     // can outgrow halfway through.
     let lastContextNote = "";
     const prepare = (list: ChatMessage[], withTools: ToolSpec[] | undefined) => {
-      let fitted = list;
+      let fitted = repairTranscript(list);
       let note: string | undefined;
       if (caps.contextWindow) {
         const fixed =
@@ -280,9 +281,17 @@ export class Agent {
       for (const call of calls) {
         assistant.parts.push({ type: "tool_call", id: call.id, name: call.name, args: call.args });
       }
-      assistant.meta = { ...assistant.meta, ...(usage ? { usage } : {}), finishReason: finish };
+      assistant.meta = {
+        ...assistant.meta,
+        ...(usage ? { usage } : {}),
+        finishReason: finish,
+        // Stopped by the user mid-reply: what streamed is kept, marked unfinished.
+        ...(input.signal.aborted ? { incomplete: true } : {}),
+      };
       messages.push(assistant);
-      onMessage(assistant);
+      // A call that failed before producing anything leaves nothing to store:
+      // an empty reply would only be replayed to the provider on every turn.
+      if (assistant.parts.length > 0) onMessage(assistant);
       yield { type: "message.done", messageId: assistantId, finishReason: finish };
 
       if (finish === "error" || calls.length === 0) {
@@ -488,7 +497,8 @@ export class Agent {
       if (!failure) return result;
 
       if (!failure.retryable || produced || signal.aborted || attempt >= maxRetries) {
-        yield { type: "error", error: failure };
+        // A stop the user asked for is not a failure to report.
+        if (!signal.aborted) yield { type: "error", error: failure };
         result.finish = "error";
         return result;
       }

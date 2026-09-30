@@ -779,3 +779,63 @@ test("stopping while an approval is pending records the call as stopped, not den
   assert.match(JSON.stringify(result.parts), /not run: the turn was stopped/);
   assert.doesNotMatch(JSON.stringify(result.parts), /denied/);
 });
+
+test("a call that fails before any output stores no reply, and the next request carries none", async () => {
+  let fail = true;
+  const sent: ChatMessage[][] = [];
+  const flaky: Provider = {
+    id: "flaky",
+    label: "flaky",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES }),
+    listModels: async () => [],
+    async *chat(req) {
+      sent.push(req.messages);
+      if (fail) {
+        yield { type: "error", error: { code: "http_401", message: "invalid api key", retryable: false } };
+        return;
+      }
+      yield { type: "text.delta", text: "hello" };
+      yield { type: "done", finishReason: "stop" as const };
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(flaky, [], { onMessage: (_s, message) => stored.push(message) });
+
+  const events = await runTurn(agent, "flaky/m");
+  assert.ok(events.some((e) => e.type === "error"));
+  assert.deepEqual(stored.map((m) => m.role), ["user"]);
+
+  // The user fixes the key and asks again, on top of what was stored.
+  fail = false;
+  await runTurn(agent, "flaky/m", { history: [...stored] });
+  const roles = sent[1].map((m) => m.role);
+  assert.deepEqual(roles, ["user"], "the two user turns go out as one, with no empty reply between");
+});
+
+test("stopping mid-reply keeps what streamed, marks it unfinished and reports no error", async () => {
+  const stop = new AbortController();
+  const slow: Provider = {
+    id: "slow",
+    label: "slow",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES }),
+    listModels: async () => [],
+    async *chat(_req, signal) {
+      yield { type: "text.delta", text: "The answer is" };
+      stop.abort();
+      await new Promise((_resolve, reject) => {
+        if (signal.aborted) reject(new DOMException("This operation was aborted", "AbortError"));
+        signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+      });
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(slow, [], { onMessage: (_s, message) => stored.push(message) });
+
+  const events = await runTurn(agent, "slow/m", { signal: stop.signal });
+
+  assert.equal(events.some((e) => e.type === "error"), false);
+  const reply = stored.find((m) => m.role === "assistant");
+  assert.ok(reply);
+  assert.deepEqual(reply.parts, [{ type: "text", text: "The answer is" }]);
+  assert.equal(reply.meta?.incomplete, true);
+});
