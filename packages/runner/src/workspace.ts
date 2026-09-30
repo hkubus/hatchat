@@ -1,7 +1,20 @@
-import fs from "node:fs/promises";
-import { mkdirSync } from "node:fs";
+import fs, { type FileHandle } from "node:fs/promises";
+import { constants, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { DirEntry } from "@hat/core";
+
+/** Not following a symlink in the last component; not blocking on a FIFO. Absent on Windows. */
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+const NONBLOCK = constants.O_NONBLOCK ?? 0;
+const DIRECTORY = constants.O_DIRECTORY ?? 0;
+
+/**
+ * Where an open descriptor can be named as a path: `/proc/self/fd/N` is the
+ * very file or directory opened, whatever happened to the path it was
+ * opened by since. Linux only; elsewhere the checks fall back to comparing
+ * the opened file with where its path leads now.
+ */
+const PROC_FD = process.platform === "linux" && existsSync("/proc/self/fd") ? "/proc/self/fd" : undefined;
 
 function isWithin(root: string, target: string): boolean {
   const rel = path.relative(root, target);
@@ -30,6 +43,83 @@ async function assertRegularFile(target: string, relative: string, mayBeMissing 
     throw error;
   }
   throw new Error(`Not a regular file: ${relative}`);
+}
+
+function escapes(relative: string): Error {
+  return new Error(`Path escapes session workspace: ${relative}`);
+}
+
+/**
+ * Open a directory and make sure the directory opened is inside `root`. The
+ * path was checked before, but a process in the workspace could have swapped
+ * one of its directories for a symlink since.
+ */
+async function openDirInside(root: string, dir: string, relative: string): Promise<FileHandle> {
+  const handle = await fs.open(dir, constants.O_RDONLY | DIRECTORY);
+  try {
+    await assertOpenedInside(handle, root, dir, relative);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/** Throw unless what `handle` has open is inside `root` (and, without /proc, is still what `opened` names). */
+async function assertOpenedInside(handle: FileHandle, root: string, opened: string, relative: string): Promise<void> {
+  if (PROC_FD) {
+    if (!isWithin(root, await fs.readlink(`${PROC_FD}/${handle.fd}`))) throw escapes(relative);
+    return;
+  }
+  const real = await fs.realpath(opened);
+  if (!isWithin(root, real)) throw escapes(relative);
+  const [held, named] = await Promise.all([handle.stat(), fs.stat(real)]);
+  if (held.dev !== named.dev || held.ino !== named.ino) {
+    throw new Error(`Path changed while it was opened: ${relative}`);
+  }
+}
+
+/**
+ * Open the file at `target` (already resolved inside the workspace) so that
+ * the file opened is inside `root` whatever changes on disk meanwhile: its
+ * directory is opened and checked first, and the file is opened through that
+ * descriptor, never following a symlink in its own name. Without /proc the
+ * file is opened by path and then compared with where the path leads now:
+ * nothing is read or written through a swapped path, though a new, empty
+ * file could be left where it led.
+ */
+async function openFileInside(root: string, target: string, relative: string, flags: number): Promise<FileHandle> {
+  const mode = flags | NOFOLLOW | NONBLOCK;
+  let handle: FileHandle;
+  if (PROC_FD) {
+    const dir = await openDirInside(root, path.dirname(target), relative);
+    try {
+      handle = await fs.open(`${PROC_FD}/${dir.fd}/${path.basename(target)}`, mode, 0o666);
+    } catch (error) {
+      if (errorCode(error) === "ELOOP") throw escapes(relative);
+      throw error;
+    } finally {
+      await dir.close();
+    }
+  } else {
+    await (await openDirInside(root, path.dirname(target), relative)).close();
+    handle = await fs.open(target, mode, 0o666).catch((error: unknown) => {
+      throw errorCode(error) === "ELOOP" ? escapes(relative) : error;
+    });
+    try {
+      await assertOpenedInside(handle, root, target, relative);
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+  try {
+    if (!(await handle.stat()).isFile()) throw new Error(`Not a regular file: ${relative}`);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
 }
 
 /** Owns the on-disk workspace tree for every session on this runner. */
@@ -97,10 +187,11 @@ export class WorkspaceManager {
    * command, `git clone`, `tar x`) would carry them anywhere on this machine.
    * The longest existing prefix is resolved and must stay inside the
    * workspace, and a dangling symlink is refused, since writing through it
-   * creates whatever it points at. The check holds at the time of the call; a
-   * sandboxed process still running could swap a directory for a link after.
+   * creates whatever it points at. That check is made again on what is
+   * actually opened (see `openFileInside`), so a process in the workspace
+   * swapping a directory for a symlink in between can't redirect it.
    */
-  private async resolveReal(sessionId: string, relative: string): Promise<string> {
+  private async resolveReal(sessionId: string, relative: string): Promise<{ root: string; target: string }> {
     const abs = this.resolveInSession(sessionId, relative);
     const root = await fs.realpath(await this.ensure(sessionId));
     const missing: string[] = [];
@@ -113,10 +204,8 @@ export class WorkspaceManager {
       }
       if (real !== undefined) {
         const resolved = path.join(real, ...missing);
-        if (!isWithin(root, resolved)) {
-          throw new Error(`Path escapes session workspace: ${relative}`);
-        }
-        return resolved;
+        if (!isWithin(root, resolved)) throw escapes(relative);
+        return { root, target: resolved };
       }
       if (await isSymlink(current)) {
         throw new Error(`Path goes through a dangling symlink: ${relative}`);
@@ -126,41 +215,63 @@ export class WorkspaceManager {
   }
 
   async read(sessionId: string, relative: string): Promise<string> {
-    const target = await this.resolveReal(sessionId, relative);
+    const { root, target } = await this.resolveReal(sessionId, relative);
     await assertRegularFile(target, relative);
-    return fs.readFile(target, "utf8");
+    const handle = await openFileInside(root, target, relative, constants.O_RDONLY);
+    try {
+      return await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
   }
 
   async write(sessionId: string, relative: string, data: string): Promise<void> {
-    const target = await this.resolveReal(sessionId, relative);
+    const { root, target } = await this.resolveReal(sessionId, relative);
     await assertRegularFile(target, relative, true);
+    // Creating missing directories goes by path. If one of them is swapped
+    // for a symlink meanwhile, an empty directory may land outside, but the
+    // file never does: the directory it goes in is checked once opened.
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, data, "utf8");
+    // Not truncated until the file opened is known to be the right one.
+    const handle = await openFileInside(root, target, relative, constants.O_WRONLY | constants.O_CREAT);
+    try {
+      await handle.truncate(0);
+      await handle.writeFile(data, "utf8");
+    } finally {
+      await handle.close();
+    }
   }
 
   async list(sessionId: string, relative: string): Promise<DirEntry[]> {
-    const abs = await this.resolveReal(sessionId, relative || ".");
+    const { root, target: abs } = await this.resolveReal(sessionId, relative || ".");
     // Entries keep the path the caller asked for, not where a symlink led.
     const shown = path.relative(this.sessionDir(sessionId), this.resolveInSession(sessionId, relative || "."));
-    const entries = await fs.readdir(abs, { withFileTypes: true });
-    const out: DirEntry[] = [];
-    for (const entry of entries) {
-      let size: number | undefined;
-      if (entry.isFile()) {
-        try {
-          size = (await fs.stat(path.join(abs, entry.name))).size;
-        } catch {
-          size = undefined;
+    const dir = await openDirInside(root, abs, relative || ".");
+    try {
+      // Read through the descriptor where possible: the directory checked.
+      const listed = PROC_FD ? `${PROC_FD}/${dir.fd}` : abs;
+      const entries = await fs.readdir(listed, { withFileTypes: true });
+      const out: DirEntry[] = [];
+      for (const entry of entries) {
+        let size: number | undefined;
+        if (entry.isFile()) {
+          try {
+            size = (await fs.lstat(path.join(listed, entry.name))).size;
+          } catch {
+            size = undefined;
+          }
         }
+        out.push({
+          name: entry.name,
+          path: path.join(shown, entry.name),
+          type: entry.isDirectory() ? "dir" : entry.isFile() ? "file" : "other",
+          size,
+        });
       }
-      out.push({
-        name: entry.name,
-        path: path.join(shown, entry.name),
-        type: entry.isDirectory() ? "dir" : entry.isFile() ? "file" : "other",
-        size,
-      });
+      return out;
+    } finally {
+      await dir.close();
     }
-    return out;
   }
 
   get outputCap(): number {

@@ -86,3 +86,62 @@ test("removing a workspace deletes it, and never what a symlink inside points at
   await workspace.remove("");
   assert.equal(fs.existsSync(other), true);
 });
+
+/**
+ * Swap `dir/<name>` for a symlink to `outside` right after the path check,
+ * as a process still running in the workspace could. Once: later calls
+ * see the symlink at check time.
+ */
+function swapAfterCheck(workspace: WorkspaceManager, dir: string, name: string, outside: string): void {
+  const internals = workspace as unknown as { resolveReal: (...args: unknown[]) => Promise<unknown> };
+  const check = internals.resolveReal.bind(workspace);
+  let swapped = false;
+  internals.resolveReal = async (...args: unknown[]) => {
+    const checked = await check(...args);
+    if (swapped) return checked;
+    swapped = true;
+    fs.renameSync(path.join(dir, name), path.join(dir, `${name}.old`));
+    fs.symlinkSync(outside, path.join(dir, name));
+    return checked;
+  };
+}
+
+test("a directory swapped for a symlink after the check is not read through", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "src/secret.txt", "workspace copy");
+  swapAfterCheck(workspace, dir, "src", outside);
+  await assert.rejects(workspace.read("s1", "src/secret.txt"), /escapes session workspace|changed while it was opened/);
+});
+
+test("a directory swapped for a symlink after the check is not written through", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "src/secret.txt", "workspace copy");
+  swapAfterCheck(workspace, dir, "src", outside);
+  await assert.rejects(workspace.write("s1", "src/secret.txt", "overwritten"), /escapes session workspace|changed while it was opened/);
+  assert.equal(fs.readFileSync(path.join(outside, "secret.txt"), "utf8"), "host secret");
+  assert.equal(fs.existsSync(path.join(outside, "secret.txt")), true);
+});
+
+test("a new file is not created through a directory swapped after the check", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "src/a.txt", "x");
+  swapAfterCheck(workspace, dir, "src", outside);
+  await assert.rejects(workspace.write("s1", "src/planted.txt", "x"), /escapes session workspace|changed while it was opened/);
+  assert.equal(fs.existsSync(path.join(outside, "planted.txt")), false);
+});
+
+test("a directory swapped for a symlink after the check is not listed", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "src/a.txt", "x");
+  swapAfterCheck(workspace, dir, "src", outside);
+  await assert.rejects(workspace.list("s1", "src"), /escapes session workspace|changed while it was opened/);
+});
+
+test("a file swapped for a symlink after the check is not followed", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "notes.txt", "mine");
+  swapAfterCheck(workspace, dir, "notes.txt", path.join(outside, "secret.txt"));
+  await assert.rejects(workspace.read("s1", "notes.txt"), /escapes session workspace|changed while it was opened/);
+  await assert.rejects(workspace.write("s1", "notes.txt", "overwritten"), /escapes session workspace|changed while it was opened/);
+  assert.equal(fs.readFileSync(path.join(outside, "secret.txt"), "utf8"), "host secret");
+});
