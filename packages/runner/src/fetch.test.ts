@@ -24,6 +24,13 @@ async function sites(t: TestContext) {
     } else if (req.url === "/secret") {
       hits.secret += 1;
       res.end("SECRET");
+    } else if (req.url === "/echo") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(req.headers));
+    } else if (req.url === "/to-echo") {
+      res.writeHead(302, { location: "/echo" }).end();
+    } else if (req.url === "/to-other-origin") {
+      res.writeHead(307, { location: `http://other.test:${port}/echo` }).end();
     } else if (req.url === "/big") {
       res.end("x".repeat(100_000));
     } else {
@@ -62,4 +69,47 @@ test("a large body is cut at the cap while reading", async (t) => {
   const site = await sites(t);
   const result = await runFetch(`${site.public}/big`, undefined, undefined, undefined, { allowHosts: site.allowHosts, maxBytes: 1_000 });
   assert.equal(result.body.length, 1_000);
+});
+
+test("the connection goes to the addresses that were checked, not a second DNS answer", async (t) => {
+  const site = await sites(t);
+  const port = new URL(site.public).port;
+  // DNS rebinding: public when checked, loopback when connecting.
+  let answers = 0;
+  const resolve = async (): Promise<string[]> => (answers++ === 0 ? ["93.184.215.14"] : ["127.0.0.1"]);
+  await assert.rejects(
+    runFetch(`http://rebind.test:${port}/secret`, undefined, undefined, undefined, { allowHosts: [], resolve }),
+    /fetch blocked: rebind\.test is a private or internal address/,
+  );
+  assert.ok(answers >= 2, "the connection resolved the name through the check");
+  assert.equal(site.hits.secret, 0);
+});
+
+test("a name is connected to by its checked address, with its own Host header", async (t) => {
+  const site = await sites(t);
+  const port = new URL(site.public).port;
+  const resolve = async (): Promise<string[]> => ["127.0.0.1"];
+  const result = await runFetch(`http://named.test:${port}/echo`, undefined, undefined, undefined, {
+    allowHosts: ["named.test"],
+    resolve,
+  });
+  assert.equal(JSON.parse(result.body).host, `named.test:${port}`);
+});
+
+test("credentials are not forwarded to another origin a redirect points at", async (t) => {
+  const site = await sites(t);
+  const resolve = async (): Promise<string[]> => ["127.0.0.1"];
+  const options = { allowHosts: ["127.0.0.1", "other.test"], resolve };
+  const headers = { Authorization: "Bearer secret", cookie: "s=1", "Proxy-Authorization": "Basic x", "x-keep": "yes" };
+
+  const same = JSON.parse((await runFetch(`${site.public}/to-echo`, undefined, headers, undefined, options)).body);
+  assert.equal(same.authorization, "Bearer secret", "a same-origin redirect keeps them");
+  assert.equal(same.cookie, "s=1");
+
+  const other = JSON.parse((await runFetch(`${site.public}/to-other-origin`, undefined, headers, undefined, options)).body);
+  assert.equal(other.host, `other.test:${new URL(site.public).port}`);
+  assert.equal(other.authorization, undefined);
+  assert.equal(other.cookie, undefined);
+  assert.equal(other["proxy-authorization"], undefined);
+  assert.equal(other["x-keep"], "yes");
 });

@@ -11,8 +11,11 @@ import { BlockList, isIP } from "node:net";
  * every address a host name resolves to has to be public. A redirect is a new
  * URL: callers check each hop.
  *
- * DNS can still answer differently when the request itself connects (DNS
- * rebinding); the check narrows that to a deliberate, well-timed attack.
+ * DNS can answer differently when the request itself connects (DNS
+ * rebinding), so a check made before the request is not enough on its own:
+ * the connection has to use the addresses that were checked. The runner does
+ * that by resolving through `resolvePublicAddresses` in the connection's own
+ * lookup.
  */
 
 const privateRanges = new BlockList();
@@ -111,9 +114,23 @@ export async function assertPublicUrl(url: string | URL, options: UrlCheckOption
  * steering the connection somewhere else.
  */
 export async function resolvePublicHost(hostname: string, options: UrlCheckOptions = {}): Promise<string> {
+  return (await resolvePublicAddresses(hostname, options))[0];
+}
+
+/**
+ * Every address a host name resolves to, once all of them are public (or the
+ * name is allowed), else a `BlockedUrlError`. Made to back a connection's own
+ * DNS lookup, so the addresses checked are the ones connected to.
+ */
+export async function resolvePublicAddresses(hostname: string, options: UrlCheckOptions = {}): Promise<string[]> {
   const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
   const resolve = options.resolve ?? resolveAll;
-  if (isAllowed(host, options.allowHosts)) return isIP(host) ? host : (await resolve(host))[0] ?? host;
+  if (isAllowed(host, options.allowHosts)) {
+    if (isIP(host)) return [host];
+    const addresses = await resolve(host);
+    if (addresses.length === 0) throw new BlockedUrlError(`${host} does not resolve`);
+    return addresses;
+  }
   const addresses =
     host === "localhost" || host.endsWith(".localhost") ? ["127.0.0.1"] : isIP(host) ? [host] : await resolve(host);
   if (addresses.length === 0) throw new BlockedUrlError(`${host} does not resolve`);
@@ -122,7 +139,7 @@ export async function resolvePublicHost(hostname: string, options: UrlCheckOptio
     const via = internal === host ? "" : ` (it resolves to ${internal})`;
     throw new BlockedUrlError(`${host} is a private or internal address${via}`);
   }
-  return addresses[0];
+  return addresses;
 }
 
 /**
