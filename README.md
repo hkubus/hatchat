@@ -31,7 +31,7 @@ web (React) ──SSE──▶ server ──WS /link──▶ runner ──▶ s
 | `@hat/runner` | Dial-out execution host: workspaces, process execution, fs, fetch |
 | `apps/web` | Streaming UI: grouped model picker, tool cards, approvals, branch navigation |
 | `apps/desktop` | Tauri v2 shell around `apps/web` for the same UI in a native window |
-| `apps/mobile` | React Native (Expo) iOS client: the same server, screens rewritten for touch |
+| `apps/ios` | Native SwiftUI iOS client: the same server, with its non-UI core (`HatKit`) tested on Linux |
 
 ## Providers (M1)
 
@@ -525,57 +525,46 @@ Tauri↔web bridge, and what's deliberately out of scope.
 
 ## iOS app (M7)
 
-`apps/mobile` is a React Native (Expo) client for the same server — not a
-WebView of the web app, so the screens are written for touch and the streaming
-is native. Like the desktop shell it is a thin client: it stores the address of
-a hat server and the token used to reach it, and nothing else.
+`apps/ios` is a native SwiftUI client for the same server — not a WebView of
+the web app. Like the desktop shell it is a thin client: it stores the address
+of a hat server and the token used to reach it, and nothing else. It has no
+third-party dependencies.
 
 ```sh
-pnpm dev:mobile          # Metro
-cd apps/mobile && eas build --profile device --platform ios
+pnpm ios:test                                  # HatKit against a live server + runner
+cd apps/ios && xcodegen generate && open Hat.xcodeproj
 ```
 
-Three things about it are worth knowing before changing it, all of which are
-subtle and cost real time to rediscover:
+It is split in two. `apps/ios/HatKit` is a Swift package with everything that
+is not a view: wire models, the SSE parser, the transcript view-model, the
+HTTP client and the chat store. It imports no UIKit or SwiftUI, so it builds
+and tests on Linux, and CI drives it against a real server and runner.
+`apps/ios/Hat` is the SwiftUI app. Things worth knowing before changing it:
 
-- **Streaming goes through `expo/fetch`, not `fetch`.** React Native's built-in
-  `fetch` buffers the response body, so a turn would not render until the model
-  had finished. `EventSource` is not an option: the turn endpoint is a POST.
+- **The parser and view-model exist twice.** `SSE.swift` and `ChatView.swift`
+  are ports of `@hat/core`'s `sse.ts` and `chat-view.ts`, and their tests hold
+  the same cases. Change one, change both.
+- **Streaming reads a POST body through a `URLSessionDataDelegate`.**
+  `EventSource` is GET-only, and `URLSession.bytes(for:)` does not exist on
+  Linux Foundation.
 - **Auth is the bearer token, not a login.** `HAT_AUTH_TOKEN` is CSRF-exempt
   server-side, so the app never touches `/api/auth/*` and needs no cookie jar.
-  The token lives in the iOS keychain. React Native does not enforce CORS, so
-  `HAT_CORS_ORIGINS` is not involved.
+  The token lives in the iOS keychain.
 - **A turn outlives its connection**, so the Stop button and "leave" are
   different requests. Stop posts `POST /api/sessions/:id/turn/cancel` and then
   drops the socket — closing the socket alone would stop the updates while the
   model kept generating with nobody watching. Leaving only detaches, and the app
   reattaches to a live turn (`GET /api/sessions/:id/stream`) on launch, on
-  opening a conversation, and when it returns to the foreground. This is what
-  makes it work on iOS, where the system suspends backgrounded apps freely.
-- **The SSE frame parser moved to `@hat/core`.** It is wire-format code that the
-  web, desktop, and mobile clients all have to agree on, so it now sits next to
-  the `KernelEvent` union it decodes rather than being copied per client.
+  opening a conversation, and when it returns to the foreground.
 
-`@hat/core` ships raw TypeScript, so `apps/mobile/metro.config.js` has to
-transpile it out of `node_modules` and rewrite the `.js` extensions its ESM-style
-relative imports carry. If the app stops bundling, that file is the first thing
-to check.
+The chrome is the system's own (navigation split view, toolbars, menus,
+sheets, search), so it is Liquid Glass on iOS 26 without code; the floating
+composer uses `glassEffect` there and a material blur below.
 
-The chrome is native: a `react-native-screens` stack (large titles, system
-search, `UIBarButtonItem`s with SF Symbols and pull-down menus). The floating
-composer uses Liquid Glass through `expo-glass-effect` on iOS 26 and falls back
-to `expo-blur` elsewhere. See [docs/ios-app.md](docs/ios-app.md).
-
-EAS device builds need a paid Apple Developer account. For a free Apple ID,
+For a free Apple ID,
 [`.github/workflows/ios-ipa.yml`](.github/workflows/ios-ipa.yml) builds an
 unsigned IPA on a GitHub macOS runner for SideStore to sign on-device (7-day
 expiry, 3 apps at a time).
-
-The tool-loop view keeps **one assistant message per model iteration**, because
-that is what the server emits: a turn that calls tools produces several
-`message.start` events and each holds the tool cards for the calls made in it.
-Approvals are resolved with the session id, which is what lets the server reject
-a decision aimed at another conversation.
 
 See [docs/ios-app.md](docs/ios-app.md) for the architecture, the state machine,
 and what is deliberately out of scope.
@@ -663,9 +652,9 @@ This is a single-user app. Before exposing it:
 - **M7 (started)** Tauri desktop: the shell, connection config, CORS and SSE
   keepalives are in place and a full turn (stream → approval → runner → result)
   works in the app. Still open: packaging/signing, OS keychain for the token.
-  A React Native (Expo) iOS app now shares the same server and the SSE parser,
-  with EAS Build configured and an unsigned-IPA workflow for free Apple IDs.
-  Still open there: native tab bars for system Liquid Glass, and a device.
+  A native SwiftUI iOS app (which replaced the first React Native one) shares
+  the same server, with its core tested against a live server in CI and an
+  unsigned-IPA workflow for free Apple IDs. Still open there: a device pass.
 - **M8 (done)** Long-conversation robustness and everyday chat features:
   context-window fitting, provider retries with backoff, Continue for cut-off
   replies, per-conversation instructions and sampling settings, document (text,

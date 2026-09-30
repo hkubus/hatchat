@@ -13,10 +13,7 @@
     "dev:runner": "tsx watch packages/runner/src/index.ts",
     "dev:web": "pnpm --filter @hat/web dev",
     "dev:desktop": "pnpm --filter @hat/desktop dev",
-    "dev:mobile": "pnpm --filter @hat/mobile start",
-    "mobile:ios": "pnpm --filter @hat/mobile ios",
-    "mobile:prebuild": "pnpm --filter @hat/mobile prebuild",
-    "mobile:build:ios": "pnpm --filter @hat/mobile build:ios",
+    "ios:test": "apps/ios/scripts/test-hatkit.sh",
     "start:server": "tsx packages/server/src/index.ts",
     "start:runner": "tsx packages/runner/src/index.ts",
     "typecheck": "turbo run typecheck",
@@ -36,10 +33,5 @@
   "dependencies": {
     "@hat/plugin-sdk": "workspace:*",
     "zod": "^3.24.1"
-  },
-  "pnpm": {
-    "overrides": {
-      "react-native-markdown-display>markdown-it": "^14.1.0"
-    }
   }
 }

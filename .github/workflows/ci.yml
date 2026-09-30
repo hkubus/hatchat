@@ -45,3 +45,31 @@ jobs:
 
       - name: Smoke test (server + runner end to end)
         run: pnpm smoke
+
+  # The iOS app's non-UI core (apps/ios/HatKit): models, SSE parser, view-model,
+  # HTTP client and chat store. It has no UIKit or SwiftUI dependency, so it
+  # builds on Linux, and its ServerTests drive it against a real server and
+  # runner. The SwiftUI app itself is compiled by the ios-ipa workflow.
+  ios-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The hosted Ubuntu image ships a Swift toolchain.
+      - name: Swift version
+        run: swift --version
+
+      - name: HatKit tests against a live server
+        run: apps/ios/scripts/test-hatkit.sh

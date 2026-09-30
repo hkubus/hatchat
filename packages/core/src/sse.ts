@@ -3,9 +3,10 @@
  * emit. The whole thing is pure string-in/array-out so it can be tested
  * without a DOM, a fetch, or a running server — see `sse.test.ts`.
  *
- * It lives here rather than in any one client because the web, desktop, and
- * mobile shells all decode the same stream, and they have to agree on the
- * awkward parts:
+ * It lives here rather than in any one client because the web and desktop
+ * shells decode the same stream. The iOS app has a Swift twin
+ * (`apps/ios/HatKit/Sources/HatKit/SSE.swift`, with the same test cases), and
+ * all of them have to agree on the awkward parts:
  *   - a frame split across two network chunks (or several frames in one chunk)
  *   - multi-byte UTF-8 split mid-character between chunks
  *   - `: keepalive` comment frames, which carry no data. The server emits one
@@ -17,13 +18,17 @@
 /** One decoded SSE frame: the joined `data:` lines, or null for a comment. */
 export type SseData = string | null;
 
-/** Byte offset just past the frame terminator, or -1 when no frame is complete. */
+/**
+ * Offset just past the first frame terminator (`\n\n`, `\r\n\r\n` or `\r\r`),
+ * or -1 when no frame is complete.
+ */
 function frameEnd(buffer: string): number {
-  const lf = buffer.indexOf("\n\n");
-  const crlf = buffer.indexOf("\r\n\r\n");
-  if (lf === -1) return crlf === -1 ? -1 : crlf + 4;
-  if (crlf === -1) return lf + 2;
-  return Math.min(lf + 2, crlf + 4);
+  let end = -1;
+  for (const terminator of ["\n\n", "\r\n\r\n", "\r\r"]) {
+    const at = buffer.indexOf(terminator);
+    if (at !== -1 && (end === -1 || at + terminator.length < end)) end = at + terminator.length;
+  }
+  return end;
 }
 
 /**
