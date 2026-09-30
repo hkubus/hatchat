@@ -37,26 +37,35 @@ for (const [network, prefix] of [
 for (const [network, prefix] of [
   ["::", 128],
   ["::1", 128],
+  ["100::", 64], // discard-only
+  ["64:ff9b:1::", 48], // local-use NAT64: translates to whatever the local network routes
+  ["2001::", 32], // Teredo: the IPv4 address inside is obfuscated, and nobody needs it
+  ["2001:db8::", 32], // documentation
   ["fc00::", 7], // unique local
   ["fe80::", 10], // link-local
+  ["fec0::", 10], // site-local (deprecated, still routed by some stacks)
   ["ff00::", 8], // multicast
-  ["2001:db8::", 32], // documentation
 ] as const) {
   privateRanges.addSubnet(network, prefix, "ipv6");
 }
 
 /**
  * Whether an IP address is anything but public: private, loopback,
- * link-local, carrier-grade NAT, multicast or reserved. IPv4-mapped IPv6
- * (`::ffff:127.0.0.1`) is judged by its IPv4 address, as is NAT64
- * (`64:ff9b::/96`). Anything that is not an IP address counts as private.
+ * link-local, site-local, carrier-grade NAT, multicast or reserved. An IPv6
+ * address that carries an IPv4 one is judged by that too: IPv4-compatible
+ * (`::127.0.0.1`), IPv4-mapped (`::ffff:127.0.0.1`), IPv4-translated
+ * (`::ffff:0:127.0.0.1`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`).
+ * Anything that is not an IP address counts as private.
  */
 export function isPrivateAddress(address: string): boolean {
   const family = isIP(address);
   if (family === 4) return privateRanges.check(address, "ipv4");
   if (family !== 6) return true;
-  const nat64 = nat64Target(address);
-  return nat64 ? privateRanges.check(nat64, "ipv4") : privateRanges.check(address, "ipv6");
+  const groups = ipv6Groups(address.replace(/%.*$/, ""));
+  if (!groups) return true;
+  const embedded = embeddedIPv4(groups);
+  if (embedded !== undefined && privateRanges.check(embedded, "ipv4")) return true;
+  return privateRanges.check(groups.map((group) => group.toString(16)).join(":"), "ipv6");
 }
 
 export class BlockedUrlError extends Error {
@@ -136,11 +145,20 @@ async function resolveAll(hostname: string): Promise<string[]> {
   return records.map((record) => record.address);
 }
 
-/** The IPv4 address inside a NAT64 (`64:ff9b::/96`) address, if it is one. */
-function nat64Target(address: string): string | undefined {
-  const groups = ipv6Groups(address);
-  if (!groups || groups[0] !== 0x64 || groups[1] !== 0xff9b || groups.slice(2, 6).some(Boolean)) return undefined;
-  return [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join(".");
+/**
+ * The IPv4 address an IPv6 address carries, where the network would deliver
+ * it to that IPv4 host: IPv4-compatible and IPv4-mapped (`::/96`,
+ * `::ffff:0:0/96`), IPv4-translated (`::ffff:0:0:0/96`), NAT64
+ * (`64:ff9b::/96`) and 6to4 (`2002:AABB:CCDD::/48`).
+ */
+function embeddedIPv4(groups: readonly number[]): string | undefined {
+  const dotted = (high: number, low: number): string => [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+  const zero = (from: number, to: number): boolean => groups.slice(from, to).every((group) => group === 0);
+  if (zero(0, 5) && (groups[5] === 0 || groups[5] === 0xffff)) return dotted(groups[6], groups[7]);
+  if (zero(0, 4) && groups[4] === 0xffff && groups[5] === 0) return dotted(groups[6], groups[7]);
+  if (groups[0] === 0x64 && groups[1] === 0xff9b && zero(2, 6)) return dotted(groups[6], groups[7]);
+  if (groups[0] === 0x2002) return dotted(groups[1], groups[2]);
+  return undefined;
 }
 
 /** The eight 16-bit groups of an IPv6 address. */

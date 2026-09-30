@@ -33,6 +33,32 @@ test("private, loopback, link-local and reserved addresses are recognised", () =
   }
 });
 
+test("IPv6 forms that carry a private IPv4 address, and deprecated local ranges, are private", () => {
+  for (const address of [
+    "::127.0.0.1", // IPv4-compatible
+    "::7f00:1",
+    "::10.0.0.1",
+    "::ffff:0:127.0.0.1", // IPv4-translated
+    "::ffff:0:a9fe:a9fe",
+    "0:0:0:0:0:ffff:7f00:1",
+    "64:ff9b:1::8.8.8.8", // local-use NAT64
+    "64:ff9b:1:abcd::1",
+    "2002:7f00:1::", // 6to4 around 127.0.0.1
+    "2002:a9fe:a9fe::1", // 6to4 around 169.254.169.254
+    "2002:c0a8:101:1::1", // 6to4 around 192.168.1.1
+    "fec0::1", // site-local
+    "feff::1",
+    "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+    "100::1", // discard-only
+    "fe80::1%eth0",
+  ]) {
+    assert.equal(isPrivateAddress(address), true, address);
+  }
+  for (const address of ["2002:808:808::1", "::ffff:0:8.8.8.8", "::ffff:8.8.8.8", "2001:4860:4860::8888", "2a00:1450::1"]) {
+    assert.equal(isPrivateAddress(address), false, address);
+  }
+});
+
 test("a URL passes only when every address of its host is public", async () => {
   const dns: Record<string, string[]> = {
     "example.com": ["93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"],
