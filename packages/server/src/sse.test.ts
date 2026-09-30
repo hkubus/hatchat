@@ -27,26 +27,27 @@ test("passes events through in order and stops when the queue ends", async () =>
 
 test("emits keepalive ticks while idle without losing later events", async () => {
   const queue = new AsyncQueue<KernelEvent>();
-  const stream = kernelStream(queue, 10);
   const collected: unknown[] = [];
-  const done = drain(stream).then((items) => collected.push(...items));
+  let keepalives = 0;
 
   queue.push({ type: "turn.start", turnId: "t1" });
-  await new Promise((resolve) => setTimeout(resolve, 35));
-  // Pushed after several idle ticks: it must still arrive, exactly once.
-  queue.push({ type: "message.done", messageId: "m1", finishReason: "stop" });
-  queue.end();
-  await done;
+  // Waits for the ticks rather than sleeping a fixed time, which a loaded
+  // machine can overrun or undershoot.
+  for await (const item of kernelStream(queue, 10)) {
+    collected.push(item);
+    if (item === KEEPALIVE && ++keepalives === 2) {
+      // Pushed after several idle ticks: it must still arrive, exactly once.
+      queue.push({ type: "message.done", messageId: "m1", finishReason: "stop" });
+      queue.end();
+    }
+  }
 
   const events = collected.filter((item) => item !== KEEPALIVE);
   assert.deepEqual(events, [
     { type: "turn.start", turnId: "t1" },
     { type: "message.done", messageId: "m1", finishReason: "stop" },
   ]);
-  assert.ok(
-    collected.filter((item) => item === KEEPALIVE).length >= 2,
-    "expected repeated keepalives while the turn was idle",
-  );
+  assert.ok(keepalives >= 2, "expected repeated keepalives while the turn was idle");
 });
 
 test("does not keep the queue open once the turn ends", async () => {
