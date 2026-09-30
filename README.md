@@ -193,6 +193,11 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 - `notifications/tools/list_changed` is wired; server→client requests we don't
   implement (sampling, elicitation) are declined with a JSON-RPC error, which
   servers handle gracefully.
+- Nothing waits on a server forever: requests time out (a minute; ten for a tool
+  call, since some do real work), Stop cancels a running call and sends the
+  server `notifications/cancelled`, and an HTTP error or a response that never
+  answers fails the request. `tools/list` follows `nextCursor`, and tool names
+  that sanitize alike (`get-item`, `get_item`) get a short hash to stay distinct.
 
 `scripts/fake-mcp-server.mjs` is a minimal stdio server used by the smoke test.
 
