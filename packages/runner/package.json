@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@hat/core": "workspace:*",
+    "@hat/net-guard": "workspace:*",
     "@hat/runner-protocol": "workspace:*",
     "ws": "^8.18.0"
   }

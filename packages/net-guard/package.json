@@ -1,5 +1,5 @@
 {
-  "name": "@hat/tool-browser",
+  "name": "@hat/net-guard",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,11 +9,5 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test \"src/**/*.test.ts\""
-  },
-  "dependencies": {
-    "@hat/core": "workspace:*",
-    "@hat/net-guard": "workspace:*",
-    "playwright-core": "1.48.0",
-    "zod": "^3.24.1"
   }
 }

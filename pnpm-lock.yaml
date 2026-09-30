@@ -231,6 +231,8 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
 
+  packages/net-guard: {}
+
   packages/plugin-sdk:
     dependencies:
       '@hat/core':
@@ -275,6 +277,9 @@ importers:
       '@hat/core':
         specifier: workspace:*
         version: link:../core
+      '@hat/net-guard':
+        specifier: workspace:*
+        version: link:../net-guard
       '@hat/runner-protocol':
         specifier: workspace:*
         version: link:../runner-protocol
@@ -377,6 +382,9 @@ importers:
       '@hat/core':
         specifier: workspace:*
         version: link:../core
+      '@hat/net-guard':
+        specifier: workspace:*
+        version: link:../net-guard
       playwright-core:
         specifier: 1.48.0
         version: 1.48.0

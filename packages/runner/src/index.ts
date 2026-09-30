@@ -9,6 +9,7 @@ import WebSocket from "ws";
 import { detectCapabilities } from "./capabilities.js";
 import { loadConfig, type RunnerConfig } from "./config.js";
 import { startJob, type JobHandle } from "./exec.js";
+import { runFetch } from "./fetch.js";
 import { startProcess, type ProcessHandle } from "./processes.js";
 import { resolveSandbox, type SandboxConfig } from "./sandbox.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -275,63 +276,6 @@ class Runner {
     for (const [, pending] of this.pending) pending.reject(new Error(reason));
     this.pending.clear();
     this.jobs.clear();
-  }
-}
-
-async function runFetch(
-  url: string,
-  method: string | undefined,
-  headers: Record<string, string> | undefined,
-  body: string | undefined,
-): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`fetch blocked: invalid URL`);
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`fetch blocked: only http(s) allowed`);
-  }
-  const host = parsed.hostname.toLowerCase();
-  // Basic SSRF guard: block metadata + loopback + private literals.
-  // (DNS-rebinding needs a resolving guard; this stops the cheap escapes.)
-  if (
-    host === "localhost" ||
-    host === "metadata.google.internal" ||
-    host.endsWith(".internal") ||
-    host === "169.254.169.254" ||
-    host === "213.0.0.0" ||
-    host.startsWith("10.") ||
-    host.startsWith("192.168.") ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    host === "[::1]" ||
-    host === "::1" ||
-    host.startsWith("fc") ||
-    host.startsWith("fd")
-  ) {
-    throw new Error(`fetch blocked: private/metadata host (${host})`);
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await fetch(url, {
-      method: method ?? "GET",
-      headers,
-      body,
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    const text = await response.text();
-    // 2MB cap to avoid blowing the link / memory on huge pages.
-    const capped = text.length > 2_000_000 ? text.slice(0, 2_000_000) : text;
-    const responseHeaders: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      responseHeaders[key] = value;
-    });
-    return { status: response.status, headers: responseHeaders, body: capped };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

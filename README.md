@@ -323,6 +323,17 @@ and `requireApproval` (override; default asks only for click/type/press). A
 Chromium build is required: the plugin uses the Playwright browser cache by
 default, or point `executablePath` at any Chromium/Chrome binary.
 
+**Private networks.** The browser runs in the server's network and `web_fetch`
+in the runner's, and both go where a model points them, so neither may reach a
+private address: loopback, the private ranges, link-local (cloud metadata),
+carrier-grade NAT (Tailscale), IPv6 unique-local. Host names are resolved and
+every address checked, and so is each redirect hop. The browser goes through a
+small filtering proxy that connects only to the address it checked, so a page's
+redirects, links, subresources and WebSockets are covered too. To let them
+reach your own services, list the host names in `HAT_ALLOW_PRIVATE_HOSTS`
+(comma-separated, `*.lan` for a whole domain) on the server (browser) and the
+runner (`web_fetch`).
+
 ## Vision + attachments (M4)
 
 Attach images by button, paste, or drag-and-drop. Uploads are content-addressed

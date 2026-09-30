@@ -1,5 +1,7 @@
+import { allowedPrivateHosts, assertPublicUrl, resolvePublicHost } from "@hat/net-guard";
 import type { Browser, BrowserContext, Page } from "playwright-core";
 import { chromium } from "playwright-core";
+import { startEgressProxy, type EgressProxy } from "./egress.js";
 
 export interface PageSnapshot {
   title: string;
@@ -31,6 +33,11 @@ export interface BrowserManagerOptions {
   navigationTimeoutMs: number;
   maxTextChars: number;
   maxLinks: number;
+  /**
+   * Host names the browser may reach although they are private (your own
+   * services). Defaults to `HAT_ALLOW_PRIVATE_HOSTS`; see `@hat/net-guard`.
+   */
+  allowPrivateHosts?: readonly string[];
 }
 
 interface LiveSession {
@@ -46,17 +53,30 @@ export class BrowserManager implements BrowserController {
   private browser?: Browser;
   private launching?: Promise<Browser>;
   private readonly sessions = new Map<string, LiveSession>();
+  /** Every connection the browser makes goes through this (see `startEgressProxy`). */
+  private proxy?: Promise<EgressProxy>;
 
   constructor(private readonly options: BrowserManagerOptions) {}
 
+  private allowHosts(): readonly string[] {
+    return this.options.allowPrivateHosts ?? allowedPrivateHosts();
+  }
+
   private async browserInstance(): Promise<Browser> {
     if (this.browser?.isConnected()) return this.browser;
-    this.launching ??= chromium
-      .launch({
-        executablePath: this.options.executablePath || undefined,
-        headless: this.options.headless,
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      })
+    this.proxy ??= startEgressProxy((host) => resolvePublicHost(host, { allowHosts: this.allowHosts() }));
+    const proxy = this.proxy;
+    this.launching ??= proxy
+      .then(({ url }) =>
+        chromium.launch({
+          executablePath: this.options.executablePath || undefined,
+          headless: this.options.headless,
+          args: ["--no-sandbox", "--disable-dev-shm-usage"],
+          // Playwright also sends loopback traffic through the proxy, which
+          // Chromium would otherwise let bypass it.
+          proxy: { server: url },
+        }),
+      )
       .then((browser) => {
         this.browser = browser;
         browser.on("disconnected", () => {
@@ -68,6 +88,8 @@ export class BrowserManager implements BrowserController {
       })
       .catch((error: unknown) => {
         this.launching = undefined;
+        // A proxy that never started is not worth keeping for the next try.
+        if (this.proxy === proxy) void proxy.catch(() => (this.proxy = undefined));
         throw error;
       });
     return this.launching;
@@ -134,6 +156,12 @@ export class BrowserManager implements BrowserController {
   }
 
   async open(sessionId: string, url: string): Promise<PageSnapshot> {
+    // The proxy would refuse it too; checked here for a clearer error.
+    try {
+      await assertPublicUrl(url, { allowHosts: this.allowHosts() });
+    } catch (error) {
+      throw new Error(`refusing to open ${url}: ${(error as Error).message}`);
+    }
     const { page } = await this.session(sessionId);
     await page.goto(url, {
       waitUntil: "domcontentloaded",
@@ -197,8 +225,11 @@ export class BrowserManager implements BrowserController {
       await this.close(sessionId);
     }
     const browser = this.browser;
+    const proxy = this.proxy;
     this.browser = undefined;
     this.launching = undefined;
+    this.proxy = undefined;
     await browser?.close().catch(() => {});
+    await (await proxy?.catch(() => undefined))?.close();
   }
 }
