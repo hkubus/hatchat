@@ -30,6 +30,7 @@ import type { ApprovalMode, ApprovalDecision, RunnerSummary, SessionRecord, Sess
 import type { UiMessage } from "@hat/core";
 import {
   applyEffect,
+  applyStoredEffect,
   approvalForDecision,
   buildMessages,
   contextFill,
@@ -245,6 +246,11 @@ export function useChat(): ChatStore {
           break;
         default:
           setInFlight((current) => applyEffect(current, effect));
+          // After reattaching mid-turn, the call waiting for approval is on a
+          // stored message: its approval request and result land there.
+          if (effect.kind === "tool-approval" || effect.kind === "tool-result") {
+            setMessages((current) => applyStoredEffect(current, effect));
+          }
       }
     },
     [],
@@ -718,19 +724,20 @@ export function useChat(): ChatStore {
   const decide = useCallback(
     async (callId: string, decision: ApprovalDecision) => {
       // Record the tap immediately: the round trip is long enough that a button
-      // that sits there looking live makes the tool look hung.
-      const resolved = approvalForDecision(decision);
-      setInFlight((current) =>
-        current.map((m) => ({
-          ...m,
-          tools: m.tools.map((t) => (t.callId === callId ? { ...t, approval: resolved } : t)),
-        })),
-      );
+      // that sits there looking live makes the tool look hung. The card is in
+      // flight, or stored if the app reattached to the turn.
+      const mark = (status: "requested" | "approved" | "denied") => {
+        setInFlight((current) => applyEffect(current, { kind: "tool-approval", callId, status }));
+        setMessages((current) => applyStoredEffect(current, { kind: "tool-approval", callId, status }));
+      };
+      mark(approvalForDecision(decision));
       if (!sessionId) return;
       try {
         // The server binds an approval to the session that asked for it.
         await api.resolveApproval(callId, decision, sessionId);
       } catch (e) {
+        // Bring the buttons back: the approval is still pending.
+        mark("requested");
         setError(describe(e));
       }
     },

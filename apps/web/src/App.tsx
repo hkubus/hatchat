@@ -2,6 +2,7 @@ import type { KernelEvent, ModelInfo, ReasoningEffort, UiMessage } from "@hat/co
 import {
   REASONING_EFFORTS,
   applyEffect,
+  applyStoredEffect,
   approvalForDecision,
   buildMessages,
   contextFill,
@@ -432,6 +433,11 @@ export default function App() {
         // Append rather than replace on message.start: a tool-using turn emits
         // one per model iteration, and the previous ones stay on screen.
         patchInFlight((list) => applyEffect(list, effect));
+        // After attaching mid-turn, the call waiting for approval is on a
+        // stored message: its approval request and result land there.
+        if (effect.kind === "tool-approval" || effect.kind === "tool-result") {
+          setMessages((list) => applyStoredEffect(list, effect));
+        }
         break;
     }
     // A blocked turn is worth a notification straight away, not on the next poll.
@@ -828,15 +834,17 @@ export default function App() {
   }
 
   async function decide(callId: string, decision: "approve" | "deny"): Promise<void> {
-    const previous = inFlightRef.current;
-    patchInFlight((list) =>
-      applyEffect(list, { kind: "tool-approval", callId, status: approvalForDecision(decision) }),
-    );
+    // The card is in flight, or stored if this tab attached mid-turn.
+    const mark = (status: "requested" | "approved" | "denied"): void => {
+      patchInFlight((list) => applyEffect(list, { kind: "tool-approval", callId, status }));
+      setMessages((list) => applyStoredEffect(list, { kind: "tool-approval", callId, status }));
+    };
+    mark(approvalForDecision(decision));
     try {
       await api.resolveApproval(callId, decision, sessionId ?? undefined);
     } catch (e) {
-      // Roll back the optimistic patch so the approval stays actionable.
-      setInFlight(previous);
+      // Roll back the optimistic mark so the approval stays actionable.
+      mark("requested");
       setError(String(e));
     }
   }

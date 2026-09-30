@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { ChatPathNode as PathNode, UiMessage } from "./chat-view.js";
 import {
   applyEffect,
+  applyStoredEffect,
   buildMessages,
   contextFill,
   emptyAssistant,
@@ -464,4 +465,48 @@ test("formatBytes", () => {
   assert.equal(formatBytes(512), "512 B");
   assert.equal(formatBytes(1536), "1.5 KB");
   assert.equal(formatBytes(20 * 1024 * 1024), "20 MB");
+});
+
+// --- attaching to a turn already under way ----------------------------------
+
+test("a replayed approval request reaches the stored message that made the call", () => {
+  // Reloaded while a call waits for approval: the message that made it was
+  // stored before the call ran, so it comes back with the history, and the
+  // server replays only what came after it.
+  const call = message("assistant", [text("Deleting the build"), toolCall("call_1", "shell_exec", { command: "rm -rf build" })]);
+  let stored = buildMessages([message("user", [text("clean up")]), call]);
+  let inFlight: UiMessage[] = [];
+  const replay: KernelEvent[] = [
+    { type: "tool.call", messageId: call.message.id, callId: "call_1", name: "shell_exec", args: {} },
+    { type: "tool.approval", callId: "call_1", status: "requested" },
+  ];
+  const apply = (event: KernelEvent): void => {
+    const effect = readEvent(event);
+    inFlight = applyEffect(inFlight, effect);
+    stored = applyStoredEffect(stored, effect);
+  };
+  replay.forEach(apply);
+
+  assert.deepEqual(inFlight, []);
+  assert.equal(stored[1].tools.length, 1, "the replayed call does not add a second card");
+  assert.equal(stored[1].tools[0].approval, "requested", "the approval buttons come back");
+
+  apply({ type: "tool.approval", callId: "call_1", status: "approved" });
+  apply({ type: "tool.result", callId: "call_1", name: "shell_exec", parts: [text("removed")], isError: false });
+  assert.deepEqual(
+    { approval: stored[1].tools[0].approval, running: stored[1].tools[0].running, result: stored[1].tools[0].result },
+    { approval: "approved", running: false, result: "removed" },
+  );
+});
+
+test("stored messages ignore every effect but tool approvals and results", () => {
+  const stored = buildMessages([message("assistant", [toolCall("call_1", "shell_exec", {})])]);
+  for (const event of [
+    { type: "message.start", messageId: "x", role: "assistant" },
+    { type: "text.delta", messageId: "x", text: "hi" },
+    { type: "usage", usage: { inputTokens: 1 } },
+    { type: "tool.approval", callId: "someone_else", status: "requested" },
+  ] as KernelEvent[]) {
+    assert.equal(applyStoredEffect(stored, readEvent(event)), stored);
+  }
 });
