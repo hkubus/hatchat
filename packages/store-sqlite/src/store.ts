@@ -153,6 +153,9 @@ interface SessionRow {
 }
 
 /** Attachment columns minus the (possibly large) extracted text. */
+/** How long an upload is kept for a draft that may still send it. */
+export const ATTACHMENT_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
+
 const ATTACHMENT_COLUMNS =
   "id, sha256, mime, size, width, height, name, (text IS NOT NULL) AS has_text, created_at";
 
@@ -210,7 +213,8 @@ export class Store implements SecretStore {
       }
     }
     // Documents the user attaches keep their original name and extracted text.
-    for (const column of ["name TEXT", "text TEXT"]) {
+    // `last_put_at`: the last time these bytes were uploaded, a dedupe hit included.
+    for (const column of ["name TEXT", "text TEXT", "last_put_at INTEGER"]) {
       try {
         this.db.exec(`ALTER TABLE attachments ADD COLUMN ${column}`);
       } catch {
@@ -334,6 +338,52 @@ export class Store implements SecretStore {
       )
       .run(title, sessionId);
     return result.changes > 0;
+  }
+
+  /** The attachments this session's messages refer to: images, documents, artifacts. */
+  attachmentIdsOf(sessionId: string): string[] {
+    const rows = this.db
+      .prepare(`SELECT parts FROM messages WHERE session_id = ?`)
+      .all(sessionId) as Array<{ parts: string }>;
+    const ids = new Set<string>();
+    const collect = (part: Part): void => {
+      if (part.type === "image" && part.source.kind === "attachment") ids.add(part.source.id);
+      else if (part.type === "file") ids.add(part.id);
+      else if (part.type === "tool_result") part.content.forEach(collect);
+    };
+    for (const row of rows) {
+      for (const part of JSON.parse(row.parts) as Part[]) collect(part);
+    }
+    return [...ids];
+  }
+
+  /**
+   * Delete the attachments among `ids` that no message refers to any more,
+   * row (with its extracted text) and bytes. The same bytes uploaded twice are
+   * one attachment, so one another conversation still uses stays.
+   *
+   * An upload is not a message yet: another conversation may hold the same
+   * bytes in its composer, unsent. So an attachment uploaded (or re-uploaded,
+   * which dedupes to the same id) at or after `olderThan` — by default a day
+   * ago — stays too.
+   */
+  async pruneAttachments(
+    ids: readonly string[],
+    { olderThan = Date.now() - ATTACHMENT_UPLOAD_GRACE_MS }: { olderThan?: number } = {},
+  ): Promise<string[]> {
+    const removed: string[] = [];
+    for (const id of ids) {
+      const used = this.db.prepare(`SELECT 1 FROM messages WHERE instr(parts, ?) > 0 LIMIT 1`).get(id);
+      if (used) continue;
+      const row = this.db
+        .prepare(`SELECT sha256, COALESCE(last_put_at, created_at) AS put_at FROM attachments WHERE id = ?`)
+        .get(id) as { sha256: string; put_at: number } | undefined;
+      if (!row || row.put_at >= olderThan) continue;
+      this.db.prepare(`DELETE FROM attachments WHERE id = ?`).run(id);
+      await this.artifacts?.delete(row.sha256);
+      removed.push(id);
+    }
+    return removed;
   }
 
   deleteSession(sessionId: string): boolean {
@@ -824,6 +874,8 @@ export class Store implements SecretStore {
     const sha256 = createHash("sha256").update(data).digest("hex");
     const existing = this.getAttachmentByHash(sha256);
     if (existing) {
+      // Someone holds this id again, maybe in a draft no message shows yet.
+      this.db.prepare(`UPDATE attachments SET last_put_at = ? WHERE id = ?`).run(Date.now(), existing.id);
       // The same bytes uploaded before as something else (or before text
       // extraction existed) pick up the text now.
       if (document?.text !== undefined && !existing.hasText) {
@@ -836,6 +888,7 @@ export class Store implements SecretStore {
     }
 
     const id = newId("att");
+    const now = Date.now();
     const size = data.length;
     const dimensions = imageSize(data);
     if (this.artifacts) {
@@ -843,8 +896,8 @@ export class Store implements SecretStore {
     }
     this.db
       .prepare(
-        `INSERT INTO attachments (id, sha256, mime, size, width, height, name, text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO attachments (id, sha256, mime, size, width, height, name, text, created_at, last_put_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -855,7 +908,8 @@ export class Store implements SecretStore {
         dimensions?.height ?? null,
         document?.name ?? null,
         document?.text ?? null,
-        Date.now(),
+        now,
+        now,
       );
 
     return this.getAttachment(id)!;

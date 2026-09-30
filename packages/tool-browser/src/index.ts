@@ -208,6 +208,9 @@ export function createBrowserPlugin(): Plugin {
       await manager?.dispose();
       manager = undefined;
     },
+    async sessionDeleted(sessionId) {
+      await manager?.close(sessionId);
+    },
   };
 }
 

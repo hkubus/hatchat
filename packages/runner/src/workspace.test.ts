@@ -71,3 +71,18 @@ test("a FIFO is refused instead of blocking the read forever", async (t) => {
   await assert.rejects(workspace.read("s1", "pipe"), /Not a regular file/);
   await assert.rejects(workspace.write("s1", "pipe", "x"), /Not a regular file/);
 });
+
+test("removing a workspace deletes it, and never what a symlink inside points at", async (t) => {
+  const { outside, workspace, dir } = setup(t);
+  await workspace.write("s1", "notes/a.txt", "private");
+  fs.symlinkSync(outside, path.join(dir, "host"));
+
+  await workspace.remove("s1");
+  assert.equal(fs.existsSync(dir), false);
+  assert.equal(fs.readFileSync(path.join(outside, "secret.txt"), "utf8"), "host secret");
+
+  // An id with nothing left after sanitizing would name the root: refused.
+  const other = workspace.ensureSync("s2");
+  await workspace.remove("");
+  assert.equal(fs.existsSync(other), true);
+});

@@ -50,6 +50,17 @@ export class WorkspaceManager {
     return dir;
   }
 
+  /**
+   * Delete a session's workspace. `fs.rm` removes symlinks, never what they
+   * point at, so a link planted inside can't take anything else with it.
+   */
+  async remove(sessionId: string): Promise<void> {
+    const dir = this.sessionDir(sessionId);
+    // An id with nothing left after sanitizing would name the root of every workspace.
+    if (path.resolve(dir) === path.resolve(this.root)) return;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+
   /** Synchronous variant, so process registration can happen before stdin arrives. */
   ensureSync(sessionId: string): string {
     const dir = this.sessionDir(sessionId);

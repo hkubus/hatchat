@@ -191,6 +191,11 @@ export class RunnerConnection implements RunnerChannel {
     return this.rpc<WorkspaceInfo>((reqId) => ({ t: "workspace.ensure", reqId, sessionId }));
   }
 
+  /** The conversation was deleted: the runner stops its work and deletes its files. */
+  removeWorkspace(sessionId: string): void {
+    this.send({ t: "workspace.remove", sessionId });
+  }
+
   exec(sessionId: string, req: ExecRequest, signal: AbortSignal): AsyncIterable<ExecEvent> {
     const jobId = newId("job");
     const queue = new AsyncQueue<ExecEvent>();

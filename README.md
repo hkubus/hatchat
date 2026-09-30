@@ -497,6 +497,15 @@ tree with settings and attachments inline, and `POST /api/sessions/import`
 recreates it as a new conversation (fresh ids, attachments re-stored). Both are
 in the chat header's download menu; import is in the sidebar.
 
+**Deleting** a conversation takes what it left behind with it: a reply still
+running is stopped, plugins let go of what they kept for it (background
+processes, the Python interpreter, a browser page), each connected runner stops
+its jobs and deletes its workspace, and attachments no other conversation uses
+are deleted, bytes included. Uploads are shared by content, so one uploaded
+(by any conversation) in the last day is kept: another composer may be about
+to send the same file. A runner that is offline at the time keeps its copy of
+the workspace.
+
 **Notifications.** The web app can notify you (Settings → Preferences, opt-in)
 when a reply is ready or a conversation needs you while the tab is in the
 background. Reaching a closed tab or a suspended phone would need server push,

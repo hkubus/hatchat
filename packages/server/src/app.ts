@@ -875,9 +875,32 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ session: store.getSession(session.id) });
   });
 
-  app.delete("/api/sessions/:id", (c) => {
-    const removed = store.deleteSession(c.req.param("id"));
-    return c.json({ ok: removed });
+  /**
+   * Delete a conversation and what it left behind: the reply still running,
+   * what plugins kept for it (processes, an interpreter, a browser page), its
+   * files and processes on the runners, and attachments nothing else uses.
+   */
+  app.delete("/api/sessions/:id", async (c) => {
+    const id = c.req.param("id");
+    // Stop the reply and let it wind down first: a turn still finishing could
+    // otherwise run a tool that recreates the workspace, or keep a plugin's
+    // per-conversation state alive, after everything below is cleaned up.
+    const running = turns.get(id);
+    if (running && !running.done) {
+      running.abort.abort();
+      if (!(await running.settled(STOPPED_TURN_GRACE_MS))) {
+        logger.warn(`deleting conversation ${id} while its stopped reply is still winding down`);
+      }
+    }
+    const attachments = store.attachmentIdsOf(id);
+    if (!store.deleteSession(id)) return c.json({ ok: false });
+    await pluginHost.sessionDeleted(id);
+    for (const runner of registry.list()) runner.removeWorkspace(id);
+    sessionRunners.delete(id);
+    await store.pruneAttachments(attachments).catch((error: unknown) => {
+      logger.warn("could not delete the attachments of a deleted conversation", normalizeError(error, "prune"));
+    });
+    return c.json({ ok: true });
   });
 
   /** Start a new conversation from this one's path up to `messageId`. */
