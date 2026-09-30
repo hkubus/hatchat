@@ -8,7 +8,10 @@
 # Once there is a paid team, archive and export from Xcode (or add signing
 # here) instead — see docs/ios-app.md.
 #
-# Result is uploaded as the `hat-unsigned-ipa` artifact.
+# Result is uploaded as the `hat-unsigned-ipa` artifact. On main (a push that
+# touches the app, or a manual run) it is also published as a GitHub release
+# tagged `ios-<version>-b<build>`, and the SideStore source listing those
+# releases is deployed to GitHub Pages as `source.json` — see docs/ios-app.md.
 
 name: ios-ipa
 
@@ -19,16 +22,23 @@ on:
       - "apps/ios/**"
       - ".github/workflows/ios-ipa.yml"
   push:
+    branches:
+      - main
+    paths:
+      - "apps/ios/**"
+      - ".github/workflows/ios-ipa.yml"
     tags:
       - "mobile-v*"
 
-# Read-only token: the job only checks out code and uploads an artifact.
+# Read-only by default; only the release job gets write access.
 permissions:
   contents: read
 
 concurrency:
   group: ios-ipa-${{ github.ref }}
-  cancel-in-progress: true
+  # A release cut short would leave the source behind the releases; only
+  # superseded pull request builds are worth cancelling.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -37,9 +47,25 @@ jobs:
     # compile the `glassEffect` calls at all.
     runs-on: macos-26
     timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        # The marketing version comes from project.yml; the build number is the
+        # run number, so every published build sorts after the one before and
+        # SideStore offers it as an update.
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^ *MARKETING_VERSION: *"\{0,1\}\([0-9.]*\)"\{0,1\}.*/\1/p' apps/ios/project.yml | head -1)
+          test -n "$VERSION" || { echo "MARKETING_VERSION not found in project.yml" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "hat $VERSION (${{ github.run_number }})"
 
       - name: Xcode version
         run: xcodebuild -version
@@ -72,6 +98,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
+            CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
             build
 
       - name: Package the .app as an unsigned IPA
@@ -91,3 +118,84 @@ jobs:
           name: hat-unsigned-ipa
           path: apps/ios/hat-unsigned.ipa
           if-no-files-found: error
+
+  release:
+    # Only the GitHub copy of the repo publishes (the Forgejo mirror has no
+    # macOS runner or Pages), and only builds of main.
+    if: >-
+      github.server_url == 'https://github.com' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}source.json
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ios-${{ needs.build.outputs.version }}-b${{ needs.build.outputs.build }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hat-unsigned-ipa
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          mv hat-unsigned.ipa hat.ipa
+          # Notes: the app's commits since the previous iOS release.
+          PREV=$(git tag --list 'ios-*' --sort=-creatordate | head -1)
+          {
+            echo "Unsigned build of \`${GITHUB_SHA::7}\`; SideStore signs it on-device."
+            echo
+            if [ -n "$PREV" ]; then
+              git log --no-merges --format='- %s' "$PREV..$GITHUB_SHA" -- apps/ios packages/core | head -30
+            else
+              git log --no-merges --format='- %s' -10 "$GITHUB_SHA" -- apps/ios
+            fi
+          } > notes.md
+          gh release create "$TAG" hat.ipa \
+            --target "$GITHUB_SHA" \
+            --title "hat iOS ${{ needs.build.outputs.version }} (${{ needs.build.outputs.build }})" \
+            --notes-file notes.md
+
+      - uses: actions/configure-pages@v5
+        id: pages
+
+      - name: Build the SideStore source
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --slurp > releases.json
+          node apps/ios/scripts/sidestore-source.mjs releases.json \
+            "${{ steps.pages.outputs.base_url }}" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" > site/source.json
+          cp apps/ios/Hat/Assets.xcassets/AppIcon.appiconset/icon.png site/icon.png
+          # A landing page for anyone who opens the Pages URL in a browser.
+          SOURCE="${{ steps.pages.outputs.base_url }}/source.json"
+          cat > site/index.html <<HTML
+          <!doctype html><meta charset="utf-8"><title>hat for iOS</title>
+          <h1>hat for iOS</h1>
+          <p>Add this source in SideStore (Sources › +): <code>$SOURCE</code></p>
+          <p><a href="sidestore://source?url=$SOURCE">Add to SideStore</a> ·
+          <a href="altstore://source?url=$SOURCE">Add to AltStore</a> ·
+          <a href="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG">Latest IPA</a></p>
+          HTML
+          jq '.apps[0].versions[0] | {version, buildVersion, downloadURL}' site/source.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deploy

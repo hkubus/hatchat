@@ -649,7 +649,9 @@ composer uses `glassEffect` there and a material blur below.
 For a free Apple ID,
 [`.github/workflows/ios-ipa.yml`](.github/workflows/ios-ipa.yml) builds an
 unsigned IPA on a GitHub macOS runner for SideStore to sign on-device (7-day
-expiry, 3 apps at a time).
+expiry, 3 apps at a time). Every build of `main` is published as a release and
+listed in the SideStore source `https://hkubus.github.io/hatchat/source.json`,
+so SideStore installs and updates it directly.
 
 See [docs/ios-app.md](docs/ios-app.md) for the architecture, the state machine,
 and what is deliberately out of scope.
