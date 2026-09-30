@@ -620,14 +620,15 @@ export default function App() {
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     await refreshSessions();
-    if (policyMode !== "ask" || reasoningEffort !== "off") {
-      const updated = await api.updateSession(payload.session.id, {
-        approvalMode: policyMode,
-        allowedTools: parseAllowlist(allowedToolsText),
-        reasoningEffort,
-      });
-      applySession(updated);
-    }
+    // What the composer shows is this chat's settings. Always send them: a new
+    // session gets the server's defaults, which need not match (skipping "ask"
+    // left a chat the user set to ask running tools without asking).
+    const updated = await api.updateSession(payload.session.id, {
+      approvalMode: policyMode,
+      allowedTools: parseAllowlist(allowedToolsText),
+      reasoningEffort,
+    });
+    applySession(updated);
     return payload.session.id;
   }
 

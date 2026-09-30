@@ -515,14 +515,15 @@ export function useChat(): ChatStore {
     applySession(payload.session);
     await savePref("session", payload.session.id);
     await refreshSessions().catch(() => undefined);
-    if (policyMode !== "ask" || reasoningEffort !== "off" || allowedTools.length > 0) {
-      const updated = await api.updateSession(payload.session.id, {
-        approvalMode: policyMode,
-        allowedTools,
-        reasoningEffort,
-      });
-      applySession(updated);
-    }
+    // What the composer shows is this chat's settings. Always send them: a new
+    // session gets the server's defaults, which need not match (skipping "ask"
+    // left a chat the user set to ask running tools without asking).
+    const updated = await api.updateSession(payload.session.id, {
+      approvalMode: policyMode,
+      allowedTools,
+      reasoningEffort,
+    });
+    applySession(updated);
     return payload.session.id;
   }, [sessionId, model, policyMode, reasoningEffort, allowedTools, applySession, refreshSessions]);
 
