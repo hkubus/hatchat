@@ -5,6 +5,9 @@ import UIKit
 /// A reply rendered as Markdown. Block structure comes from HatKit's
 /// `parseMarkdown`; inline emphasis, code spans and links are SwiftUI's own
 /// `AttributedString(markdown:)`.
+///
+/// The text came from a model, which a page it read can steer, so only web,
+/// mail and phone links open, and an image from the web loads only on a tap.
 struct MarkdownView: View {
     var text: String
 
@@ -15,17 +18,28 @@ struct MarkdownView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Backstop for `inlineMarkdown`, which already unlinks anything else.
+        .environment(\.openURL, OpenURLAction { url in
+            isOpenableLink(url) ? .systemAction : .discarded
+        })
     }
 }
 
 /// Inline Markdown, falling back to the raw text when it does not parse (a
-/// half-streamed `**` is the common case).
+/// half-streamed `**` is the common case). Links a tap may not open (another
+/// app's scheme, a relative path) are left as plain text.
 func inlineMarkdown(_ source: String) -> AttributedString {
     let options = AttributedString.MarkdownParsingOptions(
         interpretedSyntax: .inlineOnlyPreservingWhitespace,
         failurePolicy: .returnPartiallyParsedIfPossible
     )
-    return (try? AttributedString(markdown: source, options: options)) ?? AttributedString(source)
+    guard var parsed = try? AttributedString(markdown: source, options: options) else { return AttributedString(source) }
+    var inert: [Range<AttributedString.Index>] = []
+    for (link, range) in parsed.runs[\.link] {
+        if let link, !isOpenableLink(link) { inert.append(range) }
+    }
+    for range in inert { parsed[range].link = nil }
+    return parsed
 }
 
 private struct BlockView: View {
@@ -88,6 +102,8 @@ private struct BlockView: View {
             .background(Theme.surfaceAlt, in: .rect(cornerRadius: 12, style: .continuous))
         case .rule:
             Divider().padding(.vertical, 4)
+        case let .image(alt, source):
+            MarkdownImage(alt: alt, source: source)
         }
     }
 
@@ -100,6 +116,61 @@ private struct BlockView: View {
             Text(marker).monospacedDigit().foregroundStyle(.secondary)
         } else {
             Text(item.depth == 0 ? "•" : "◦").foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// An image on a line of its own in a reply. One already in the reply (a data
+/// URL) is shown; one from the web waits for a tap, since fetching it is a
+/// request to wherever the reply points, with whatever the URL carries.
+private struct MarkdownImage: View {
+    var alt: String
+    var source: String
+    @State private var load = false
+
+    var body: some View {
+        switch markdownImageSource(source) {
+        case let .inline(data):
+            if let image = UIImage(data: data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: 420, alignment: .leading)
+                    .clipShape(.rect(cornerRadius: 12, style: .continuous))
+                    .accessibilityLabel(alt.isEmpty ? "Image" : alt)
+            }
+        case let .remote(url, host):
+            if load {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .clipShape(.rect(cornerRadius: 12, style: .continuous))
+                            .accessibilityLabel(alt.isEmpty ? "Image from \(host)" : alt)
+                    } else if phase.error != nil {
+                        Label("Couldn’t load the image from \(host)", systemImage: "photo.badge.exclamationmark")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: 420, alignment: .leading)
+            } else {
+                Button {
+                    Haptics.tap()
+                    load = true
+                } label: {
+                    Label(alt.isEmpty ? "Load image from \(host)" : "Load image “\(alt)” from \(host)", systemImage: "photo")
+                        .font(.footnote)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+            }
+        case .blocked:
+            EmptyView()
         }
     }
 }

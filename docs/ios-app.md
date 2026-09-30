@@ -334,7 +334,11 @@ iOS's generic "secure connection required" error.
 - **Syntax highlighting.** Fenced blocks get a monospace surface.
 - **Markdown** is a pragmatic subset: paragraphs, headings, fenced code, nested
   and task lists, quotes, tables and rules, with SwiftUI's inline syntax.
-  Images and HTML inside Markdown are shown as text.
+  An image on a line of its own is shown if it is a data URL; one from the
+  web is a "Load image from <host>" button, since fetching it would send
+  whatever a steered reply put in its URL. Images inside a sentence, and
+  HTML, are shown as text. Only `http`, `https`, `mailto` and `tel` links
+  open; others are plain text.
 - **The app icon** is still Expo's template placeholder (with dark and tinted
   variants). Real icon art, ideally an Icon Composer `.icon`, is still to do.
 - **No device or simulator pass yet.** HatKit is covered end to end against a
