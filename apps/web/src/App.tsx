@@ -35,6 +35,18 @@ interface PendingAttachment {
   previewUrl?: string;
 }
 
+/** What the composer held when a message was sent. */
+interface Draft {
+  text: string;
+  attachments: PendingAttachment[];
+}
+
+function releasePreviews(attachments: readonly PendingAttachment[]): void {
+  for (const attachment of attachments) {
+    if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+  }
+}
+
 /** Pasting more than this much text attaches it as a file instead. */
 const PASTE_AS_FILE_CHARS = 8_000;
 
@@ -150,6 +162,15 @@ export default function App() {
   const sessionsRequestRef = useRef(0);
   /** Last status seen per session, to notice a turn finishing or needing the user. */
   const statusRef = useRef(new Map<string, SessionSummary["status"]>());
+  /** What the composer holds now, for async work that outlives the render it started in. */
+  const composerRef = useRef<Draft>({ text: input, attachments: pending });
+  composerRef.current = { text: input, attachments: pending };
+  /**
+   * Drafts a refused send gave back after the user had moved to another
+   * conversation, by the conversation they were written in. Opening it again
+   * puts the draft back in the composer.
+   */
+  const refusedDrafts = useRef(new Map<string, Draft>());
 
   useEffect(() => {
     const el = scroller.current;
@@ -632,24 +653,54 @@ export default function App() {
     return payload.session.id;
   }
 
+  /**
+   * Put an unsent draft back in the composer, keeping whatever the user has
+   * written since: their text, or their attachments, win over the draft's.
+   */
+  function putBackDraft(draft: Draft): void {
+    const current = composerRef.current;
+    if (!current.text && draft.text) setInput(draft.text);
+    if (current.attachments.length === 0) setPending(draft.attachments);
+    else releasePreviews(draft.attachments);
+  }
+
+  /**
+   * Give back a draft that was not sent. Only into the conversation it was
+   * written in: if the user has opened another one since, it waits for them
+   * to come back to its own.
+   */
+  function giveBackDraft(draft: Draft, sentFromView: number, sessionIdSentTo: string | null): void {
+    if (viewRef.current === sentFromView) {
+      putBackDraft(draft);
+      return;
+    }
+    if (!sessionIdSentTo) {
+      releasePreviews(draft.attachments);
+      return;
+    }
+    const previous = refusedDrafts.current.get(sessionIdSentTo);
+    if (previous) releasePreviews(previous.attachments);
+    refusedDrafts.current.set(sessionIdSentTo, draft);
+  }
+
   async function send(): Promise<void> {
     const text = input.trim();
     if ((!text && pending.length === 0) || busy) return;
     const attachments = pending;
+    const draft: Draft = { text, attachments };
+    const sentFromView = viewRef.current;
+    const sessionAtSend = sessionIdRef.current;
     setInput("");
     setPending([]);
     setError(null);
 
-    const revoke = (): void =>
-      attachments.forEach((a) => a.previewUrl && URL.revokeObjectURL(a.previewUrl));
     let uploaded: api.AttachmentRecord[] = [];
     try {
       uploaded = await Promise.all(attachments.map((a) => api.uploadAttachment(a.file)));
     } catch (e) {
       // Nothing was sent, so give the user their draft back.
-      setInput(text);
-      setPending(attachments);
-      setError(e instanceof Error ? e.message : String(e));
+      giveBackDraft(draft, sentFromView, sessionAtSend);
+      if (viewRef.current === sentFromView) setError(e instanceof Error ? e.message : String(e));
       return;
     }
 
@@ -671,8 +722,10 @@ export default function App() {
     ]);
 
     let refused = false;
+    let sessionIdSentTo = sessionAtSend;
     try {
       const id = await ensureSession();
+      sessionIdSentTo = id;
       await runStream(id, async (onEvent, signal) => {
         try {
           await api.sendTurn(
@@ -694,13 +747,8 @@ export default function App() {
       if (!api.isAbortError(e)) setError(String(e));
       setBusy(false);
     } finally {
-      if (refused) {
-        // Give the user their draft back, unless they already started another.
-        setInput((current) => current || text);
-        setPending((current) => (current.length > 0 ? current : attachments));
-      } else {
-        revoke();
-      }
+      if (refused) giveBackDraft(draft, sentFromView, sessionIdSentTo);
+      else releasePreviews(attachments);
     }
   }
 
@@ -800,6 +848,11 @@ export default function App() {
     setSessionId(payload.session.id);
     setMessages(buildMessages(payload.path));
     applySession(payload.session);
+    const refused = refusedDrafts.current.get(payload.session.id);
+    if (refused) {
+      refusedDrafts.current.delete(payload.session.id);
+      putBackDraft(refused);
+    }
     void followActiveTurn(payload.session.id);
   }
 
@@ -810,6 +863,11 @@ export default function App() {
 
   async function handleDelete(id: string): Promise<void> {
     await api.deleteSession(id);
+    const refused = refusedDrafts.current.get(id);
+    if (refused) {
+      refusedDrafts.current.delete(id);
+      releasePreviews(refused.attachments);
+    }
     if (id === sessionIdRef.current) {
       viewRef.current++;
       detachStream();
