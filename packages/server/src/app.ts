@@ -238,14 +238,24 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     turns.emit(sessionId, event);
   }, config.approvalTimeoutMs);
 
+  /**
+   * The runner each session's workspace lives on. When the kernel needs a new
+   * host because the old one's link closed, the session goes back to that
+   * runner if it has reconnected, rather than to whichever runner is least
+   * busy and has none of its files.
+   */
+  const sessionRunners = new Map<string, string>();
+
   const resolveHost = async (sessionId: string): Promise<ExecutionHost> => {
-    const channel = registry.acquire();
+    const home = sessionRunners.get(sessionId);
+    const channel = (home ? registry.get(home) : undefined) ?? registry.acquire();
     if (!channel) {
       throw new Error(
         "No runner connected. Start @hat/runner and make sure it can reach the server's /link endpoint.",
       );
     }
     await channel.ensureWorkspace(sessionId);
+    sessionRunners.set(sessionId, channel.id);
     return createRemoteHost(channel, sessionId);
   };
 

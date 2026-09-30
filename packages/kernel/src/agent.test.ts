@@ -595,3 +595,98 @@ test("ephemeral runs hide excluded tools, skip persistence and give tools their 
   assert.deepEqual(emitted, [{ type: "warning", message: "from tool" }]);
   assert.deepEqual(persisted, []);
 });
+
+/** Calls `tools` (in one round) whenever the user spoke last, and answers once they have run. */
+function toolRoundProvider(tools: string[], counter = { calls: 0 }): Provider {
+  return {
+    id: "round",
+    label: "round",
+    capabilities: () => ({ ...DEFAULT_CAPABILITIES, toolCalls: true }),
+    listModels: async () => [],
+    async *chat(req) {
+      counter.calls += 1;
+      if (req.messages.at(-1)?.role === "tool") {
+        yield { type: "text.delta", text: "done" };
+        yield { type: "done", finishReason: "stop" as const };
+        return;
+      }
+      for (const name of tools) {
+        yield { type: "toolcall", call: { id: newId("call"), name, args: {} } };
+      }
+      yield { type: "done", finishReason: "tool_calls" as const };
+    },
+  };
+}
+
+function agentFor(provider: Provider, tools: Tool[], extra: Partial<ConstructorParameters<typeof Agent>[0]> = {}) {
+  const providers = new ProviderRegistry();
+  providers.register(provider);
+  const registry = new ToolRegistry();
+  for (const entry of tools) registry.register(entry);
+  return new Agent({
+    providers,
+    tools: registry,
+    resolveHost: async () => ({}) as ExecutionHost,
+    approval: { async request() { return "approve"; } },
+    secrets: { async get() { return undefined; } },
+    audit: { record() {} },
+    logger,
+    ...extra,
+  });
+}
+
+async function runTurn(
+  agent: Agent,
+  model: string,
+  options: { history?: ChatMessage[]; signal?: AbortSignal } = {},
+): Promise<KernelEvent[]> {
+  const events: KernelEvent[] = [];
+  for await (const event of agent.run({
+    sessionId: "s1",
+    history: options.history ?? [],
+    model,
+    userText: "go",
+    signal: options.signal ?? new AbortController().signal,
+    toolPolicy: { ...DEFAULT_TOOL_POLICY, mode: "auto", maxIterations: 5 },
+  })) {
+    events.push(event);
+  }
+  return events;
+}
+
+const okTool = (name: string, onRun?: () => void): Tool => ({
+  name,
+  description: "test",
+  async execute() {
+    onRun?.();
+    return [{ type: "text", text: "ok" }];
+  },
+});
+
+test("a cached host whose runner went away is replaced, not reused", async () => {
+  const hosts: Array<{ id: string; closed: boolean }> = [];
+  const used: string[] = [];
+  const recorder: Tool = {
+    name: "where",
+    description: "records its host",
+    async execute(_args, ctx) {
+      used.push(ctx.host.id);
+      return [{ type: "text", text: "ok" }];
+    },
+  };
+  const agent = agentFor(toolRoundProvider(["where"]), [recorder], {
+    resolveHost: async () => {
+      const host = { id: `host-${hosts.length + 1}`, closed: false };
+      hosts.push(host);
+      return host as unknown as ExecutionHost;
+    },
+  });
+
+  await runTurn(agent, "round/m");
+  await runTurn(agent, "round/m");
+  assert.deepEqual(used, ["host-1", "host-1"]);
+
+  hosts[0].closed = true; // its runner reconnected: the old link will never answer
+  await runTurn(agent, "round/m");
+  assert.deepEqual(used, ["host-1", "host-1", "host-2"]);
+});

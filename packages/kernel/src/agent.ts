@@ -107,18 +107,24 @@ export class Agent {
   constructor(private readonly deps: KernelDeps) {}
   private readonly hostCache = new Map<string, Promise<ExecutionHost>>();
 
-  private resolveHostCached(sessionId: string): Promise<ExecutionHost> {
-    // One workspace.ensure per turn instead of one per tool call.
-    let cached = this.hostCache.get(sessionId);
-    if (!cached) {
-      cached = this.deps.resolveHost(sessionId);
-      this.hostCache.set(sessionId, cached);
-      // Drop on failure so the next call retries; drop after the turn
-      // via clearHostCache? Kept per Agent instance (per server) — entries
-      // are cheap (a channel + workspace) and keyed by session.
-      cached.catch(() => this.hostCache.delete(sessionId));
+  private async resolveHostCached(sessionId: string): Promise<ExecutionHost> {
+    // One workspace.ensure per session instead of one per tool call. Entries
+    // live as long as the server and are cheap (a channel and a session id),
+    // but a host whose runner has gone away is replaced, not reused: nothing
+    // sent through it would ever be answered.
+    const cached = this.hostCache.get(sessionId);
+    if (cached) {
+      const host = await cached.catch(() => undefined);
+      if (host && !host.closed) return host;
+      if (this.hostCache.get(sessionId) === cached) this.hostCache.delete(sessionId);
     }
-    return cached;
+    const fresh = this.deps.resolveHost(sessionId);
+    this.hostCache.set(sessionId, fresh);
+    // Drop on failure so the next call retries.
+    fresh.catch(() => {
+      if (this.hostCache.get(sessionId) === fresh) this.hostCache.delete(sessionId);
+    });
+    return fresh;
   }
 
   async *run(input: AgentTurnInput): AsyncGenerator<KernelEvent> {

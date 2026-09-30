@@ -34,7 +34,11 @@ test("filters by os and runtime", () => {
 /** Stand up a registry on an ephemeral port and return a runner-side connector. */
 async function withRegistry(
   onAvailability: (available: boolean) => void,
-): Promise<{ connect: (runnerId: string) => Promise<WebSocket>; close: () => Promise<void> }> {
+): Promise<{
+  registry: RunnerRegistry;
+  connect: (runnerId: string) => Promise<WebSocket>;
+  close: () => Promise<void>;
+}> {
   const silent = { info() {}, warn() {}, error() {}, debug() {} };
   const registry = new RunnerRegistry(silent, "", onAvailability);
   const http: Server = createHttpServer();
@@ -44,6 +48,7 @@ async function withRegistry(
   const sockets: WebSocket[] = [];
 
   return {
+    registry,
     connect: (runnerId) =>
       new Promise<WebSocket>((resolve, reject) => {
         const ws = new WebSocket(`ws://127.0.0.1:${port}/link`);
@@ -113,5 +118,48 @@ test("a same-id reconnect does not report the fleet as empty", async () => {
   second.close();
   await settled();
   assert.deepEqual(events, [true, false]);
+  await close();
+});
+
+/** Drain an exec stream; rejects with the stream's error, if it fails. */
+async function drainExec(events: AsyncIterable<unknown>): Promise<void> {
+  for await (const _ of events) {
+    /* nothing is expected */
+  }
+}
+
+/**
+ * Whatever still holds a superseded connection (a cached execution host) has
+ * to get an error back. A request on a closed link used to wait forever.
+ */
+test("a superseded connection fails new requests instead of hanging", async () => {
+  const { registry, connect, close } = await withRegistry(() => {});
+  await connect("r1");
+  await settled();
+  const old = registry.get("r1")!;
+  await connect("r1");
+  await settled();
+
+  assert.equal(old.closed, true);
+  assert.equal(registry.get("r1")?.closed, false);
+  assert.notEqual(registry.get("r1"), old);
+  await assert.rejects(old.ensureWorkspace("s1"), /superseded/);
+  await assert.rejects(old.fsRead("s1", "notes.txt"), /superseded/);
+  await assert.rejects(old.spawn({ command: "sleep 1", shell: true }), /superseded/);
+  await assert.rejects(drainExec(old.exec("s1", { command: "echo hi" }, new AbortController().signal)), /superseded/);
+  await close();
+});
+
+test("an exec for a turn that was already cancelled is never started", async () => {
+  const { registry, connect, close } = await withRegistry(() => {});
+  const ws = await connect("r1");
+  const received: string[] = [];
+  ws.on("message", (data: Buffer) => received.push((JSON.parse(data.toString()) as { t: string }).t));
+  const stopped = new AbortController();
+  stopped.abort();
+
+  await assert.rejects(drainExec(registry.get("r1")!.exec("s1", { command: "rm -rf build" }, stopped.signal)), /cancelled/);
+  await settled();
+  assert.deepEqual(received.filter((type) => type.startsWith("exec.")), []);
   await close();
 });
