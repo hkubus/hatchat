@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@hat/core": "workspace:*",
+    "@hat/net-guard": "workspace:*",
     "@hat/runner-protocol": "workspace:*",
+    "undici": "^7.30.0",
     "ws": "^8.18.0"
   }
 }

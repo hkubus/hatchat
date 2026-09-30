@@ -36,6 +36,7 @@ import type { SessionRecord } from "@hat/store-sqlite";
 import { Store } from "@hat/store-sqlite";
 import { createShellPlugin } from "@hat/tool-shell";
 import { createBrowserPlugin } from "@hat/tool-browser";
+import { ceneoPrompt, createCeneoPlugin } from "@hat/tool-ceneo";
 import { createWebSearchPlugin } from "@hat/tool-websearch";
 import { createFsPlugin } from "@hat/tool-fs";
 import { createWebFetchPlugin } from "@hat/tool-webfetch";
@@ -43,7 +44,9 @@ import { createProcessPlugin, createPythonPlugin } from "@hat/tool-process";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
+import { getConnInfo } from "@hono/node-server/conninfo";
 import crypto from "node:crypto";
 import { ApprovalManager } from "./approvals.js";
 import type { ServerConfig } from "./config.js";
@@ -82,17 +85,38 @@ const CONTINUE_PROMPT =
   "Your previous reply was cut off by the output limit. Continue exactly where it stopped, " +
   "without repeating what you already wrote and without any preamble.";
 
+/** Why a second turn in a conversation is refused (409). */
+const TURN_RUNNING = "a reply is still running in this conversation; stop it first";
+
+/** How long a turn the user stopped may take to store its last messages. */
+const STOPPED_TURN_GRACE_MS = 10_000;
+
 export async function createServer(config: ServerConfig): Promise<ServerRuntime> {
   const logger = createLogger();
   const audit = createAuditLog(logger);
 
   const master = loadMasterKey({ filePath: config.masterKeyPath });
   if (master.source === "generated") {
-    logger.warn(`generated a new master key at ${master.path} (set HAT_MASTER_KEY in production)`);
+    logger.warn(
+      `generated a new master key at ${master.path}; in production, put its contents in HAT_MASTER_KEY ` +
+        "(a different key would leave every secret saved under this one unreadable)",
+    );
   }
   const artifacts = createArtifactStore({ dir: config.uploadDir, s3: config.s3 });
   logger.info(`artifact backend: ${artifacts.kind}`);
   const store = new Store(config.dbPath, master.key, artifacts);
+  const unreadable = store.unreadableSecrets();
+  if (unreadable.length > 0) {
+    const why = master.shadowedFile
+      ? `HAT_MASTER_KEY differs from the key in ${master.shadowedFile}, which they were likely saved under`
+      : master.source === "generated"
+        ? "a new key file was just generated, so the key they were saved under is gone"
+        : "the master key is not the one they were saved under";
+    logger.warn(
+      `can't decrypt ${unreadable.length} saved secret(s): ${unreadable.join(", ")}. ${why}. ` +
+        "Restore that key, or save them again in Settings; until then they count as unset.",
+    );
+  }
 
   const providers = new ProviderRegistry();
   const tools = new ToolRegistry();
@@ -119,8 +143,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
             // Always cycle: an already-active plugin is holding stdio
             // processes that died with the previous runner.
             logger.info(`runner available; (re)connecting plugin ${id}`);
-            await pluginHost.deactivate(id);
-            await pluginHost.activate(id);
+            await pluginHost.restart(id);
           } else {
             continue;
           }
@@ -166,6 +189,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createDeepSeekPlugin());
   pluginHost.register(createShellPlugin());
   pluginHost.register(createWebSearchPlugin());
+  pluginHost.register(createCeneoPlugin());
   pluginHost.register(createBrowserPlugin());
   pluginHost.register(createFsPlugin());
   pluginHost.register(createWebFetchPlugin());
@@ -215,8 +239,18 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   pluginHost.register(createFakePlugin());
   pluginHost.register(createMcpPlugin());
 
+  // The built-in plugins' secrets (the user's provider keys) are theirs alone.
+  const reservedSecrets = pluginHost.list().flatMap((plugin) => plugin.requiresSecrets);
   for (const plugin of config.enableExternalPlugins
-    ? await loadExternalPlugins(config.pluginsDir, logger, { isolate: config.pluginIsolation })
+    ? await loadExternalPlugins(config.pluginsDir, logger, {
+        isolate: config.pluginIsolation,
+        reservedSecrets,
+        secretClaimants: (name) =>
+          pluginHost
+            .list()
+            .filter((plugin) => plugin.requiresSecrets.includes(name))
+            .map((plugin) => plugin.id),
+      })
     : []) {
     pluginHost.register(plugin, "external");
   }
@@ -238,14 +272,24 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     turns.emit(sessionId, event);
   }, config.approvalTimeoutMs);
 
+  /**
+   * The runner each session's workspace lives on. When the kernel needs a new
+   * host because the old one's link closed, the session goes back to that
+   * runner if it has reconnected, rather than to whichever runner is least
+   * busy and has none of its files.
+   */
+  const sessionRunners = new Map<string, string>();
+
   const resolveHost = async (sessionId: string): Promise<ExecutionHost> => {
-    const channel = registry.acquire();
+    const home = sessionRunners.get(sessionId);
+    const channel = (home ? registry.get(home) : undefined) ?? registry.acquire();
     if (!channel) {
       throw new Error(
         "No runner connected. Start @hat/runner and make sure it can reach the server's /link endpoint.",
       );
     }
     await channel.ensureWorkspace(sessionId);
+    sessionRunners.set(sessionId, channel.id);
     return createRemoteHost(channel, sessionId);
   };
 
@@ -259,9 +303,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     logger,
     systemPrompt: config.systemPrompt,
     systemContext: () =>
-      pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
+      [
+        pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
+        pluginHost.get("ceneo")?.status === "active"
+          ? ceneoPrompt(tools.list().map((tool) => tool.name))
+          : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n\n") || undefined,
     maxToolIterations: config.maxToolIterations,
-    onMessage: (sessionId, message) => store.appendMessage(sessionId, message),
+    onMessage: (sessionId, message, parentId) => store.appendMessage(sessionId, message, parentId),
     resolveImage: async (attachmentId) => {
       const record = store.getAttachment(attachmentId);
       const data = await store.readAttachment(attachmentId);
@@ -316,16 +367,30 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   const turnLimiter = new RateLimiter(60, 60_000);
   const uploadLimiter = new RateLimiter(30, 60_000);
 
+  let ignoredForwarding = false;
+
+  /**
+   * The address a request came from, for rate limits. `X-Forwarded-For` is
+   * anyone's to write, so it only counts on a connection from a proxy listed
+   * in HAT_TRUSTED_PROXIES: otherwise a client could claim a fresh address on
+   * every login attempt and never be limited.
+   */
   function clientIp(c: Context): string {
-    // Prefer the last forwarded entry (closest proxy) and fall back to direct.
-    // Full proxy-trust needs explicit config; this at least stops trivial
-    // header-rotation bypasses from resetting the login bucket alone.
+    const peer = peerAddress(c);
     const forwarded = c.req.header("x-forwarded-for");
-    if (forwarded) {
-      const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
-      if (parts.length > 0) return parts[parts.length - 1];
+    if (forwarded && peer && config.trustedProxies.includes(peer)) {
+      // The proxy appends the address it saw: the last entry is its own word.
+      const hops = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
+      if (hops.length > 0) return hops[hops.length - 1];
     }
-    return c.req.header("x-real-ip")?.trim() || "local";
+    if (forwarded && !ignoredForwarding) {
+      ignoredForwarding = true;
+      logger.warn(
+        `ignoring X-Forwarded-For from ${peer ?? "an unknown address"}; if that is your reverse proxy, ` +
+          "list it in HAT_TRUSTED_PROXIES, or every client shares its rate limits",
+      );
+    }
+    return peer ?? "local";
   }
 
   const bearerAuthed = (c: Context): boolean => {
@@ -353,7 +418,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     }),
   );
 
-  app.post("/api/auth/login", async (c) => {
+  // Anyone can call this one, so it reads a password, not whatever they send.
+  app.post("/api/auth/login", bodyLimit({ maxSize: 16 * 1024, onError: tooLarge("request too large") }), async (c) => {
     if (!config.authPasswordHash) {
       return c.json({ error: "password auth is not configured" }, 400);
     }
@@ -367,7 +433,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     } catch {
       /* ignore */
     }
-    if (!body.password || !verifyPassword(body.password, config.authPasswordHash)) {
+    if (typeof body.password !== "string" || !(await verifyPassword(body.password, config.authPasswordHash))) {
       return c.json({ error: "invalid password" }, 401);
     }
     loginLimiter.reset(ip);
@@ -382,7 +448,22 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ ok: true, csrfToken: csrf });
   });
 
+  /**
+   * Sign out: clear the cookies. A live session takes its CSRF token as well,
+   * so a cross-site form can't sign the user out. A session that has expired
+   * (or a forged one) is cleared without it: there is nothing to protect, and
+   * a stale cookie must not leave the user unable to sign out at all.
+   */
   app.post("/api/auth/logout", (c) => {
+    const token = getCookie(c, "hat_session");
+    const live = token ? verifySession(token, sessionSecret) : undefined;
+    if (live && !bearerAuthed(c)) {
+      const csrfCookie = getCookie(c, "hat_csrf");
+      const csrfHeader = c.req.header("x-csrf-token");
+      if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+        return c.json({ error: "invalid csrf token" }, 403);
+      }
+    }
     deleteCookie(c, "hat_session", { path: "/" });
     deleteCookie(c, "hat_csrf", { path: "/" });
     return c.json({ ok: true });
@@ -392,9 +473,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   app.use("/api/*", async (c, next) => {
     const path = c.req.path;
-    // Login + status stay unauthenticated; logout requires session + CSRF
-    // so a cross-site form can't log the user out.
-    if (path === "/api/auth/login" || path === "/api/auth/status") return next();
+    // Login, status and logout check what they need themselves.
+    if (path === "/api/auth/login" || path === "/api/auth/status" || path === "/api/auth/logout") return next();
     if (!authRequired) return next();
     if (bearerAuthed(c)) return next();
 
@@ -546,6 +626,26 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   const streamTurn = (c: Context, options: TurnOptions): Response =>
     serveTurn(c, runTurn(options));
 
+  const turnRunning = (sessionId: string): boolean => {
+    const turn = turns.get(sessionId);
+    return Boolean(turn && !turn.done);
+  };
+
+  /**
+   * A conversation runs one turn at a time. Two turns writing to it at once
+   * interleave their messages (a reply under the wrong question, a tool result
+   * after the next user message), and providers refuse every request after
+   * that. A turn the user just stopped may still be storing its last messages,
+   * so it gets a moment to finish.
+   *
+   * Check `turnRunning` right after this, and start the turn in the same
+   * synchronous stretch: another request can start one at any `await`.
+   */
+  const settleStoppedTurn = async (sessionId: string): Promise<void> => {
+    const turn = turns.get(sessionId);
+    if (turn && !turn.done && turn.signal.aborted) await turn.settled(STOPPED_TURN_GRACE_MS);
+  };
+
   const pathOf = (sessionId: string) => store.getPath(sessionId);
 
   // ---- meta ---------------------------------------------------------------
@@ -574,7 +674,9 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   // ---- attachments --------------------------------------------------------
 
-  app.post("/api/attachments", async (c) => {
+  // Refused while it streams in, not after the whole body sits in memory.
+  const uploadLimit = bodyLimit({ maxSize: 26 * 1024 * 1024, onError: tooLarge("file too large (max 25MB)") });
+  app.post("/api/attachments", uploadLimit, async (c) => {
     if (!uploadLimiter.allow(clientIp(c))) {
       return c.json({ error: "too many uploads; try again later" }, 429);
     }
@@ -677,7 +779,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
   app.get("/api/secrets", (c) => c.json({ secrets: store.listSecretNames() }));
 
   app.post("/api/secrets", async (c) => {
-    let body: { name?: string; value?: string } = {};
+    let body: { name?: string; value?: string; plugin?: unknown } = {};
     try {
       body = await c.req.json();
     } catch {
@@ -686,7 +788,16 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!body.name || typeof body.value !== "string" || body.value.length === 0) {
       return c.json({ error: "name and value are required" }, 400);
     }
-    store.setSecret(body.name, body.value);
+    // `plugin`: the external plugin this secret is for. Sandboxed plugins
+    // are served only secrets saved for them.
+    if (body.plugin !== undefined) {
+      const plugin = typeof body.plugin === "string" ? pluginHost.get(body.plugin) : undefined;
+      if (!plugin) return c.json({ error: "no such plugin" }, 400);
+      if (!plugin.requiresSecrets.includes(body.name)) {
+        return c.json({ error: `plugin ${plugin.id} does not declare the secret ${body.name}` }, 400);
+      }
+    }
+    store.setSecret(body.name, body.value, typeof body.plugin === "string" ? body.plugin : undefined);
     await pluginHost.reload();
     return c.json({ ok: true });
   });
@@ -823,9 +934,32 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     return c.json({ session: store.getSession(session.id) });
   });
 
-  app.delete("/api/sessions/:id", (c) => {
-    const removed = store.deleteSession(c.req.param("id"));
-    return c.json({ ok: removed });
+  /**
+   * Delete a conversation and what it left behind: the reply still running,
+   * what plugins kept for it (processes, an interpreter, a browser page), its
+   * files and processes on the runners, and attachments nothing else uses.
+   */
+  app.delete("/api/sessions/:id", async (c) => {
+    const id = c.req.param("id");
+    // Stop the reply and let it wind down first: a turn still finishing could
+    // otherwise run a tool that recreates the workspace, or keep a plugin's
+    // per-conversation state alive, after everything below is cleaned up.
+    const running = turns.get(id);
+    if (running && !running.done) {
+      running.abort.abort();
+      if (!(await running.settled(STOPPED_TURN_GRACE_MS))) {
+        logger.warn(`deleting conversation ${id} while its stopped reply is still winding down`);
+      }
+    }
+    const attachments = store.attachmentIdsOf(id);
+    if (!store.deleteSession(id)) return c.json({ ok: false });
+    await pluginHost.sessionDeleted(id);
+    for (const runner of registry.list()) runner.removeWorkspace(id);
+    sessionRunners.delete(id);
+    await store.pruneAttachments(attachments).catch((error: unknown) => {
+      logger.warn("could not delete the attachments of a deleted conversation", normalizeError(error, "prune"));
+    });
+    return c.json({ ok: true });
   });
 
   /** Start a new conversation from this one's path up to `messageId`. */
@@ -915,6 +1049,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!text.trim() && attachmentIds.length === 0) {
       return c.json({ error: "text or attachments are required" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     if (body.model) store.setSessionModel(session.id, body.model);
 
     let userParts: Part[] | undefined;
@@ -950,9 +1086,11 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
    * (synthetic) user message so the history keeps alternating, which every
    * provider accepts; clients hide it and read the next reply as the rest.
    */
-  app.post("/api/sessions/:id/continue", (c) => {
+  app.post("/api/sessions/:id/continue", async (c) => {
     const session = store.getSession(c.req.param("id"));
     if (!session) return c.json({ error: "not found" }, 404);
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     const history = pathOf(session.id).map((n) => n.message);
     const last = history.at(-1);
     if (!last || last.role !== "assistant") {
@@ -981,6 +1119,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!target || target.role !== "assistant") {
       return c.json({ error: "messageId must reference an assistant message" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     const parent = store.getParentId(target.id);
     store.setActiveLeaf(session.id, parent);
     return streamTurn(c, {
@@ -1006,6 +1146,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!target || target.role !== "user") {
       return c.json({ error: "messageId must reference a user message" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     store.setActiveLeaf(session.id, store.getParentId(target.id));
     return streamTurn(c, {
       sessionId: session.id,
@@ -1168,6 +1310,20 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
       store.close();
     },
   };
+}
+
+/** A 413 for a body over its limit, worded like the API's other errors. */
+function tooLarge(message: string): (c: Context) => Response {
+  return (c) => c.json({ error: message }, 413);
+}
+
+/** The connection's own address; an in-process request (tests) has none. */
+function peerAddress(c: Context): string | undefined {
+  try {
+    return getConnInfo(c).remote.address?.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, "");
+  } catch {
+    return undefined;
+  }
 }
 
 /**

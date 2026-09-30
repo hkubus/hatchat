@@ -50,6 +50,11 @@ export interface ServerConfig {
   sessionTtlMs: number;
   /** Origins allowed to call the API from a browser (native shells). */
   corsOrigins: string[];
+  /**
+   * Addresses of reverse proxies whose `X-Forwarded-For` is believed. Anyone
+   * else could write that header, and claim a fresh address on every request.
+   */
+  trustedProxies: string[];
   /** SSE keepalive comment interval; 0 disables keepalives. */
   sseKeepaliveMs: number;
   /** Model used for background title generation (defaults to the session model). */
@@ -157,6 +162,7 @@ export function loadConfig(): ServerConfig {
     cookieSecure: envBool("HAT_COOKIE_SECURE", false),
     sessionTtlMs: envInt("HAT_SESSION_TTL_HOURS", 24) * 3_600_000,
     corsOrigins: envList("HAT_CORS_ORIGINS", DEFAULT_CORS_ORIGINS),
+    trustedProxies: envList("HAT_TRUSTED_PROXIES", []),
     sseKeepaliveMs: envInt("HAT_SSE_KEEPALIVE_MS", 1_000),
     titleModel: process.env.HAT_TITLE_MODEL || undefined,
     enableExternalPlugins: envBool("HAT_ENABLE_EXTERNAL_PLUGINS", true),

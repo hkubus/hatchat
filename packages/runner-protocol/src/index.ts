@@ -46,6 +46,16 @@ export const workspaceEnsureSchema = z.object({
   sessionId: z.string(),
 });
 
+/**
+ * The conversation was deleted: stop what still runs for it and delete its
+ * files. Nothing is sent back, and a runner that predates the message only
+ * logs that it could not read it.
+ */
+export const workspaceRemoveSchema = z.object({
+  t: z.literal("workspace.remove"),
+  sessionId: z.string().min(1),
+});
+
 export const execStartSchema = z.object({
   t: z.literal("exec.start"),
   jobId: z.string(),
@@ -132,6 +142,7 @@ export const netFetchSchema = z.object({
 export const serverToRunnerSchema = z.discriminatedUnion("t", [
   helloOkSchema,
   workspaceEnsureSchema,
+  workspaceRemoveSchema,
   execStartSchema,
   execStdinSchema,
   execCancelSchema,

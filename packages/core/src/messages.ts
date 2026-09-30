@@ -46,10 +46,12 @@ export interface MessageMeta {
    */
   finishReason?: FinishReason;
   /**
-   * A user message the app wrote on the user's behalf (the "Continue" nudge).
-   * Sent to the model like any other, but not shown as a chat bubble.
+   * A user message the app wrote on the user's behalf: the "Continue" nudge,
+   * or the "answer with what you have" one that closes a turn out of tool
+   * budget (never stored). Sent to the model like any other, but not shown as
+   * a chat bubble, and part of the exchange it follows.
    */
-  synthetic?: "continue";
+  synthetic?: "continue" | "close";
 }
 
 /**

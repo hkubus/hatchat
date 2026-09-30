@@ -8,3 +8,7 @@ dist/
 !.env.example
 .DS_Store
 coverage/
+# Claude Code agent worktrees are local checkouts, never content.
+.claude/worktrees/
+# Built by .github/workflows/ios-ipa.yml and uploaded as an artifact.
+*.ipa

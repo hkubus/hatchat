@@ -393,6 +393,21 @@ export function applyEffect(list: UiMessage[], effect: ChatEffect): UiMessage[] 
 }
 
 /**
+ * Apply a live effect to the stored messages shown above the in-flight ones.
+ * Only tool approvals and results can concern them: a client that attached
+ * to a turn already under way (a reload, switching back, another device) got
+ * the message that made the call with the stored history, since it was saved
+ * before the call ran, so the replayed approval request and the result belong
+ * to that copy. Applied only in flight, they were dropped, which left an
+ * approval with no buttons and the turn waiting on it. The list comes back
+ * unchanged when the call is not in it.
+ */
+export function applyStoredEffect(stored: UiMessage[], effect: ChatEffect): UiMessage[] {
+  if (effect.kind !== "tool-approval" && effect.kind !== "tool-result") return stored;
+  return applyEffect(stored, effect);
+}
+
+/**
  * How full the model's context window is, judged by the most recent model
  * call: its prompt plus its reply is what the next call starts from. Undefined
  * when the window is unknown or nothing has been reported yet.

@@ -40,6 +40,18 @@ test("text is extracted from a PDF", async () => {
   assert.match((result as { text: string }).text, /Hello PDF/);
 });
 
+test("a PDF uploaded as a Buffer is read, and the Buffer is left intact", async () => {
+  // The upload route hands over a Node Buffer, which pdf.js rejects outright.
+  const upload = Buffer.from(minimalPdf("Hello Buffer"));
+  const size = upload.length;
+  const result = await readUpload(upload, "application/pdf", "doc.pdf");
+  assert.equal(result.kind, "document", JSON.stringify(result));
+  assert.match((result as { text: string }).text, /Hello Buffer/);
+  // The same bytes are stored afterwards, so extraction must not consume them.
+  assert.equal(upload.length, size);
+  assert.equal(upload.subarray(0, 5).toString("latin1"), "%PDF-");
+});
+
 test("a corrupt PDF is rejected cleanly", async () => {
   const result = await readUpload(bytes("%PDF-1.4 garbage"), "application/pdf", "bad.pdf");
   assert.equal(result.kind, "rejected");

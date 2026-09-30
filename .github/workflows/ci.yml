@@ -12,6 +12,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only token: the job only checks out and tests the code.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

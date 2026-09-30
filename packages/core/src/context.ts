@@ -18,6 +18,20 @@ export interface ApprovalBroker {
 
 export interface SecretStore {
   get(key: string): Promise<string | undefined>;
+  /**
+   * A secret saved in hat itself, never one read from the process
+   * environment. Sandboxed plugins are only served these: the server's
+   * environment holds its own credentials, and whatever else the host set.
+   */
+  getStored?(key: string): Promise<string | undefined>;
+  /**
+   * Who a saved secret was saved for: a plugin id, `""` for no plugin in
+   * particular, `null` when it was saved before secrets recorded that, or
+   * `undefined` when it is not saved. A sandboxed plugin is served only its own.
+   */
+  ownerOf?(key: string): string | null | undefined;
+  /** Record whom a saved secret belongs to (a legacy one claimed by the only plugin that wants it). */
+  setOwner?(key: string, owner: string): void;
 }
 
 export interface AuditEntry {

@@ -67,6 +67,11 @@ export interface WorkspaceInfo {
 export interface ExecutionHost {
   readonly id: string;
   readonly capabilities: HostCapabilities;
+  /**
+   * True once the host can no longer run anything (its runner disconnected).
+   * Anything that keeps a host around must resolve a fresh one instead.
+   */
+  readonly closed?: boolean;
   ensureWorkspace(sessionId: string): Promise<WorkspaceInfo>;
   exec(req: ExecRequest, signal: AbortSignal): AsyncIterable<ExecEvent>;
   readonly fs: ScopedFs;

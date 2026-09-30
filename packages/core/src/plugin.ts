@@ -55,4 +55,10 @@ export interface Plugin {
   readonly configJsonSchema?: unknown;
   activate(ctx: PluginContext): void | Promise<void>;
   deactivate?(): void | Promise<void>;
+  /**
+   * A conversation was deleted: let go of whatever was kept for it (a
+   * background process, an interpreter, a browser page). Called on active
+   * plugins only.
+   */
+  sessionDeleted?(sessionId: string): void | Promise<void>;
 }

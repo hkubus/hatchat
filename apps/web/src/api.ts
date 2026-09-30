@@ -13,9 +13,21 @@ export class HttpError extends Error {
   constructor(
     readonly status: number,
     readonly url: string,
+    /** The server's own explanation (`{ error }` in the body), when it gave one. */
+    readonly reason?: string,
   ) {
-    super(`${url}: ${status}`);
+    super(reason ?? `${url}: ${status}`);
     this.name = "HttpError";
+  }
+}
+
+/** The `{ error }` message of a failed API response, if it carries one. */
+async function errorReason(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    return typeof body.error === "string" ? body.error : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -362,7 +374,8 @@ async function readSSE(
   res: Response,
   onEvent: (event: KernelEvent) => void,
 ): Promise<void> {
-  if (!res.ok || !res.body) throw new HttpError(res.status, res.url);
+  // A refused turn says why, e.g. that another reply is still running.
+  if (!res.ok || !res.body) throw new HttpError(res.status, res.url, await errorReason(res));
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

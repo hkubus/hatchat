@@ -153,6 +153,9 @@ interface SessionRow {
 }
 
 /** Attachment columns minus the (possibly large) extracted text. */
+/** How long an upload is kept for a draft that may still send it. */
+export const ATTACHMENT_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
+
 const ATTACHMENT_COLUMNS =
   "id, sha256, mime, size, width, height, name, (text IS NOT NULL) AS has_text, created_at";
 
@@ -210,7 +213,14 @@ export class Store implements SecretStore {
       }
     }
     // Documents the user attaches keep their original name and extracted text.
-    for (const column of ["name TEXT", "text TEXT"]) {
+    // Whom a secret was saved for; NULL on secrets saved before this existed.
+    try {
+      this.db.exec(`ALTER TABLE secrets ADD COLUMN owner TEXT`);
+    } catch {
+      /* column already exists */
+    }
+    // `last_put_at`: the last time these bytes were uploaded, a dedupe hit included.
+    for (const column of ["name TEXT", "text TEXT", "last_put_at INTEGER"]) {
       try {
         this.db.exec(`ALTER TABLE attachments ADD COLUMN ${column}`);
       } catch {
@@ -334,6 +344,52 @@ export class Store implements SecretStore {
       )
       .run(title, sessionId);
     return result.changes > 0;
+  }
+
+  /** The attachments this session's messages refer to: images, documents, artifacts. */
+  attachmentIdsOf(sessionId: string): string[] {
+    const rows = this.db
+      .prepare(`SELECT parts FROM messages WHERE session_id = ?`)
+      .all(sessionId) as Array<{ parts: string }>;
+    const ids = new Set<string>();
+    const collect = (part: Part): void => {
+      if (part.type === "image" && part.source.kind === "attachment") ids.add(part.source.id);
+      else if (part.type === "file") ids.add(part.id);
+      else if (part.type === "tool_result") part.content.forEach(collect);
+    };
+    for (const row of rows) {
+      for (const part of JSON.parse(row.parts) as Part[]) collect(part);
+    }
+    return [...ids];
+  }
+
+  /**
+   * Delete the attachments among `ids` that no message refers to any more,
+   * row (with its extracted text) and bytes. The same bytes uploaded twice are
+   * one attachment, so one another conversation still uses stays.
+   *
+   * An upload is not a message yet: another conversation may hold the same
+   * bytes in its composer, unsent. So an attachment uploaded (or re-uploaded,
+   * which dedupes to the same id) at or after `olderThan` — by default a day
+   * ago — stays too.
+   */
+  async pruneAttachments(
+    ids: readonly string[],
+    { olderThan = Date.now() - ATTACHMENT_UPLOAD_GRACE_MS }: { olderThan?: number } = {},
+  ): Promise<string[]> {
+    const removed: string[] = [];
+    for (const id of ids) {
+      const used = this.db.prepare(`SELECT 1 FROM messages WHERE instr(parts, ?) > 0 LIMIT 1`).get(id);
+      if (used) continue;
+      const row = this.db
+        .prepare(`SELECT sha256, COALESCE(last_put_at, created_at) AS put_at FROM attachments WHERE id = ?`)
+        .get(id) as { sha256: string; put_at: number } | undefined;
+      if (!row || row.put_at >= olderThan) continue;
+      this.db.prepare(`DELETE FROM attachments WHERE id = ?`).run(id);
+      await this.artifacts?.delete(row.sha256);
+      removed.push(id);
+    }
+    return removed;
   }
 
   deleteSession(sessionId: string): boolean {
@@ -548,8 +604,10 @@ export class Store implements SecretStore {
 
   /**
    * Append a message as a child of `parentId` (defaults to the session's active
-   * leaf) and move the active leaf to it. Atomic: the insert + leaf move
-   * commit together so a crash can't orphan a message.
+   * leaf). The active leaf moves to it only while it still points at that
+   * parent: a turn writing its own branch must not drag the conversation back
+   * to it after the user switched to another one. Atomic: the insert + leaf
+   * move commit together so a crash can't orphan a message.
    */
   appendMessage(sessionId: string, message: ChatMessage, parentId?: string | null): void {
     const session = this.getSession(sessionId);
@@ -561,7 +619,10 @@ export class Store implements SecretStore {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     const touch = this.db.prepare(
-      `UPDATE sessions SET active_leaf_id = ?, updated_at = ?, title = ? WHERE id = ?`,
+      `UPDATE sessions
+          SET active_leaf_id = CASE WHEN active_leaf_id IS ? THEN ? ELSE active_leaf_id END,
+              updated_at = ?, title = ?
+        WHERE id = ?`,
     );
     const title = deriveTitle(session, message);
     // node:sqlite is sync; a simple exec transaction is enough.
@@ -576,7 +637,7 @@ export class Store implements SecretStore {
         message.meta ? JSON.stringify(message.meta) : null,
         message.createdAt || now,
       );
-      touch.run(message.id, now, title, sessionId);
+      touch.run(parent, message.id, now, title, sessionId);
       // The synthetic "Continue" nudge is hidden in every client, so it must
       // not turn up as a search hit either.
       const searchable =
@@ -738,24 +799,35 @@ export class Store implements SecretStore {
 
   // ---- secrets ------------------------------------------------------------
 
-  setSecret(name: string, value: string): void {
+  /**
+   * Save a secret. `owner` is the plugin it is for, which alone (of the
+   * sandboxed plugins) may read it. Without one, a new secret belongs to no
+   * plugin, and a new value for an existing secret keeps its owner.
+   */
+  setSecret(name: string, value: string, owner?: string): void {
     const record = encryptSecret(value, this.masterKey);
     this.db
       .prepare(
-        `INSERT INTO secrets (name, ciphertext, iv, tag, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET ciphertext = excluded.ciphertext, iv = excluded.iv, tag = excluded.tag, updated_at = excluded.updated_at`,
+        `INSERT INTO secrets (name, ciphertext, iv, tag, updated_at, owner) VALUES (?, ?, ?, ?, ?, COALESCE(?, ''))
+         ON CONFLICT(name) DO UPDATE SET ciphertext = excluded.ciphertext, iv = excluded.iv, tag = excluded.tag,
+           updated_at = excluded.updated_at, owner = COALESCE(?, secrets.owner, '')`,
       )
-      .run(name, record.ciphertext, record.iv, record.tag, Date.now());
+      .run(name, record.ciphertext, record.iv, record.tag, Date.now(), owner ?? null, owner ?? null);
+  }
+
+  ownerOf(name: string): string | null | undefined {
+    const row = this.db.prepare(`SELECT owner FROM secrets WHERE name = ?`).get(name) as
+      | { owner: string | null }
+      | undefined;
+    return row ? row.owner : undefined;
+  }
+
+  setOwner(name: string, owner: string): void {
+    this.db.prepare(`UPDATE secrets SET owner = ? WHERE name = ?`).run(owner, name);
   }
 
   async getSecret(name: string): Promise<string | undefined> {
-    const row = this.db
-      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
-      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
-    if (row) {
-      return decryptSecret(row, this.masterKey);
-    }
-    return process.env[name];
+    return (await this.getStored(name)) ?? process.env[name];
   }
 
   /** SecretStore contract: DB first, then process env. */
@@ -763,11 +835,40 @@ export class Store implements SecretStore {
     return this.getSecret(name);
   }
 
+  /** SecretStore contract: the DB only, never the process env. */
+  async getStored(name: string): Promise<string | undefined> {
+    return this.readSecret(name);
+  }
+
   hasSecret(name: string): boolean {
+    return this.readSecret(name) !== undefined || Boolean(process.env[name]);
+  }
+
+  /**
+   * Saved secrets the current master key can't decrypt: they were saved under
+   * another one (`HAT_MASTER_KEY` changed, or the key file was lost and a new
+   * one generated). They read as unset until they are saved again.
+   */
+  unreadableSecrets(): string[] {
+    const rows = this.db.prepare(`SELECT name FROM secrets ORDER BY name ASC`).all() as Array<{ name: string }>;
+    return rows.map((row) => row.name).filter((name) => this.readSecret(name) === undefined);
+  }
+
+  /**
+   * A saved secret, decrypted. One the master key can't decrypt reads as
+   * unset, so whatever needs it asks for it again, rather than the error
+   * stopping every plugin from loading and the server from starting.
+   */
+  private readSecret(name: string): string | undefined {
     const row = this.db
-      .prepare(`SELECT 1 AS present FROM secrets WHERE name = ?`)
-      .get(name) as { present: number } | undefined;
-    return Boolean(row) || Boolean(process.env[name]);
+      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
+      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
+    if (!row) return undefined;
+    try {
+      return decryptSecret(row, this.masterKey);
+    } catch {
+      return undefined;
+    }
   }
 
   listSecretNames(): string[] {
@@ -796,6 +897,8 @@ export class Store implements SecretStore {
     const sha256 = createHash("sha256").update(data).digest("hex");
     const existing = this.getAttachmentByHash(sha256);
     if (existing) {
+      // Someone holds this id again, maybe in a draft no message shows yet.
+      this.db.prepare(`UPDATE attachments SET last_put_at = ? WHERE id = ?`).run(Date.now(), existing.id);
       // The same bytes uploaded before as something else (or before text
       // extraction existed) pick up the text now.
       if (document?.text !== undefined && !existing.hasText) {
@@ -808,6 +911,7 @@ export class Store implements SecretStore {
     }
 
     const id = newId("att");
+    const now = Date.now();
     const size = data.length;
     const dimensions = imageSize(data);
     if (this.artifacts) {
@@ -815,8 +919,8 @@ export class Store implements SecretStore {
     }
     this.db
       .prepare(
-        `INSERT INTO attachments (id, sha256, mime, size, width, height, name, text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO attachments (id, sha256, mime, size, width, height, name, text, created_at, last_put_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -827,7 +931,8 @@ export class Store implements SecretStore {
         dimensions?.height ?? null,
         document?.name ?? null,
         document?.text ?? null,
-        Date.now(),
+        now,
+        now,
       );
 
     return this.getAttachment(id)!;

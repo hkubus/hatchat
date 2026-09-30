@@ -78,7 +78,10 @@ the API is open (dev only).
   expiry) plus a readable `hat_csrf` cookie.
 - Mutating requests authenticated by cookie must send `x-csrf-token` matching
   the cookie (double-submit); bearer-token requests are exempt.
-- Login is **rate-limited** (10 attempts / 15 min per IP).
+- Login is **rate-limited** (10 attempts / 15 min per client address). The
+  address is the connection's own: `X-Forwarded-For` is believed only from the
+  proxies listed in `HAT_TRUSTED_PROXIES`, since anyone can send it. Behind a
+  reverse proxy, list its address there, or every client shares one limit.
 - `HAT_AUTH_TOKEN` still works as a bearer credential for automation (curl,
   scripts) and bypasses CSRF.
 - `HAT_COOKIE_SECURE=true` when serving over HTTPS. The web UI shows a login
@@ -153,6 +156,13 @@ too (with an image that has what they need). An explicit
 `HAT_SANDBOX_PROCESSES=host` opts them out. stdio MCP servers always run on the
 host.
 
+The file tools (`read_file`, `write_file`, `list_dir`, ...) are not sandboxed
+commands: the runner performs them itself, on its host. They resolve symlinks
+and refuse any path that ends up outside the session workspace, so a link left
+there by a command, a cloned repo or an unpacked archive can't lead them
+elsewhere on the machine. Dangling links and special files (FIFOs, devices) are
+refused too.
+
 ## MCP (M5)
 
 The `mcp` plugin connects to Model Context Protocol servers and exposes their
@@ -186,6 +196,11 @@ Configure it in **Settings → Plugins → MCP servers** with a JSON array:
 - `notifications/tools/list_changed` is wired; server→client requests we don't
   implement (sampling, elicitation) are declined with a JSON-RPC error, which
   servers handle gracefully.
+- Nothing waits on a server forever: requests time out (a minute; ten for a tool
+  call, since some do real work), Stop cancels a running call and sends the
+  server `notifications/cancelled`, and an HTTP error or a response that never
+  answers fails the request. `tools/list` follows `nextCursor`, and tool names
+  that sanitize alike (`get-item`, `get_item`) get a short hash to stay distinct.
 
 `scripts/fake-mcp-server.mjs` is a minimal stdio server used by the smoke test.
 
@@ -258,6 +273,28 @@ max 20) and `requireApproval` gates each search (off by default — searches are
 read-only). The search request is made by the **server process** directly, like
 provider calls, so no key or query crosses the runner link.
 
+## Ceneo (price checks)
+
+The `ceneo` plugin checks prices of **new** products on
+[Ceneo.pl](https://www.ceneo.pl), the Polish price comparison site. It is
+keyless and on by default:
+
+- `ceneo_search` — products matching a query with their lowest price (PLN),
+  shop count, rating and key specs; optional `min_price` / `max_price` filters.
+- `ceneo_product` — the shop offers for one product (id from the search, or a
+  ceneo.pl URL), cheapest first, with shop rating and delivery. Ceneo renders
+  only the first ~15 offers server-side, so the tool says when the list is
+  partial.
+
+While the plugin is active, the system prompt tells the model to use Ceneo
+for the price of anything bought new. When a Scout MCP server is connected
+(`mcp__scout__*` tools), it also says to keep Scout for second-hand listings or
+products Ceneo doesn't carry. Like web search, requests go from the server
+process and parse Ceneo's HTML, so markup changes can degrade results. Each
+request has its own 20 s timeout and a 5 MB size cap, and redirects are only
+followed within ceneo.pl. `maxResults` sets the default number of products and offers
+(max 30).
+
 ## System prompt
 
 Every turn is prefixed with a base system prompt that is never stored in
@@ -280,10 +317,15 @@ Every turn replays the active branch, so a long conversation — or a few large
 tool outputs — would eventually overflow the model and fail. Before each model
 call the kernel (`packages/kernel/src/context.ts`) estimates the request and,
 when it would not fit the model's window (minus room for the reply), first
-replaces **old tool outputs** with a short placeholder (the newest tool result
-is never touched), then leaves out the **oldest exchanges**, adding a note
-that it did. Only the request is trimmed: stored history is unchanged, and a
-model with a larger window sees everything again.
+replaces **old tool outputs** with a short placeholder (the latest round of
+results, parallel calls included, is never touched), then leaves out the
+**oldest exchanges**, adding a note that it did. A Continue, or the closing
+"answer now" nudge, counts as part of the exchange before it, so the reply it
+refers to is never the part left out. Only the request is trimmed: stored
+history is unchanged, and a model with a larger window sees everything again.
+
+The estimate counts about 3.5 characters a token, one a character for Chinese,
+Japanese and Korean, and nothing for stored reasoning, which is never sent back.
 
 Cuts are made in pages of a quarter of the budget, so the start of the request
 stays byte-identical across turns until the conversation has grown by another
@@ -315,6 +357,17 @@ Config (Settings → Plugins → Browser): `executablePath` (or `HAT_BROWSER_PAT
 and `requireApproval` (override; default asks only for click/type/press). A
 Chromium build is required: the plugin uses the Playwright browser cache by
 default, or point `executablePath` at any Chromium/Chrome binary.
+
+**Private networks.** The browser runs in the server's network and `web_fetch`
+in the runner's, and both go where a model points them, so neither may reach a
+private address: loopback, the private ranges, link-local (cloud metadata),
+carrier-grade NAT (Tailscale), IPv6 unique-local. Host names are resolved and
+every address checked, and so is each redirect hop. The browser goes through a
+small filtering proxy that connects only to the address it checked, so a page's
+redirects, links, subresources and WebSockets are covered too. To let them
+reach your own services, list the host names in `HAT_ALLOW_PRIVATE_HOSTS`
+(comma-separated, `*.lan` for a whole domain) on the server (browser) and the
+runner (`web_fetch`).
 
 ## Vision + attachments (M4)
 
@@ -424,8 +477,22 @@ Schema.
   workers or load native addons. On older Node the child still runs in its own
   process with a scrubbed env, but without the filesystem sandbox (a warning is
   logged).
-- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`.
-  Anything else is refused.
+- **Secrets**: `ctx.secrets.get` serves only the names in `requiresSecrets`,
+  and only secrets saved in hat *for that plugin*, never the server's
+  environment. A plugin names its own secrets, so the name proves nothing:
+  hat's (`HAT_*`) and those of the built-in plugins (`OPENROUTER_API_KEY`, ...)
+  can't be declared, and a secret saved for another plugin, or for none, is
+  not served (the plugin is refused before it starts). Save one for a plugin
+  with its id:
+
+  ```sh
+  curl -X POST localhost:8787/api/secrets -H 'content-type: application/json' \
+    -d '{"name":"WEATHER_API_KEY","value":"...","plugin":"weather"}'
+  ```
+
+  A secret saved before secrets recorded their plugin goes to the one
+  installed plugin that declares its name, and is that plugin's from then on;
+  if several declare it, save it again with `plugin`.
 - **Tool context**: `sessionId`, `callId`, `signal`, `logger` and `secrets`.
   `ctx.host` forwards to the call's execution host, stays pinned to that session,
   and works only while the call runs. Each part needs its declared permission:
@@ -466,6 +533,15 @@ tree with settings and attachments inline, and `POST /api/sessions/import`
 recreates it as a new conversation (fresh ids, attachments re-stored). Both are
 in the chat header's download menu; import is in the sidebar.
 
+**Deleting** a conversation takes what it left behind with it: a reply still
+running is stopped, plugins let go of what they kept for it (background
+processes, the Python interpreter, a browser page), each connected runner stops
+its jobs and deletes its workspace, and attachments no other conversation uses
+are deleted, bytes included. Uploads are shared by content, so one uploaded
+(by any conversation) in the last day is kept: another composer may be about
+to send the same file. A runner that is offline at the time keeps its copy of
+the workspace.
+
 **Notifications.** The web app can notify you (Settings → Preferences, opt-in)
 when a reply is ready or a conversation needs you while the tab is in the
 background. Reaching a closed tab or a suspended phone would need server push,
@@ -484,7 +560,16 @@ again reattaches to the live turn (`GET /api/sessions/:id/stream`, which
 replays the pending tail and then follows). The send button's **Stop** (or
 `Esc`) is a separate, explicit
 `POST /api/sessions/:id/turn/cancel` that really aborts the turn, so a runaway
-generation or a hung tool stops promptly instead of only being hidden.
+generation or a hung tool stops promptly instead of only being hidden. A tool
+that ignores the cancel is abandoned after a few seconds.
+
+**One turn per conversation.** While a reply is running, starting another in
+the same conversation (send, continue, regenerate or edit, from another tab or
+device) is refused with `409` until it is stopped: two turns writing at once
+would interleave their messages into a history providers reject. A turn that
+was just stopped gets a few seconds to store its last messages before the new
+one starts. Each turn stores its messages as its own chain, so switching
+branches while it runs leaves its reply under its own question.
 
 The view only follows the stream while you are already at the bottom — scroll
 up to read back without being yanked down on every delta.
@@ -598,6 +683,21 @@ web build on every push to `main` and every pull request.
 HAT_ENROLL_TOKEN=$(openssl rand -hex 16) HAT_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
 ```
 
+Compose refuses to start without both tokens: the server's port is published,
+so an empty `HAT_AUTH_TOKEN` would leave the API — and the runner's shell — open
+to anyone who can reach it. Keep them in a `.env` file next to
+`docker-compose.yml` (compose reads it) so later commands see the same values.
+
+The server keeps conversations, uploads and the master key that encrypts saved
+secrets in the `server-data` volume, so they survive rebuilds; back it up. Both
+images install from the lockfile and run as the unprivileged `node` user.
+
+Upgrading from an image that ran the runner as root: its `runner-workspaces`
+volume is root-owned. The runner's entrypoint starts as root just long enough
+to hand that directory to `node`, then drops privileges before the runner
+starts, so no manual step is needed. If you start the runner with `--user`, it
+cannot do that; it exits with a message naming the directory to `chown`.
+
 The runner publishes **no ports** — it dials out to `server:8787/link`.
 
 ## The execution link
@@ -607,6 +707,9 @@ The runner publishes **no ports** — it dials out to `server:8787/link`.
 - Server sends `workspace.ensure`, `exec.start|stdin|cancel`, `fs.*`, `net.fetch`
   with correlation ids; runner streams `exec.stdout|stderr|exit` and `*.result`.
 - Jobs are killed on cancel, timeout, or output-cap breach (process tree).
+- The server pings each runner every 15s and drops one that stops answering
+  (a machine that vanished without closing its socket), and a request its
+  runner never answers fails after 2 minutes: neither leaves a turn waiting.
 - The runner holds no provider keys, database, or auth state. Secrets and
   approval live only on the server and never cross the link.
 

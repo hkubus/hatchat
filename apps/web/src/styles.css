@@ -3019,3 +3019,23 @@ p.mcp-errors {
 .chat-settings-field textarea:focus {
   border-color: var(--fg-dim);
 }
+
+/* A web image in a reply, waiting to be asked for (see RemoteImage). */
+.remote-image {
+  display: inline-block;
+  margin: 4px 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  background: var(--surface-2);
+  border: 1px dashed var(--border-3);
+  color: var(--fg-muted);
+  border-radius: 8px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-image:hover {
+  color: var(--fg);
+}

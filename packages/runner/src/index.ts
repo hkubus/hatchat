@@ -9,6 +9,7 @@ import WebSocket from "ws";
 import { detectCapabilities } from "./capabilities.js";
 import { loadConfig, type RunnerConfig } from "./config.js";
 import { startJob, type JobHandle } from "./exec.js";
+import { runFetch } from "./fetch.js";
 import { startProcess, type ProcessHandle } from "./processes.js";
 import { resolveSandbox, type SandboxConfig } from "./sandbox.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -34,6 +35,8 @@ class Runner {
   private readonly workspace: WorkspaceManager;
   private readonly jobs = new Map<string, JobHandle>();
   private readonly processes = new Map<string, ProcessHandle>();
+  /** The session each running job or process belongs to, by job/process id. */
+  private readonly owners = new Map<string, string>();
   private readonly pending = new Map<string, PendingRequest>();
   private stopped = false;
   private readonly startedAt = Date.now();
@@ -129,6 +132,9 @@ class Runner {
       case "workspace.ensure":
         void this.handleEnsure(message.reqId, message.sessionId);
         break;
+      case "workspace.remove":
+        void this.removeSession(message.sessionId);
+        break;
       case "exec.start":
         void this.handleExec(message);
         break;
@@ -201,6 +207,8 @@ class Runner {
       this.config.maxTimeoutMs,
     );
 
+    // Recorded first: a job that ends at once clears it again on its way out.
+    this.owners.set(message.jobId, message.sessionId);
     const handle = startJob(
       {
         jobId: message.jobId,
@@ -213,7 +221,10 @@ class Runner {
       },
       this.sandbox,
       (out) => this.send(out),
-      (jobId) => this.jobs.delete(jobId),
+      (jobId) => {
+        this.jobs.delete(jobId);
+        this.owners.delete(jobId);
+      },
     );
     this.jobs.set(message.jobId, handle);
   }
@@ -230,6 +241,7 @@ class Runner {
       return;
     }
 
+    if (message.sessionId) this.owners.set(message.procId, message.sessionId);
     const handle = startProcess(
       {
         procId: message.procId,
@@ -240,10 +252,35 @@ class Runner {
         shell: message.shell ? this.processSandbox : undefined,
       },
       (out) => this.send(out),
-      (procId) => this.processes.delete(procId),
+      (procId) => {
+        this.processes.delete(procId);
+        this.owners.delete(procId);
+      },
     );
     // Register synchronously so the immediately-following proc.stdin isn't lost.
     this.processes.set(message.procId, handle);
+  }
+
+  /**
+   * A deleted conversation: stop the jobs and processes still running for it,
+   * then delete its workspace. Best effort; nothing is sent back.
+   */
+  private async removeSession(sessionId: string): Promise<void> {
+    const stopping: Array<Promise<void>> = [];
+    for (const [id, owner] of this.owners) {
+      if (owner !== sessionId) continue;
+      const job = this.jobs.get(id);
+      if (job) stopping.push(job.abort());
+      const process = this.processes.get(id);
+      if (process) stopping.push(process.kill());
+    }
+    await Promise.allSettled(stopping);
+    try {
+      await this.workspace.remove(sessionId);
+      log(`removed the workspace of deleted session ${sessionId}`);
+    } catch (error) {
+      log(`could not remove the workspace of deleted session ${sessionId}`, String(error));
+    }
   }
 
   private async handle(
@@ -275,63 +312,6 @@ class Runner {
     for (const [, pending] of this.pending) pending.reject(new Error(reason));
     this.pending.clear();
     this.jobs.clear();
-  }
-}
-
-async function runFetch(
-  url: string,
-  method: string | undefined,
-  headers: Record<string, string> | undefined,
-  body: string | undefined,
-): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`fetch blocked: invalid URL`);
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`fetch blocked: only http(s) allowed`);
-  }
-  const host = parsed.hostname.toLowerCase();
-  // Basic SSRF guard: block metadata + loopback + private literals.
-  // (DNS-rebinding needs a resolving guard; this stops the cheap escapes.)
-  if (
-    host === "localhost" ||
-    host === "metadata.google.internal" ||
-    host.endsWith(".internal") ||
-    host === "169.254.169.254" ||
-    host === "213.0.0.0" ||
-    host.startsWith("10.") ||
-    host.startsWith("192.168.") ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    host === "[::1]" ||
-    host === "::1" ||
-    host.startsWith("fc") ||
-    host.startsWith("fd")
-  ) {
-    throw new Error(`fetch blocked: private/metadata host (${host})`);
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await fetch(url, {
-      method: method ?? "GET",
-      headers,
-      body,
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    const text = await response.text();
-    // 2MB cap to avoid blowing the link / memory on huge pages.
-    const capped = text.length > 2_000_000 ? text.slice(0, 2_000_000) : text;
-    const responseHeaders: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      responseHeaders[key] = value;
-    });
-    return { status: response.status, headers: responseHeaders, body: capped };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

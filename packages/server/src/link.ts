@@ -27,6 +27,16 @@ interface PendingRpc {
   reject: (error: unknown) => void;
 }
 
+export interface LinkTimings {
+  /** How long a request may wait for its answer before it fails. */
+  rpcTimeoutMs?: number;
+  /** How often each runner is pinged; one that misses a ping is dropped. */
+  pingIntervalMs?: number;
+}
+
+const DEFAULT_RPC_TIMEOUT_MS = 120_000;
+const DEFAULT_PING_INTERVAL_MS = 15_000;
+
 export interface RunnerRequirements {
   tags?: string[];
   os?: string;
@@ -73,18 +83,29 @@ export class RunnerConnection implements RunnerChannel {
   private readonly pending = new Map<string, PendingRpc>();
   private readonly jobs = new Map<string, AsyncQueue<ExecEvent>>();
   private readonly procs = new Map<string, AsyncQueue<ExecEvent>>();
-  private closed = false;
+  /** Why the link went away; set once by `fail`. */
+  private closedReason: string | undefined;
 
   constructor(
     private readonly ws: WebSocket,
     readonly id: string,
     readonly capabilities: HostCapabilities,
     private readonly log: Logger,
+    private readonly rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   ) {}
 
   /** In-flight work on this runner (jobs + long-lived processes). */
   get load(): number {
     return this.jobs.size + this.procs.size;
+  }
+
+  /**
+   * True once the link is gone. Nothing sent on it would ever be answered, so
+   * new requests fail straight away, and whoever still holds this connection
+   * (a cached execution host) knows to acquire a runner again.
+   */
+  get closed(): boolean {
+    return this.closedReason !== undefined;
   }
 
   handleMessage(message: RunnerToServer): void {
@@ -170,16 +191,26 @@ export class RunnerConnection implements RunnerChannel {
     return this.rpc<WorkspaceInfo>((reqId) => ({ t: "workspace.ensure", reqId, sessionId }));
   }
 
+  /** The conversation was deleted: the runner stops its work and deletes its files. */
+  removeWorkspace(sessionId: string): void {
+    this.send({ t: "workspace.remove", sessionId });
+  }
+
   exec(sessionId: string, req: ExecRequest, signal: AbortSignal): AsyncIterable<ExecEvent> {
     const jobId = newId("job");
     const queue = new AsyncQueue<ExecEvent>();
+    // A closed link would swallow the job, and a cancel sent ahead of the start
+    // is ignored by the runner, which would then run the command anyway.
+    if (this.closedReason !== undefined || signal.aborted) {
+      queue.fail(new Error(this.closedReason ?? "cancelled"));
+      return queue;
+    }
     this.jobs.set(jobId, queue);
 
     const onAbort = (): void => {
       if (!this.closed) this.send({ t: "exec.cancel", jobId });
     };
-    if (signal.aborted) onAbort();
-    else signal.addEventListener("abort", onAbort, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
 
     this.send({
       t: "exec.start",
@@ -216,6 +247,7 @@ export class RunnerConnection implements RunnerChannel {
   }
 
   spawn(request: SpawnRequest): Promise<SpawnedProcess> {
+    if (this.closedReason !== undefined) return Promise.reject(new Error(this.closedReason));
     const procId = newId("proc");
     const queue = new AsyncQueue<ExecEvent>();
     this.procs.set(procId, queue);
@@ -267,7 +299,7 @@ export class RunnerConnection implements RunnerChannel {
 
   fail(reason: string): void {
     if (this.closed) return;
-    this.closed = true;
+    this.closedReason = reason;
     for (const queue of this.jobs.values()) queue.fail(new Error(reason));
     this.jobs.clear();
     for (const queue of this.procs.values()) queue.fail(new Error(reason));
@@ -285,11 +317,24 @@ export class RunnerConnection implements RunnerChannel {
   }
 
   private rpc<T>(build: (reqId: string) => ServerToRunner): Promise<T> {
+    if (this.closedReason !== undefined) return Promise.reject(new Error(this.closedReason));
     const reqId = newId("req");
     return new Promise<T>((resolve, reject) => {
+      // A runner that is connected but stuck (a file read on a stalled disk)
+      // would otherwise leave the tool call, and its turn, waiting forever.
+      const timer = setTimeout(() => {
+        this.reject(reqId, new Error(`runner ${this.id} did not answer within ${Math.round(this.rpcTimeoutMs / 1000)}s`));
+      }, this.rpcTimeoutMs);
+      timer.unref?.();
       this.pending.set(reqId, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value as T);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
       });
       this.send(build(reqId));
     });
@@ -325,6 +370,7 @@ export class RunnerRegistry {
      * the next restart.
      */
     private readonly onAvailabilityChange?: (available: boolean) => void,
+    private readonly timings: LinkTimings = {},
   ) {}
 
   attach(server: Server): void {
@@ -336,6 +382,11 @@ export class RunnerRegistry {
 
   list(): RunnerConnection[] {
     return [...this.runners.values()];
+  }
+
+  /** The live connection of a runner, if it is connected. */
+  get(id: string): RunnerConnection | undefined {
+    return this.runners.get(id);
   }
 
   /** Total in-flight jobs + processes across all runners. */
@@ -408,13 +459,33 @@ export class RunnerRegistry {
         previous?.close();
         previous?.fail("superseded by a newer connection");
 
-        connection = new RunnerConnection(ws, id, message.caps, this.log);
+        connection = new RunnerConnection(ws, id, message.caps, this.log, this.timings.rpcTimeoutMs);
         this.runners.set(id, connection);
         ws.send(encodeLinkMessage({ t: "hello.ok", runnerId: id }));
         this.log.info(`runner connected: ${id} (${message.caps.os}/${message.caps.arch}) tags=${message.caps.tags.join(",")}`);
         if (wasEmpty) this.onAvailabilityChange?.(true);
 
+        // A runner that vanished without closing its socket (power loss, a
+        // network partition) would keep its requests waiting until TCP gives
+        // up, which can take hours. The runner's socket answers pings on its
+        // own; one that misses a ping is dropped, and its requests fail.
+        let answered = true;
+        ws.on("pong", () => {
+          answered = true;
+        });
+        const ping = setInterval(() => {
+          if (!answered) {
+            this.log.warn(`runner ${id} stopped answering; dropping it`);
+            ws.terminate();
+            return;
+          }
+          answered = false;
+          ws.ping();
+        }, this.timings.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS);
+        ping.unref?.();
+
         ws.on("close", () => {
+          clearInterval(ping);
           if (this.runners.get(id) !== connection) return;
           this.runners.delete(id);
           connection?.fail("link closed");

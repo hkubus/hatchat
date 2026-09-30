@@ -10,6 +10,8 @@ export interface ArtifactStore {
   readonly kind: "local" | "s3";
   put(key: string, data: Buffer, contentType: string): Promise<void>;
   get(key: string): Promise<Buffer | undefined>;
+  /** Remove a blob; one that is already gone is not an error. */
+  delete(key: string): Promise<void>;
   /** A durable URL for the browser, or undefined to serve via the API by id. */
   url(key: string): Promise<string | undefined>;
 }
@@ -38,6 +40,11 @@ export class LocalArtifactStore implements ArtifactStore {
     assertKey(key);
     const file = path.join(this.dir, key);
     return fs.existsSync(file) ? fs.readFileSync(file) : undefined;
+  }
+
+  async delete(key: string): Promise<void> {
+    assertKey(key);
+    fs.rmSync(path.join(this.dir, key), { force: true });
   }
 
   async url(_key: string): Promise<string | undefined> {
@@ -122,6 +129,25 @@ export class S3ArtifactStore implements ArtifactStore {
       throw new Error(`S3 get failed: ${response.status}`);
     }
     return Buffer.from(await response.arrayBuffer());
+  }
+
+  async delete(key: string): Promise<void> {
+    const { url, headers } = signRequest({
+      method: "DELETE",
+      endpoint: this.endpoint,
+      bucket: this.options.bucket,
+      key: this.objectKey(key),
+      pathStyle: this.pathStyle,
+      accessKeyId: this.options.accessKeyId,
+      secretAccessKey: this.options.secretAccessKey,
+      sessionToken: this.options.sessionToken,
+      region: this.options.region,
+    });
+    const response = await this.fetchImpl(url, { method: "DELETE", headers });
+    // S3 answers 204 whether or not the object existed.
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`S3 delete failed: ${response.status}`);
+    }
   }
 
   async url(key: string): Promise<string | undefined> {

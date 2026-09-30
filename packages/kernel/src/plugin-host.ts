@@ -56,6 +56,8 @@ export class PluginHost {
   private readonly states = new Map<string, PluginState>();
   private readonly contributions = new Map<string, Contribution>();
   private readonly statuses = new Map<string, { status: PluginStatus; error?: string }>();
+  /** Lifecycle work queued per plugin (see `serial`). */
+  private readonly queues = new Map<string, Promise<void>>();
 
   constructor(private readonly deps: PluginHostDeps) {}
 
@@ -80,14 +82,66 @@ export class PluginHost {
   /** Re-activate every plugin; used after secrets or config change. */
   async reload(): Promise<void> {
     for (const id of this.plugins.keys()) {
-      await this.deactivate(id);
-      await this.activate(id);
+      await this.restart(id);
     }
   }
 
-  async activate(id: string): Promise<void> {
+  /**
+   * Tell every running plugin a conversation is gone, so it can let go of
+   * what it kept for it. One that fails at it is logged, not fatal.
+   */
+  async sessionDeleted(sessionId: string): Promise<void> {
+    for (const [id, entry] of this.plugins) {
+      if (!this.contributions.has(id)) continue;
+      try {
+        await entry.plugin.sessionDeleted?.(sessionId);
+      } catch (error) {
+        this.deps.logger.warn(`plugin ${id} could not clean up after a deleted conversation`, String(error));
+      }
+    }
+  }
+
+  /** Start a plugin; one already running is stopped first. */
+  activate(id: string): Promise<void> {
+    return this.serial(id, () => this.start(id));
+  }
+
+  deactivate(id: string): Promise<void> {
+    return this.serial(id, () => this.stop(id));
+  }
+
+  /** Stop a plugin and start it again, with nothing else for it in between. */
+  restart(id: string): Promise<void> {
+    return this.serial(id, async () => {
+      await this.stop(id);
+      await this.start(id);
+    });
+  }
+
+  /**
+   * Run lifecycle work for one plugin after whatever is already queued for it.
+   * Enabling, configuring, reloading after a secret changes and runner
+   * arrivals come from separate requests; interleaved, one activation could
+   * start while another was still running and leave behind a process or a
+   * connection that nothing would ever close.
+   */
+  private serial(id: string, work: () => Promise<void>): Promise<void> {
+    const queued = this.queues.get(id) ?? Promise.resolve();
+    const next = queued.then(work, work);
+    const settled = next.catch(() => {});
+    this.queues.set(id, settled);
+    void settled.then(() => {
+      if (this.queues.get(id) === settled) this.queues.delete(id);
+    });
+    return next;
+  }
+
+  private async start(id: string): Promise<void> {
     const entry = this.plugins.get(id);
     if (!entry) return;
+    // Never two activations of one plugin: the first one's processes and
+    // connections would be left running with nothing to close them.
+    if (this.contributions.has(id)) await this.stop(id);
     const plugin = entry.plugin;
     const state = this.states.get(id) ?? { enabled: true, config: {} };
 
@@ -97,8 +151,14 @@ export class PluginHost {
     }
 
     const missing: string[] = [];
-    for (const name of plugin.requiresSecrets ?? []) {
-      if (!(await this.deps.secrets.get(name))) missing.push(name);
+    try {
+      for (const name of plugin.requiresSecrets ?? []) {
+        if (!(await this.deps.secrets.get(name))) missing.push(name);
+      }
+    } catch (error) {
+      // A secret store failing takes this plugin down, not every plugin after it.
+      this.statuses.set(id, { status: "error", error: normalizeError(error, "plugin_secrets").message });
+      return;
     }
     if (missing.length > 0) {
       this.statuses.set(id, { status: "needs-config", error: `missing secret: ${missing.join(", ")}` });
@@ -164,7 +224,7 @@ export class PluginHost {
     this.statuses.set(id, { status: "active" });
   }
 
-  async deactivate(id: string): Promise<void> {
+  private async stop(id: string): Promise<void> {
     const entry = this.plugins.get(id);
     if (!entry) return;
     try {
@@ -184,8 +244,7 @@ export class PluginHost {
     if (!state) return;
     state.enabled = enabled;
     this.deps.persistence.set(id, state);
-    await this.deactivate(id);
-    await this.activate(id);
+    await this.restart(id);
   }
 
   async setConfig(id: string, config: unknown): Promise<void> {
@@ -193,8 +252,7 @@ export class PluginHost {
     if (!state) return;
     state.config = config;
     this.deps.persistence.set(id, state);
-    await this.deactivate(id);
-    await this.activate(id);
+    await this.restart(id);
   }
 
   list(): PluginDescriptor[] {

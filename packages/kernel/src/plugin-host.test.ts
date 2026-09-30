@@ -194,3 +194,77 @@ test("fail() after activation rolls back; stale reports are ignored", async () =
   assert.equal(host.get("flaky")?.status, "active");
   assert.equal(tools.get("flaky_tool")?.name, "flaky_tool");
 });
+
+test("lifecycle calls for one plugin run one at a time", async () => {
+  const { host } = makeHost();
+  let running = 0;
+  let most = 0;
+  let starts = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  host.register({
+    id: "slow",
+    name: "Slow",
+    version: "1.0.0",
+    async activate() {
+      running += 1;
+      most = Math.max(most, running);
+      starts += 1;
+      await gate;
+      running -= 1;
+    },
+  });
+
+  // Saving settings twice and a secret change, from three requests at once.
+  const calls = [host.setConfig("slow", { v: 1 }), host.setConfig("slow", { v: 2 }), host.reload()];
+  release();
+  await Promise.all(calls);
+
+  assert.equal(most, 1, "never two activations at once");
+  assert.equal(starts, 3);
+  assert.deepEqual(host.get("slow")?.config, { v: 2 });
+  assert.equal(host.get("slow")?.status, "active");
+});
+
+test("activating a plugin that is already running stops it first", async () => {
+  const { host } = makeHost();
+  let live = 0;
+  host.register({
+    id: "conn",
+    name: "Connections",
+    version: "1.0.0",
+    activate() {
+      live += 1;
+    },
+    deactivate() {
+      live -= 1;
+    },
+  });
+  await host.activate("conn");
+  await host.activate("conn");
+  await host.restart("conn");
+  assert.equal(live, 1);
+});
+
+test("a deleted conversation is announced to running plugins only, and a failure is not fatal", async () => {
+  const { host } = makeHost();
+  const told: string[] = [];
+  const plugin = (id: string, fail = false): Plugin => ({
+    id,
+    name: id,
+    version: "1.0.0",
+    activate() {},
+    sessionDeleted(sessionId) {
+      told.push(`${id}:${sessionId}`);
+      if (fail) throw new Error("boom");
+    },
+  });
+  host.register(plugin("first", true));
+  host.register(plugin("second"));
+  host.register(plugin("off"));
+  await host.activateAll();
+  await host.setEnabled("off", false);
+
+  await host.sessionDeleted("s1");
+  assert.deepEqual(told, ["first:s1", "second:s1"]);
+});
