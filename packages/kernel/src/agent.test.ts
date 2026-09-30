@@ -638,7 +638,7 @@ function agentFor(provider: Provider, tools: Tool[], extra: Partial<ConstructorP
 async function runTurn(
   agent: Agent,
   model: string,
-  options: { history?: ChatMessage[]; signal?: AbortSignal } = {},
+  options: { history?: ChatMessage[]; signal?: AbortSignal; mode?: ToolPolicy["mode"] } = {},
 ): Promise<KernelEvent[]> {
   const events: KernelEvent[] = [];
   for await (const event of agent.run({
@@ -647,7 +647,7 @@ async function runTurn(
     model,
     userText: "go",
     signal: options.signal ?? new AbortController().signal,
-    toolPolicy: { ...DEFAULT_TOOL_POLICY, mode: "auto", maxIterations: 5 },
+    toolPolicy: { ...DEFAULT_TOOL_POLICY, mode: options.mode ?? "auto", maxIterations: 5 },
   })) {
     events.push(event);
   }
@@ -661,6 +661,23 @@ const okTool = (name: string, onRun?: () => void): Tool => ({
     onRun?.();
     return [{ type: "text", text: "ok" }];
   },
+});
+
+test("a turn stores its messages as one chain, starting after its history", async () => {
+  const stored: Array<{ id: string; role: string; parentId: string | null }> = [];
+  const agent = agentFor(toolRoundProvider(["a", "b"]), [okTool("a"), okTool("b")], {
+    onMessage: (_s, message, parentId) => stored.push({ id: message.id, role: message.role, parentId }),
+  });
+  const history: ChatMessage[] = [
+    { id: "u0", role: "user", parts: [{ type: "text", text: "earlier" }], createdAt: 1 },
+    { id: "a0", role: "assistant", parts: [{ type: "text", text: "reply" }], createdAt: 2 },
+  ];
+
+  await runTurn(agent, "round/m", { history });
+
+  assert.deepEqual(stored.map((m) => m.role), ["user", "assistant", "tool", "tool", "assistant"]);
+  assert.equal(stored[0].parentId, "a0");
+  for (let i = 1; i < stored.length; i++) assert.equal(stored[i].parentId, stored[i - 1].id);
 });
 
 test("a cached host whose runner went away is replaced, not reused", async () => {
@@ -689,4 +706,76 @@ test("a cached host whose runner went away is replaced, not reused", async () =>
   hosts[0].closed = true; // its runner reconnected: the old link will never answer
   await runTurn(agent, "round/m");
   assert.deepEqual(used, ["host-1", "host-1", "host-2"]);
+});
+
+test("stopping a turn mid-round abandons a hung tool and starts nothing else", async () => {
+  const counter = { calls: 0 };
+  const stop = new AbortController();
+  let laterRan = false;
+  const hung: Tool = {
+    name: "hung",
+    description: "ignores its signal, like a wedged MCP server",
+    execute() {
+      stop.abort();
+      return new Promise<Part[]>(() => {});
+    },
+  };
+  const stored: ChatMessage[] = [];
+  const agent = agentFor(toolRoundProvider(["hung", "later"], counter), [hung, okTool("later", () => (laterRan = true))], {
+    stopGraceMs: 20,
+    onMessage: (_s, message) => stored.push(message),
+  });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal });
+
+  assert.equal(laterRan, false);
+  assert.equal(counter.calls, 1, "no model call after the stop");
+  const results = events.filter((e) => e.type === "tool.result");
+  assert.equal(results.length, 2);
+  assert.ok(results.every((e) => e.type === "tool.result" && e.isError));
+  assert.equal(events.at(-1)?.type, "turn.done");
+  // Every tool call still has a stored result, so the history stays well-formed.
+  assert.deepEqual(stored.map((m) => m.role), ["user", "assistant", "tool", "tool"]);
+});
+
+test("a tool that honours the stop keeps its own result", async () => {
+  const stop = new AbortController();
+  const cooperative: Tool = {
+    name: "build",
+    description: "returns what it has when cancelled",
+    execute(_args, ctx) {
+      return new Promise<Part[]>((resolve) => {
+        ctx.signal.addEventListener("abort", () => resolve([{ type: "text", text: "partial output [cancelled]" }]));
+        stop.abort();
+      });
+    },
+  };
+  const agent = agentFor(toolRoundProvider(["build"]), [cooperative], { stopGraceMs: 1_000 });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal });
+
+  const result = events.find((e) => e.type === "tool.result");
+  assert.ok(result && result.type === "tool.result");
+  assert.match(JSON.stringify(result.parts), /partial output/);
+});
+
+test("stopping while an approval is pending records the call as stopped, not denied", async () => {
+  const stop = new AbortController();
+  const gated: Tool = { ...okTool("gated"), requiresApproval: true };
+  const agent = agentFor(toolRoundProvider(["gated"]), [gated], {
+    approval: {
+      request: (_req, signal) =>
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("approval aborted")), { once: true });
+          stop.abort(); // the user presses Stop instead of answering
+        }),
+    },
+  });
+
+  const events = await runTurn(agent, "round/m", { signal: stop.signal, mode: "ask" });
+
+  const result = events.find((e) => e.type === "tool.result");
+  assert.ok(result && result.type === "tool.result");
+  assert.match(JSON.stringify(result.parts), /not run: the turn was stopped/);
+  assert.doesNotMatch(JSON.stringify(result.parts), /denied/);
 });

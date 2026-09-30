@@ -47,6 +47,25 @@ test("branches, selects and walks the message tree", () => {
   store.close();
 });
 
+test("the active leaf follows an append only while it points at the parent", () => {
+  const store = new Store(":memory:", crypto.randomBytes(32));
+  const session = store.createSession("fake/fake-agent");
+  store.appendMessage(session.id, message("u1", "user", "one"));
+  store.appendMessage(session.id, message("a1", "assistant", "reply"));
+  store.appendMessage(session.id, message("u2", "user", "two"), "a1");
+  assert.deepEqual(ids(store, session.id), ["u1", "a1", "u2"]);
+
+  // The user switches to another branch while a turn is still writing its own.
+  store.setActiveLeaf(session.id, "u1");
+  store.appendMessage(session.id, message("a2", "assistant", "reply two"), "u2");
+  assert.deepEqual(ids(store, session.id), ["u1"]);
+  assert.deepEqual(store.children(session.id, "u2").map((m) => m.id), ["a2"]);
+
+  store.selectBranch(session.id, "a1");
+  assert.deepEqual(ids(store, session.id), ["u1", "a1", "u2", "a2"]);
+  store.close();
+});
+
 test("a new session persists the auto/low defaults it reports", () => {
   const store = new Store(":memory:", crypto.randomBytes(32));
   const created = store.createSession("fake/fake-agent");

@@ -548,8 +548,10 @@ export class Store implements SecretStore {
 
   /**
    * Append a message as a child of `parentId` (defaults to the session's active
-   * leaf) and move the active leaf to it. Atomic: the insert + leaf move
-   * commit together so a crash can't orphan a message.
+   * leaf). The active leaf moves to it only while it still points at that
+   * parent: a turn writing its own branch must not drag the conversation back
+   * to it after the user switched to another one. Atomic: the insert + leaf
+   * move commit together so a crash can't orphan a message.
    */
   appendMessage(sessionId: string, message: ChatMessage, parentId?: string | null): void {
     const session = this.getSession(sessionId);
@@ -561,7 +563,10 @@ export class Store implements SecretStore {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     const touch = this.db.prepare(
-      `UPDATE sessions SET active_leaf_id = ?, updated_at = ?, title = ? WHERE id = ?`,
+      `UPDATE sessions
+          SET active_leaf_id = CASE WHEN active_leaf_id IS ? THEN ? ELSE active_leaf_id END,
+              updated_at = ?, title = ?
+        WHERE id = ?`,
     );
     const title = deriveTitle(session, message);
     // node:sqlite is sync; a simple exec transaction is enough.
@@ -576,7 +581,7 @@ export class Store implements SecretStore {
         message.meta ? JSON.stringify(message.meta) : null,
         message.createdAt || now,
       );
-      touch.run(message.id, now, title, sessionId);
+      touch.run(parent, message.id, now, title, sessionId);
       // The synthetic "Continue" nudge is hidden in every client, so it must
       // not turn up as a search hit either.
       const searchable =

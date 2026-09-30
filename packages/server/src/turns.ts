@@ -40,6 +40,23 @@ export class Turn {
     for (const subscriber of this.subscribers) subscriber.onEvent(event);
   }
 
+  /** Resolves true once the turn has ended, or false if it is still going after `timeoutMs`. */
+  settled(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        unsubscribe();
+        resolve(false);
+      }, timeoutMs);
+      const unsubscribe = this.subscribe({
+        onEvent: () => {},
+        onEnd: () => {
+          clearTimeout(timer);
+          resolve(true);
+        },
+      });
+    });
+  }
+
   /** Replay the pending tail, then receive live events until `onEnd`. */
   subscribe(subscriber: Subscriber): () => void {
     if (this.finished) {
@@ -61,9 +78,10 @@ export class Turn {
 }
 
 /**
- * Registry of active turns, one per session. `start` supersedes any turn still
- * running for that session; completed turns linger briefly so a client that
- * reconnects right as one ends can still drain the final events.
+ * Registry of active turns, one per session. The server refuses a new turn
+ * while one is running; `start` still aborts any turn left behind, as a
+ * backstop. Completed turns linger briefly so a client that reconnects right
+ * as one ends can still drain the final events.
  */
 export class TurnHub {
   private readonly turns = new Map<string, Turn>();

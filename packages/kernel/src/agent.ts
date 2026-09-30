@@ -59,7 +59,13 @@ export interface KernelDeps {
   secrets: SecretStore;
   audit: AuditLog;
   logger: Logger;
-  onMessage?(sessionId: string, message: ChatMessage): void;
+  /**
+   * Store a message the turn produced, under `parentId`: the turn's previous
+   * message, or the end of its history for the first. A turn keeps to its own
+   * chain, so its messages stay together even if the conversation's active
+   * branch moves while it runs.
+   */
+  onMessage?(sessionId: string, message: ChatMessage, parentId: string | null): void;
   /** Resolve an attachment id to base64 data, for vision models. */
   resolveImage?(attachmentId: string): Promise<{ data: string; mime: string } | undefined>;
   /**
@@ -81,6 +87,11 @@ export interface KernelDeps {
   maxRetries?: number;
   /** First retry delay; doubles each attempt. Default 1000ms. */
   retryBaseDelayMs?: number;
+  /**
+   * How long a tool may take to return once its turn is stopped before the
+   * call is abandoned. Default 3000ms.
+   */
+  stopGraceMs?: number;
 }
 
 /** What one model call produced, after any retries. */
@@ -130,8 +141,13 @@ export class Agent {
   async *run(input: AgentTurnInput): AsyncGenerator<KernelEvent> {
     const turnId = newId("turn");
     const persist = input.persist !== false;
+    // Each stored message goes under the one before it, starting from the end
+    // of the history this turn was given.
+    let parentId: string | null = input.history.at(-1)?.id ?? null;
     const onMessage = (message: ChatMessage): void => {
-      if (persist) this.deps.onMessage?.(input.sessionId, cloneMessage(message));
+      if (!persist) return;
+      this.deps.onMessage?.(input.sessionId, cloneMessage(message), parentId);
+      parentId = message.id;
     };
     yield { type: "turn.start", turnId };
 
@@ -329,10 +345,13 @@ export class Agent {
 
       failureStreak = roundFailed && roundCounted ? failureStreak + 1 : roundFailed ? failureStreak : 0;
       if (failureStreak >= policy.maxConsecutiveFailures) guardTripped = true;
+      // Stopped during the round: every call has its result stored, and a
+      // model call now would only fail on the aborted signal.
+      if (input.signal.aborted) break;
       if (guardTripped) break;
     }
 
-    if (!endedNaturally && !endedOnError && caps.toolCalls) {
+    if (!endedNaturally && !endedOnError && caps.toolCalls && !input.signal.aborted) {
       yield* this.closeWithAnswer(
         input,
         provider,
@@ -340,6 +359,7 @@ export class Agent {
         messages,
         (list) => requestFor(list, undefined),
         guardTripped ? "guard" : "iterations",
+        onMessage,
       );
     }
 
@@ -359,6 +379,7 @@ export class Agent {
     messages: ChatMessage[],
     requestFor: (list: ChatMessage[]) => { request: ChatRequest; warning?: string },
     reason: "iterations" | "guard",
+    onMessage: (message: ChatMessage) => void,
   ): AsyncGenerator<KernelEvent> {
     yield {
       type: "warning",
@@ -407,7 +428,7 @@ export class Agent {
         meta: { provider: provider.id, model, ...(usage ? { usage } : {}), finishReason: finish },
       };
       messages.push(assistant);
-      if (input.persist !== false) this.deps.onMessage?.(input.sessionId, cloneMessage(assistant));
+      onMessage(assistant);
     }
     yield { type: "message.done", messageId: assistantId, finishReason: finish };
   }
@@ -527,6 +548,9 @@ export class Agent {
     messageId?: string,
     emit?: (event: KernelEvent) => void,
   ): Promise<ToolOutcome> {
+    // Once the turn is stopped nothing new starts. The call still gets a
+    // result, so the stored history answers every tool call.
+    if (signal.aborted) return notRun(call.name);
     const tool = this.deps.tools.get(call.name);
     if (!tool) {
       return { parts: [{ type: "text", text: `Unknown tool: ${call.name}` }], isError: true };
@@ -572,6 +596,11 @@ export class Agent {
       } catch (error) {
         this.deps.logger.warn("approval request failed", normalizeError(error, "approval"));
       }
+      // Stopping the turn abandons the question; the user did not say no.
+      if (signal.aborted) {
+        await audit({ ok: false, detail: "turn stopped" });
+        return notRun(tool.name);
+      }
       if (answer === "deny") {
         await audit({ decision: answer, ok: false, detail: "denied" });
         return {
@@ -612,7 +641,8 @@ export class Agent {
         emit,
       };
       const args = tool.schema ? tool.schema.parse(call.args) : call.args;
-      const parts = truncateParts(await tool.execute(args, ctx), this.deps.maxToolResultChars ?? 20_000);
+      const output = await settleOrAbandon(tool.execute(args, ctx), signal, this.deps.stopGraceMs ?? 3_000);
+      const parts = truncateParts(output, this.deps.maxToolResultChars ?? 20_000);
       await audit({ ok: true });
       return { parts, isError: false };
     } catch (error) {
@@ -631,6 +661,15 @@ interface ToolOutcome {
   isError: boolean;
   /** Failed for a reason outside the model's control (no runner, denied, blocked). */
   external?: boolean;
+}
+
+/** The outcome of a call that never ran because its turn was stopped. */
+function notRun(name: string): ToolOutcome {
+  return {
+    parts: [{ type: "text", text: `Tool "${name}" was not run: the turn was stopped.` }],
+    isError: true,
+    external: true,
+  };
 }
 
 /**
@@ -687,6 +726,37 @@ function retryDelay(attempt: number, baseMs: number, retryAfterMs?: number): num
   if (retryAfterMs !== undefined && retryAfterMs > 0) return Math.min(retryAfterMs, 60_000);
   const exponential = baseMs * 2 ** attempt;
   return Math.min(30_000, exponential + Math.floor(Math.random() * baseMs * 0.25));
+}
+
+/**
+ * Wait for a tool call, but not forever once its turn is stopped. A tool that
+ * ignores its signal (a hung MCP server, a runner that stopped answering)
+ * would otherwise keep the turn, and with it the conversation, busy. Tools
+ * that do honour the signal get `graceMs` to hand back what they have.
+ */
+function settleOrAbandon<T>(work: Promise<T>, signal: AbortSignal, graceMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      timer = setTimeout(() => reject(new Error("the turn was stopped")), graceMs);
+    };
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        done();
+        resolve(value);
+      },
+      (error: unknown) => {
+        done();
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Resolves true after `ms`, or false as soon as `signal` aborts. */

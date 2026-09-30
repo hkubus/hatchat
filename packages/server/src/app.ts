@@ -82,6 +82,12 @@ const CONTINUE_PROMPT =
   "Your previous reply was cut off by the output limit. Continue exactly where it stopped, " +
   "without repeating what you already wrote and without any preamble.";
 
+/** Why a second turn in a conversation is refused (409). */
+const TURN_RUNNING = "a reply is still running in this conversation; stop it first";
+
+/** How long a turn the user stopped may take to store its last messages. */
+const STOPPED_TURN_GRACE_MS = 10_000;
+
 export async function createServer(config: ServerConfig): Promise<ServerRuntime> {
   const logger = createLogger();
   const audit = createAuditLog(logger);
@@ -271,7 +277,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     systemContext: () =>
       pluginHost.get("memory")?.status === "active" ? memoryPrompt(store) : undefined,
     maxToolIterations: config.maxToolIterations,
-    onMessage: (sessionId, message) => store.appendMessage(sessionId, message),
+    onMessage: (sessionId, message, parentId) => store.appendMessage(sessionId, message, parentId),
     resolveImage: async (attachmentId) => {
       const record = store.getAttachment(attachmentId);
       const data = await store.readAttachment(attachmentId);
@@ -555,6 +561,26 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   const streamTurn = (c: Context, options: TurnOptions): Response =>
     serveTurn(c, runTurn(options));
+
+  const turnRunning = (sessionId: string): boolean => {
+    const turn = turns.get(sessionId);
+    return Boolean(turn && !turn.done);
+  };
+
+  /**
+   * A conversation runs one turn at a time. Two turns writing to it at once
+   * interleave their messages (a reply under the wrong question, a tool result
+   * after the next user message), and providers refuse every request after
+   * that. A turn the user just stopped may still be storing its last messages,
+   * so it gets a moment to finish.
+   *
+   * Check `turnRunning` right after this, and start the turn in the same
+   * synchronous stretch: another request can start one at any `await`.
+   */
+  const settleStoppedTurn = async (sessionId: string): Promise<void> => {
+    const turn = turns.get(sessionId);
+    if (turn && !turn.done && turn.signal.aborted) await turn.settled(STOPPED_TURN_GRACE_MS);
+  };
 
   const pathOf = (sessionId: string) => store.getPath(sessionId);
 
@@ -925,6 +951,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!text.trim() && attachmentIds.length === 0) {
       return c.json({ error: "text or attachments are required" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     if (body.model) store.setSessionModel(session.id, body.model);
 
     let userParts: Part[] | undefined;
@@ -960,9 +988,11 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
    * (synthetic) user message so the history keeps alternating, which every
    * provider accepts; clients hide it and read the next reply as the rest.
    */
-  app.post("/api/sessions/:id/continue", (c) => {
+  app.post("/api/sessions/:id/continue", async (c) => {
     const session = store.getSession(c.req.param("id"));
     if (!session) return c.json({ error: "not found" }, 404);
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     const history = pathOf(session.id).map((n) => n.message);
     const last = history.at(-1);
     if (!last || last.role !== "assistant") {
@@ -991,6 +1021,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!target || target.role !== "assistant") {
       return c.json({ error: "messageId must reference an assistant message" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     const parent = store.getParentId(target.id);
     store.setActiveLeaf(session.id, parent);
     return streamTurn(c, {
@@ -1016,6 +1048,8 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
     if (!target || target.role !== "user") {
       return c.json({ error: "messageId must reference a user message" }, 400);
     }
+    await settleStoppedTurn(session.id);
+    if (turnRunning(session.id)) return c.json({ error: TURN_RUNNING }, 409);
     store.setActiveLeaf(session.id, store.getParentId(target.id));
     return streamTurn(c, {
       sessionId: session.id,

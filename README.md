@@ -491,7 +491,16 @@ again reattaches to the live turn (`GET /api/sessions/:id/stream`, which
 replays the pending tail and then follows). The send button's **Stop** (or
 `Esc`) is a separate, explicit
 `POST /api/sessions/:id/turn/cancel` that really aborts the turn, so a runaway
-generation or a hung tool stops promptly instead of only being hidden.
+generation or a hung tool stops promptly instead of only being hidden. A tool
+that ignores the cancel is abandoned after a few seconds.
+
+**One turn per conversation.** While a reply is running, starting another in
+the same conversation (send, continue, regenerate or edit, from another tab or
+device) is refused with `409` until it is stopped: two turns writing at once
+would interleave their messages into a history providers reject. A turn that
+was just stopped gets a few seconds to store its last messages before the new
+one starts. Each turn stores its messages as its own chain, so switching
+branches while it runs leaves its reply under its own question.
 
 The view only follows the stream while you are already at the bottom — scroll
 up to read back without being yanked down on every delta.
