@@ -14,6 +14,9 @@ const INTERRUPTED = "[no result: this call was interrupted before it finished]";
  *   which is never sent back) is dropped;
  * - a tool call with no result (the server stopped mid-call) is answered
  *   with a placeholder, and a result whose call is gone is dropped;
+ * - a call id used twice (some models number their calls afresh each time)
+ *   is made unique for the request, and results pair with calls one to one,
+ *   in order, instead of the first result answering every call of that id;
  * - back-to-back user messages are merged, since some providers insist on
  *   alternating turns. A "Continue" nudge that never got its reply is
  *   dropped rather than merged: it would make the model continue an old
@@ -25,8 +28,22 @@ const INTERRUPTED = "[no result: this call was interrupted before it finished]";
  */
 export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
-  /** Calls of the latest assistant message still waiting for a result. */
-  let unanswered: Array<{ id: string; name: string }> = [];
+  /**
+   * Calls of the latest assistant message still waiting for a result: the id
+   * stored, and the id the request uses for it (unique across the request).
+   */
+  let unanswered: Array<{ id: string; sentId: string; name: string }> = [];
+  /**
+   * Every call id the request already uses. A repeat gets `_2`, `_3`, ...:
+   * letters, digits, `_` and `-` are what every provider accepts in an id.
+   */
+  const usedIds = new Set<string>();
+  const uniqueId = (id: string): string => {
+    let sentId = id;
+    for (let n = 2; usedIds.has(sentId); n++) sentId = `${id}_${n}`;
+    usedIds.add(sentId);
+    return sentId;
+  };
 
   const answerRest = (): void => {
     if (unanswered.length === 0) return;
@@ -35,7 +52,7 @@ export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
       role: "tool",
       parts: unanswered.map((call) => ({
         type: "tool_result" as const,
-        id: call.id,
+        id: call.sentId,
         name: call.name,
         content: [{ type: "text" as const, text: INTERRUPTED }],
         isError: true,
@@ -45,16 +62,24 @@ export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
     unanswered = [];
   };
 
-  for (const message of messages) {
+  for (let message of messages) {
     if (message.role === "system") continue;
 
     if (message.role === "tool") {
-      const results = message.parts.filter(
-        (part) => part.type === "tool_result" && unanswered.some((call) => call.id === part.id),
-      );
+      // Each result answers the first call of its id still waiting, so a
+      // second call with the same id keeps waiting for the second result.
+      const results: Part[] = [];
+      let renamed = false;
+      for (const part of message.parts) {
+        if (part.type !== "tool_result") continue;
+        const index = unanswered.findIndex((call) => call.id === part.id);
+        if (index < 0) continue;
+        const [call] = unanswered.splice(index, 1);
+        renamed ||= call.sentId !== part.id;
+        results.push(call.sentId === part.id ? part : { ...part, id: call.sentId });
+      }
       if (results.length === 0) continue;
-      unanswered = unanswered.filter((call) => !results.some((part) => part.type === "tool_result" && part.id === call.id));
-      out.push(results.length === message.parts.length ? message : { ...message, parts: results });
+      out.push(results.length === message.parts.length && !renamed ? message : { ...message, parts: results });
       continue;
     }
 
@@ -64,7 +89,14 @@ export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
     if (message.role === "assistant") {
       const calls = message.parts.filter((part) => part.type === "tool_call");
       if (!hasText(message.parts) && calls.length === 0) continue;
-      unanswered = calls.map((part) => ({ id: part.id, name: part.name }));
+      unanswered = calls.map((part) => ({ id: part.id, sentId: uniqueId(part.id), name: part.name }));
+      if (unanswered.some((call) => call.sentId !== call.id)) {
+        let next = 0;
+        message = {
+          ...message,
+          parts: message.parts.map((part) => (part.type === "tool_call" ? { ...part, id: unanswered[next++].sentId } : part)),
+        };
+      }
       if (previous?.role === "assistant") {
         // Only reachable when the previous one made no calls (they would have
         // been answered above), so the two read as one reply.

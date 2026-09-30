@@ -130,3 +130,52 @@ test("two replies in a row read as one", () => {
   ]);
   assert.deepEqual(shape(repaired), ["user(hi)", "assistant(first part + second part + call:c1)", "tool(result:c1)"]);
 });
+
+test("two calls sharing an id each keep their own result", () => {
+  const repaired = repairTranscript([
+    msg("u1", "user", [text("check both")]),
+    msg("a1", "assistant", [call("c1"), call("c1")]),
+    msg("t1", "tool", [result("c1", "first")]),
+    msg("t2", "tool", [result("c1", "second")]),
+    msg("a2", "assistant", [text("done")]),
+  ]);
+  // Unique ids for the request, and each result pairs with its own call, in order.
+  assert.deepEqual(shape(repaired), [
+    "user(check both)",
+    "assistant(call:c1 + call:c1_2)",
+    "tool(result:c1)",
+    "tool(result:c1_2)",
+    "assistant(done)",
+  ]);
+  const outputs = repaired
+    .flatMap((m) => m.parts)
+    .flatMap((part) => (part.type === "tool_result" ? [`${part.id}=${(part.content[0] as { text: string }).text}`] : []));
+  assert.deepEqual(outputs, ["c1=first", "c1_2=second"]);
+});
+
+test("a shared id whose second result never came gets a placeholder for that call alone", () => {
+  const repaired = repairTranscript([
+    msg("u1", "user", [text("check both")]),
+    msg("a1", "assistant", [call("c1"), call("c1")]),
+    msg("t1", "tool", [result("c1")]),
+  ]);
+  assert.deepEqual(shape(repaired), ["user(check both)", "assistant(call:c1 + call:c1_2)", "tool(result:c1)", "tool(result:c1_2!)"]);
+});
+
+test("an id reused in a later round is made unique, and its result follows it", () => {
+  // Some models number their calls from zero every round.
+  const repaired = repairTranscript([
+    msg("u1", "user", [text("go")]),
+    msg("a1", "assistant", [call("call_0")]),
+    msg("t1", "tool", [result("call_0", "one")]),
+    msg("a2", "assistant", [call("call_0")]),
+    msg("t2", "tool", [result("call_0", "two")]),
+  ]);
+  assert.deepEqual(shape(repaired), [
+    "user(go)",
+    "assistant(call:call_0)",
+    "tool(result:call_0)",
+    "assistant(call:call_0_2)",
+    "tool(result:call_0_2)",
+  ]);
+});
