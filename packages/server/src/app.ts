@@ -94,11 +94,26 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
 
   const master = loadMasterKey({ filePath: config.masterKeyPath });
   if (master.source === "generated") {
-    logger.warn(`generated a new master key at ${master.path} (set HAT_MASTER_KEY in production)`);
+    logger.warn(
+      `generated a new master key at ${master.path}; in production, put its contents in HAT_MASTER_KEY ` +
+        "(a different key would leave every secret saved under this one unreadable)",
+    );
   }
   const artifacts = createArtifactStore({ dir: config.uploadDir, s3: config.s3 });
   logger.info(`artifact backend: ${artifacts.kind}`);
   const store = new Store(config.dbPath, master.key, artifacts);
+  const unreadable = store.unreadableSecrets();
+  if (unreadable.length > 0) {
+    const why = master.shadowedFile
+      ? `HAT_MASTER_KEY differs from the key in ${master.shadowedFile}, which they were likely saved under`
+      : master.source === "generated"
+        ? "a new key file was just generated, so the key they were saved under is gone"
+        : "the master key is not the one they were saved under";
+    logger.warn(
+      `can't decrypt ${unreadable.length} saved secret(s): ${unreadable.join(", ")}. ${why}. ` +
+        "Restore that key, or save them again in Settings; until then they count as unset.",
+    );
+  }
 
   const providers = new ProviderRegistry();
   const tools = new ToolRegistry();

@@ -764,17 +764,38 @@ export class Store implements SecretStore {
 
   /** SecretStore contract: the DB only, never the process env. */
   async getStored(name: string): Promise<string | undefined> {
-    const row = this.db
-      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
-      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
-    return row ? decryptSecret(row, this.masterKey) : undefined;
+    return this.readSecret(name);
   }
 
   hasSecret(name: string): boolean {
+    return this.readSecret(name) !== undefined || Boolean(process.env[name]);
+  }
+
+  /**
+   * Saved secrets the current master key can't decrypt: they were saved under
+   * another one (`HAT_MASTER_KEY` changed, or the key file was lost and a new
+   * one generated). They read as unset until they are saved again.
+   */
+  unreadableSecrets(): string[] {
+    const rows = this.db.prepare(`SELECT name FROM secrets ORDER BY name ASC`).all() as Array<{ name: string }>;
+    return rows.map((row) => row.name).filter((name) => this.readSecret(name) === undefined);
+  }
+
+  /**
+   * A saved secret, decrypted. One the master key can't decrypt reads as
+   * unset, so whatever needs it asks for it again, rather than the error
+   * stopping every plugin from loading and the server from starting.
+   */
+  private readSecret(name: string): string | undefined {
     const row = this.db
-      .prepare(`SELECT 1 AS present FROM secrets WHERE name = ?`)
-      .get(name) as { present: number } | undefined;
-    return Boolean(row) || Boolean(process.env[name]);
+      .prepare(`SELECT ciphertext, iv, tag FROM secrets WHERE name = ?`)
+      .get(name) as { ciphertext: string; iv: string; tag: string } | undefined;
+    if (!row) return undefined;
+    try {
+      return decryptSecret(row, this.masterKey);
+    } catch {
+      return undefined;
+    }
   }
 
   listSecretNames(): string[] {

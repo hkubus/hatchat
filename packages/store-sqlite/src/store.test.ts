@@ -486,3 +486,21 @@ test("synthetic nudges are neither searchable nor counted as visible rows", () =
   const other = store.createSession("fake/fake-agent");
   assert.equal(store.hasMessage(other.id, "m1"), false);
 });
+
+test("a secret saved under another master key reads as unset instead of throwing", async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "hat-store-")), "hat.db");
+  const before = new Store(file, crypto.randomBytes(32));
+  before.setSecret("HAT_TEST_PROVIDER_KEY", "sk-old");
+  before.close();
+
+  // The key changed: HAT_MASTER_KEY set to a new value, or master.key lost.
+  const after = new Store(file, crypto.randomBytes(32));
+  assert.equal(await after.get("HAT_TEST_PROVIDER_KEY"), undefined);
+  assert.equal(after.hasSecret("HAT_TEST_PROVIDER_KEY"), false);
+  assert.deepEqual(after.unreadableSecrets(), ["HAT_TEST_PROVIDER_KEY"]);
+
+  after.setSecret("HAT_TEST_PROVIDER_KEY", "sk-new");
+  assert.equal(await after.get("HAT_TEST_PROVIDER_KEY"), "sk-new");
+  assert.deepEqual(after.unreadableSecrets(), []);
+  after.close();
+});

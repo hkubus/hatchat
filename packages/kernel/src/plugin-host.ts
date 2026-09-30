@@ -97,8 +97,14 @@ export class PluginHost {
     }
 
     const missing: string[] = [];
-    for (const name of plugin.requiresSecrets ?? []) {
-      if (!(await this.deps.secrets.get(name))) missing.push(name);
+    try {
+      for (const name of plugin.requiresSecrets ?? []) {
+        if (!(await this.deps.secrets.get(name))) missing.push(name);
+      }
+    } catch (error) {
+      // A secret store failing takes this plugin down, not every plugin after it.
+      this.statuses.set(id, { status: "error", error: normalizeError(error, "plugin_secrets").message });
+      return;
     }
     if (missing.length > 0) {
       this.statuses.set(id, { status: "needs-config", error: `missing secret: ${missing.join(", ")}` });
