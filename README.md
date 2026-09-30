@@ -616,6 +616,11 @@ web build on every push to `main` and every pull request.
 HAT_ENROLL_TOKEN=$(openssl rand -hex 16) HAT_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
 ```
 
+Compose refuses to start without both tokens: the server's port is published,
+so an empty `HAT_AUTH_TOKEN` would leave the API — and the runner's shell — open
+to anyone who can reach it. Keep them in a `.env` file next to
+`docker-compose.yml` (compose reads it) so later commands see the same values.
+
 The runner publishes **no ports** — it dials out to `server:8787/link`.
 
 ## The execution link

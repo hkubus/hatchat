@@ -8,8 +8,11 @@ services:
     environment:
       HAT_HOST: 0.0.0.0
       HAT_PORT: "8787"
-      HAT_AUTH_TOKEN: ${HAT_AUTH_TOKEN:-}
-      HAT_ENROLL_TOKEN: ${HAT_ENROLL_TOKEN:-dev-enroll-token}
+      # Both are required: the port is published, so without a token the API
+      # (and through it the runner's shell) is open to anyone who can reach it,
+      # and a known enroll token lets anyone attach a runner of their own.
+      HAT_AUTH_TOKEN: "${HAT_AUTH_TOKEN:?set HAT_AUTH_TOKEN to a random secret, e.g. openssl rand -hex 32}"
+      HAT_ENROLL_TOKEN: "${HAT_ENROLL_TOKEN:?set HAT_ENROLL_TOKEN to a random secret, e.g. openssl rand -hex 16}"
 
   runner:
     build:
@@ -19,7 +22,7 @@ services:
       - server
     environment:
       HAT_SERVER_URL: ws://server:8787/link
-      HAT_ENROLL_TOKEN: ${HAT_ENROLL_TOKEN:-dev-enroll-token}
+      HAT_ENROLL_TOKEN: "${HAT_ENROLL_TOKEN:?set HAT_ENROLL_TOKEN to a random secret, e.g. openssl rand -hex 16}"
       HAT_RUNNER_TAGS: docker
       HAT_WORKSPACE_ROOT: /srv/hat/workspaces
       # The image has no container runtime, and mounting the host Docker socket
