@@ -20,6 +20,12 @@ import type { ChatMessage, Part } from "@hat/core";
 
 /** Rough characters-per-token for mixed prose and code. Deliberately low. */
 const CHARS_PER_TOKEN = 3.5;
+/**
+ * Chinese, Japanese and Korean run far denser: about a token a character
+ * (less on some tokenizers, more on others). At 3.5 characters a token they
+ * were undercounted two- to threefold, and an over-full request went out.
+ */
+const CJK_TOKENS_PER_CHAR = 1;
 /** Flat per-message overhead (role markers, separators). */
 const MESSAGE_OVERHEAD = 4;
 /** What an image costs, give or take: providers bill ~1k tokens for typical sizes. */
@@ -30,14 +36,29 @@ const MIN_ELIDE_CHARS = 400;
 const PAGE_FRACTION = 0.25;
 
 export function estimateTextTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  let wide = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    // Kana, CJK ideographs (with extension A), Hangul syllables, compatibility ideographs.
+    if (
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0x3400 && code <= 0x9fff) ||
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0xf900 && code <= 0xfaff)
+    ) {
+      wide += 1;
+    }
+  }
+  return Math.ceil((text.length - wide) / CHARS_PER_TOKEN + wide * CJK_TOKENS_PER_CHAR);
 }
 
 function partTokens(part: Part): number {
   switch (part.type) {
     case "text":
-    case "reasoning":
       return estimateTextTokens(part.text);
+    case "reasoning":
+      // Kept for the user to read, but never sent back to a provider.
+      return 0;
     case "image":
       return IMAGE_TOKENS;
     case "file":
@@ -94,16 +115,17 @@ export function fitToContext(messages: ChatMessage[], budget: number): FitResult
   }
   const page = Math.max(1, Math.floor(budget * PAGE_FRACTION));
 
-  // 1. Elide tool outputs, oldest first. The newest tool message is exempt:
-  //    it is what the model is about to act on.
-  const lastTool = findLastIndex(messages, (m) => m.role === "tool");
+  // 1. Elide tool outputs, oldest first. The latest round of results (every
+  //    tool message after the last assistant one) is exempt: it is what the
+  //    model is about to act on, parallel calls included.
+  const lastRound = findLastIndex(messages, (m) => m.role === "assistant");
   const target = Math.ceil((total - budget) / page) * page;
   let saved = 0;
   let elided = 0;
   let working = messages.slice();
   for (let i = 0; i < working.length && saved < target; i++) {
     const message = working[i];
-    if (message.role !== "tool" || i === lastTool) continue;
+    if (message.role !== "tool" || i > lastRound) continue;
     let changed = false;
     const parts = message.parts.map((part) => {
       if (saved >= target || part.type !== "tool_result") return part;
@@ -133,12 +155,17 @@ export function fitToContext(messages: ChatMessage[], budget: number): FitResult
   }
 
   // 2. Drop whole exchanges (a user message and everything up to the next),
-  //    oldest first, never the last one. Leading system messages stay.
+  //    oldest first, never the last one. Leading system messages stay. A
+  //    synthetic user message (Continue, the closing nudge) belongs to the
+  //    exchange before it: starting one would let the reply it refers to go.
   const head = working.findIndex((m) => m.role !== "system");
   if (head === -1) return { messages: working, elidedToolResults: elided, droppedMessages: 0, tokens };
   const starts: number[] = [];
   for (let i = head; i < working.length; i++) {
-    if (working[i].role === "user" && (i === head || working[i - 1]?.role !== "user")) starts.push(i);
+    const message = working[i];
+    if (message.role === "user" && !message.meta?.synthetic && (i === head || working[i - 1]?.role !== "user")) {
+      starts.push(i);
+    }
   }
   if (starts[0] !== head) starts.unshift(head);
   const dropTarget = Math.ceil((tokens - budget) / page) * page;

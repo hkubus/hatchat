@@ -140,8 +140,7 @@ export async function createServer(config: ServerConfig): Promise<ServerRuntime>
             // Always cycle: an already-active plugin is holding stdio
             // processes that died with the previous runner.
             logger.info(`runner available; (re)connecting plugin ${id}`);
-            await pluginHost.deactivate(id);
-            await pluginHost.activate(id);
+            await pluginHost.restart(id);
           } else {
             continue;
           }

@@ -292,10 +292,15 @@ Every turn replays the active branch, so a long conversation — or a few large
 tool outputs — would eventually overflow the model and fail. Before each model
 call the kernel (`packages/kernel/src/context.ts`) estimates the request and,
 when it would not fit the model's window (minus room for the reply), first
-replaces **old tool outputs** with a short placeholder (the newest tool result
-is never touched), then leaves out the **oldest exchanges**, adding a note
-that it did. Only the request is trimmed: stored history is unchanged, and a
-model with a larger window sees everything again.
+replaces **old tool outputs** with a short placeholder (the latest round of
+results, parallel calls included, is never touched), then leaves out the
+**oldest exchanges**, adding a note that it did. A Continue, or the closing
+"answer now" nudge, counts as part of the exchange before it, so the reply it
+refers to is never the part left out. Only the request is trimmed: stored
+history is unchanged, and a model with a larger window sees everything again.
+
+The estimate counts about 3.5 characters a token, one a character for Chinese,
+Japanese and Korean, and nothing for stored reasoning, which is never sent back.
 
 Cuts are made in pages of a quarter of the budget, so the start of the request
 stays byte-identical across turns until the conversation has grown by another

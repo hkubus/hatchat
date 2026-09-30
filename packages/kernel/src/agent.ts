@@ -415,6 +415,7 @@ export class Agent {
         },
       ],
       createdAt: Date.now(),
+      meta: { synthetic: "close" },
     };
     const { request, warning } = requestFor([...messages, nudge]);
     if (warning) yield { type: "warning", message: warning };
